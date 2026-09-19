@@ -780,6 +780,8 @@ public class ClientUI extends BaseUI implements ChatListener {
             groupWindow.dispose();
             groupWindow = null;
         }
+        // 文件传输窗口由静态注册表管理，不在上面两个集合里，需要单独关闭
+        FileTransferUI.disposeAll();
         client.close();
         super.dispose();
     }

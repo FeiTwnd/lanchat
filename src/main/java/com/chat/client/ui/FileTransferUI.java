@@ -112,6 +112,21 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
+     * 关闭全部传输窗口并清空注册表。
+     *
+     * <p>传输窗口由静态注册表管理（同一对端只开一个），并不属于主窗口的组件树，
+     * 因此退出登录或程序退出时必须显式统一关闭：否则旧窗口会残留在屏幕上，
+     * 且继续持有已经关闭的客户端连接，导致下次登录后发文件毫无反应。</p>
+     */
+    public static void disposeAll() {
+        for (FileTransferUI window : new java.util.ArrayList<>(WINDOWS.values())) {
+            window.dispose();
+        }
+        WINDOWS.clear();
+        TRANSFER_OWNERS.clear();
+    }
+
+    /**
      * 组装界面组件。
      */
     private void initComponents() {
