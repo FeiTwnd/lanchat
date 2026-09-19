@@ -206,6 +206,20 @@ public final class Config {
     }
 
     /**
+     * 获取聊天记录加密口令。
+     *
+     * <p>取值优先级：系统属性 {@code lanchat.crypto.secret} > 配置文件 {@code security.message.secret}。
+     * 该口令用于派生 AES 密钥，所有读写同一数据库的进程（服务器与客户端导出的场景）
+     * 必须使用同一口令，否则查出来的记录会显示为无法解密。</p>
+     *
+     * @return 加密口令；未配置时返回内置默认口令
+     */
+    public static String messageSecret() {
+        return override("lanchat.crypto.secret",
+                get("security.message.secret", Constants.DB_MESSAGE_SECRET));
+    }
+
+    /**
      * 读取系统属性覆盖值。
      *
      * @param property      系统属性名

@@ -10,6 +10,7 @@ import com.chat.common.TextMessage;
 import com.chat.exception.ChatException;
 import com.chat.util.DateUtil;
 import com.chat.util.FileUtil;
+import com.chat.util.MessageCipher;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -40,6 +41,11 @@ import java.util.logging.Logger;
  * <p>字段映射：文本与系统消息存 {@code content}；文件消息除 {@code content}（可读描述）外，
  * 还把文件名、大小与校验和存入专用列 {@code file_name/file_size/sha256}，
  * 这样既方便 SQL 直接统计文件传输，读回时也能无损还原成 {@link FileMessage}。</p>
+ *
+ * <p>存储加密：{@code content} 列在写入前经 {@link MessageCipher} 加密、读出后解密，
+ * 数据库里保存的是 Base64 密文；文件名与收发双方仍为明文，
+ * 以便保留按文件名、按用户检索与统计的能力。加密前写入的历史记录没有密文前缀，
+ * 会被识别为明文原样返回，因此无需数据迁移。</p>
  *
  * <p>连接策略：与 {@link JdbcUserDao} 一致，每次操作独立获取连接并由 try-with-resources 关闭，
  * 不引入连接池，保持零第三方依赖。</p>
@@ -203,7 +209,7 @@ public class JdbcMessageDao implements MessageDao {
             if (content == null) {
                 ps.setNull(4, java.sql.Types.LONGVARCHAR);
             } else {
-                ps.setString(4, content);
+                ps.setString(4, MessageCipher.encrypt(content));
             }
             if (message instanceof FileMessage) {
                 FileMessage file = (FileMessage) message;
@@ -285,8 +291,10 @@ public class JdbcMessageDao implements MessageDao {
     /**
      * 在全部消息中按关键字模糊检索。
      *
-     * <p>检索范围覆盖正文、文件名、发送者与接收者，等价于文件实现对
-     * "摘要 + 发送者 + 接收者"的包含匹配。</p>
+     * <p>检索范围与原文件实现一致：正文、文件名、发送者与接收者。
+     * 但正文以密文入库，SQL 的 {@code LIKE} 只能匹配到密文，无法再在数据库侧完成正文过滤，
+     * 因此改为逐行解密后在内存中匹配；只保留命中行，内存占用与命中数量成正比，
+     * 对课程设计的数据量而言代价可忽略。</p>
      *
      * @param keyword 关键字，不允许为空
      * @return 命中的消息列表（时间升序），永不返回 null
@@ -298,11 +306,41 @@ public class JdbcMessageDao implements MessageDao {
         if (keyword == null || keyword.trim().isEmpty()) {
             throw new ChatException("检索关键字不能为空");
         }
-        String sql = "SELECT " + COLUMNS + " FROM chat_message WHERE LOWER(CONCAT("
-                + "IFNULL(content,''), ' ', IFNULL(file_name,''), ' ', sender, ' ', receiver)) LIKE ?"
-                + " ORDER BY create_time ASC, id ASC";
-        String pattern = "%" + keyword.trim().toLowerCase(Locale.ROOT) + "%";
-        return executeQuery(sql, List.of(pattern));
+        String needle = keyword.trim().toLowerCase(Locale.ROOT);
+        String sql = "SELECT " + COLUMNS + " FROM chat_message ORDER BY create_time ASC, id ASC";
+        List<Message> hits = new ArrayList<>();
+        try (Connection connection = openConnection();
+             PreparedStatement ps = connection.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                Message message = map(rs);
+                if (matches(message, needle)) {
+                    hits.add(message);
+                }
+            }
+            return hits;
+        } catch (SQLException e) {
+            throw new ChatException("聊天记录检索失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 判断一条消息是否命中关键字。
+     *
+     * @param message 已解密的消息
+     * @param needle  已转小写的关键字
+     * @return 正文、文件名、发送者或接收者任一包含关键字时返回 true
+     */
+    private boolean matches(Message message, String needle) {
+        StringBuilder text = new StringBuilder();
+        String content = contentOf(message);
+        text.append(content == null ? "" : content).append(' ')
+                .append(nullToEmpty(message.getSender())).append(' ')
+                .append(nullToEmpty(message.getReceiver()));
+        if (message instanceof FileMessage) {
+            text.append(' ').append(nullToEmpty(((FileMessage) message).getFileName()));
+        }
+        return text.toString().toLowerCase(Locale.ROOT).contains(needle);
     }
 
     /**
@@ -342,7 +380,8 @@ public class JdbcMessageDao implements MessageDao {
         MessageType type = MessageType.fromName(rs.getString("msg_type"));
         String sender = nullToEmpty(rs.getString("sender"));
         String receiver = nullToEmpty(rs.getString("receiver"));
-        String content = rs.getString("content");
+        // 正文以密文入库，读出后立即解密，保证上层拿到的始终是明文
+        String content = MessageCipher.decrypt(rs.getString("content"));
         String fileName = rs.getString("file_name");
         Message message;
         if (fileName != null || type == MessageType.FILE_REQUEST || type == MessageType.FILE_RESULT) {
