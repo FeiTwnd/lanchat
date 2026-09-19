@@ -482,21 +482,15 @@ public final class ChatServer {
     }
 
     /**
-     * 服务器入口：直接启动带界面的服务器；传入 {@code --console} 则使用控制台模式。
+     * 服务器入口：启动带图形控制台的服务器。
      *
-     * @param args 命令行参数
+     * <p>服务器只保留图形控制台一种启动方式：控制台里能看到在线用户、运行日志与启停按钮，
+     * 比纯命令行输出更直观，也不必为同一套功能维护两条启动路径。</p>
+     *
+     * @param args 命令行参数（当前未使用，保留标准入口签名）
      */
     public static void main(String[] args) {
-        boolean consoleMode = args.length > 0 && "--console".equalsIgnoreCase(args[0]);
         ChatServer server = ChatServer.getInstance();
-        if (consoleMode) {
-            if (!server.start()) {
-                System.exit(1);
-            }
-            LOGGER.info("控制台模式已启动，按 Ctrl+C 退出");
-            Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "chat-shutdown"));
-            return;
-        }
         javax.swing.SwingUtilities.invokeLater(() -> {
             ServerUI ui = new ServerUI(server);
             ui.setVisible(true);

@@ -106,7 +106,6 @@ public final class ChatClientApp {
         System.out.println("  java com.chat.client.ChatClientApp --local-server  先启动本机服务器再打开客户端");
         System.out.println("  java com.chat.client.ChatClientApp --help          显示本帮助");
         System.out.println("服务器启动方式:");
-        System.out.println("  java com.chat.server.ChatServer                    启动带界面的服务器");
-        System.out.println("  java com.chat.server.ChatServer --console          以控制台模式启动服务器");
+        System.out.println("  java com.chat.server.ChatServer                    启动带图形控制台的服务器");
     }
 }

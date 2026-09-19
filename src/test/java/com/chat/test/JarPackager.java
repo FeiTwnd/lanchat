@@ -23,10 +23,11 @@ import java.util.stream.Stream;
  * 使用标准库 {@link JarOutputStream} 自行打包，既保证跨平台一致，也顺便演示了
  * Java 归档格式的操作方式。</p>
  *
- * <p>用法（可传入多个类目录，例如把测试类一起打进测试 jar）：</p>
+ * <p>用法（可传入多个类目录，例如把测试类一起打进测试 jar）。
+ * 以 IDEA 的输出目录为例（工作目录为项目根目录）：</p>
  * <pre>
- * java -cp build/classes:build/test-classes com.chat.test.JarPackager \
- *      &lt;outputJar&gt; &lt;mainClass&gt; &lt;classesDir&gt; [moreClassesDirs...]
+ * java -cp out/production/LANChat:out/test/LANChat com.chat.test.JarPackager \
+ *      dist/chat-server.jar com.chat.server.ChatServer out/production/LANChat
  * </pre>
  *
  * @author Java 课程设计

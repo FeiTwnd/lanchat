@@ -21,6 +21,5 @@ data/received/*
 .idea/
 *.iml
 
-# 过程文档与外部参考项目（仅本地留存，不纳入版本管理）
+# 过程文档（仅本地留存，不纳入版本管理）
 docs/superpowers/
-MyQqChat/
