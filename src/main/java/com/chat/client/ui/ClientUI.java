@@ -64,6 +64,10 @@ public class ClientUI extends BaseUI implements ChatListener {
     /** 序列化版本号 */
     private static final long serialVersionUID = 20250119L;
 
+    /** 日志记录器 */
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(Constants.LOGGER_NAME + ".ClientUI");
+
     /** 客户端实例 */
     private final transient ChatClient client;
 
@@ -648,18 +652,27 @@ public class ClientUI extends BaseUI implements ChatListener {
      */
     private void handlePrivateMessage(TextMessage message) {
         String self = client.getUsername();
+        String sender = message.getSender();
+        String receiver = message.getReceiver();
         // 服务器在私聊投递成功后会给发送方回一条“送达回执”，其发送者与接收者都是发送者本人。
         // 本地发送时已经回显消息，若把回执也走一遍分发，发送方会弹出一个“与自己私聊”的窗口，
         // 因此这里直接忽略；回执的价值在于协议层确认送达（集成用例 IT-03 依赖它）。
-        if (self != null && self.equals(message.getSender()) && self.equals(message.getReceiver())) {
+        if (self != null && self.equals(sender) && self.equals(receiver)) {
             return;
         }
-        String peer = self != null && self.equals(message.getSender())
-                ? message.getReceiver() : message.getSender();
-        if (peer == null || peer.isEmpty()) {
+        if (self != null && self.equals(sender)) {
+            // 发送者字段是自己、接收者却是别人：服务器只会把消息转发给接收方，正常不会出现这种情况。
+            // 一旦出现说明本端与服务器对"我是谁"的认知不一致，继续分发会凭空造出一个以自己命名的窗口，
+            // 因此宁可丢弃并留日志，也不要污染界面。
+            LOGGER.warning(() -> "忽略身份异常的私聊消息: self=" + self + ", sender=" + sender
+                    + ", receiver=" + receiver);
             return;
         }
-        onEdt(() -> openPrivateWindow(peer).getPanel().onMessage(message));
+        if (sender == null || sender.isEmpty()) {
+            return;
+        }
+        // 走到这里发送者必然是对端，会话键直接取它即可
+        onEdt(() -> openPrivateWindow(sender).getPanel().onMessage(message));
     }
 
     /**
