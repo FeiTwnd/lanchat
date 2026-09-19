@@ -2,7 +2,7 @@
 
 一个基于 **Java SE + Socket + 多线程 + Swing** 的类 QQ 局域网聊天系统，采用 C/S 架构，
 纯标准库实现，**不依赖任何第三方框架**（不使用 Netty、Spring、JavaFX）。
-代码原创，总计约 11300 行主源码与 2280 行测试代码，全部中文注释。
+代码原创，总计 13063 行主源码（55 个文件）与 2283 行测试代码，全部中文注释。
 
 ---
 
@@ -12,7 +12,8 @@
 |---|---|---|
 | 局域网自动发现 | 启动客户端自动搜索局域网内的聊天服务器，一键填入地址 | UDP 广播 `LANCHAT_DISCOVER`，服务器应答自身 IP、端口与在线人数；发现失败时可手动输入 IP |
 | 用户管理 | 注册、登录、修改昵称、修改密码、按用户名查询、管理员删除用户 | 密码以「随机盐 + SHA-256」存储，不存明文；用户名唯一；同一账号不允许重复登录 |
-| 在线用户列表 | 实时展示在线用户，上线/下线/改名自动刷新 | 服务端 `ConcurrentHashMap` 维护在线表，变更后向所有客户端广播列表快照 |
+| 在线用户列表 | 好友树形式展示在线用户，按管理员/普通用户/离线分组并显示人数 | 服务端 `ConcurrentHashMap` 维护在线表，变更后向所有客户端广播列表快照；客户端 `JTree` + 自定义 `TreeCellRenderer` 渲染头像、昵称、账号与在线状态 |
+| 界面皮肤 | 无系统边框窗口、自绘标题栏与按钮、Java2D 生成头像与图标，零图片资源 | `com.chat.client.ui.theme` 包统一配色、字体与绘制；窗口可拖动、双击最大化、右下角缩放 |
 | 私聊 | 双击用户即可一对一聊天 | 消息含发送者/接收者/内容/时间/类型，服务器按接收者定向转发，对方不在线时明确回执失败 |
 | 群聊 | 群聊大厅，所有人可见 | 服务器广播给全部在线连接，含用户上下线系统通知 |
 | 文件传输 | 发送任意类型文件，带实时进度条 | 64KB 分块传输、接收方确认、SHA-256 完整性校验、失败自动清理残缺文件、单文件上限 200MB |
@@ -36,11 +37,30 @@
 | 异常 | 自定义 `ChatException` / `UserNotFoundException` / `FileTransferException`，配合 try-with-resources |
 | 多线程 | 连接处理线程池、发送线程池、心跳调度线程、UDP 应答线程、文件传输独立线程 |
 | 网络编程 | `ServerSocket` / `Socket`（TCP）+ `DatagramSocket`（UDP 广播发现） |
-| GUI | Swing：`JFrame`、`JPanel`、`JTable`、`JTextPane`、`JProgressBar`、`JPasswordField`、`JSplitPane` |
+| GUI | Swing：无边框 `JFrame` + 自绘标题栏、`JPanel`、`JTree`、`JTextPane`、`JProgressBar`、`JPasswordField`、`JSplitPane`、`JTabbedPane`、`CardLayout` |
+| 自绘资源 | Java2D 绘制图标（`Glyphs`）与头像（`AvatarFactory`），不引入任何图片文件；`SkinButton` 自定义绘制四种按钮形态 |
+| 线程模型 | 网络回调线程只做协议解码，所有窗口创建、显示与文本渲染统一切换到事件分发线程（EDT） |
 | 持久化 | 文件 IO（`java.nio.file`）+ 可选 JDBC（MySQL） |
 | 设计模式 | 单例（`ChatServer`）、工厂（`ChatMessageFactory`）、模板方法/策略（`AbstractMessageHandler`）、DAO、观察者（`ServerObserver`）、监听器（`ChatListener`） |
 | 序列化 | `Message` 实现 `Serializable`，TCP 上使用 `ObjectOutputStream` 逐帧传输 |
 | 日志 | `java.util.logging` 记录关键操作 |
+
+### 界面设计要点
+
+界面全部由代码绘制，**不包含任何图片资源文件**（不使用 `.png`、`.ico`、字体图标等外部素材），
+因此不存在素材版权问题，也便于逐行讲解：
+
+| 类 | 职责 |
+|---|---|
+| `theme/Theme` | 统一配色常量、字体探测（微软雅黑 → 苹方 → Noto Sans CJK → 文泉驿 → 逻辑字体）与少量全局外观键 |
+| `theme/Glyphs` | 用 `Painter` 函数式接口 + lambda 描述图标，`Glyphs.of(size, color, painter)` 生成 `Icon` |
+| `theme/AvatarFactory` | 按昵称首字与配色表生成渐变圆角头像，带在线状态圆点与管理员描边，并做缓存 |
+| `theme/SkinButton` | 自绘按钮，提供 `PRIMARY` / `NORMAL` / `GHOST` / `DANGER` 四种形态与图标 + 文本布局 |
+| `theme/SkinTitleBar` | 自绘标题栏：拖动移动窗口、双击最大化/还原、最小化与关闭按钮 |
+| `theme/WindowResizer` | 在 `JLayeredPane` 上叠加右/下/右下三个透明手柄，实现无边框窗口缩放 |
+| `BaseUI` | 无边框窗口骨架：根面板背景、描边、标题栏与 `body()` 内容区，统一各窗口结构 |
+| `OnlineUserTree` | 好友树：根节点显示在线人数，管理员/普通用户/离线三个分组，关键词过滤与离线置灰 |
+| `ClientUI` | 唯一的消息分发者：把网络线程回调切到 EDT，再按类型投递给聊天窗口、文件窗口或好友树 |
 
 ---
 
@@ -181,13 +201,15 @@ IDEA 的编译输出目录是 `out/`，与脚本使用的 `build/`、`dist/` 互
 2. 启动客户端，点击「自动发现服务器」；若发现失败，手动填写服务器 IP 与端口 `9527`。
 3. 点击「注册新账号」创建普通账号（用户名 3-16 位字母/数字/下划线且以字母开头，密码 6-32 位），
    注册成功后会自动登录。
-4. 登录后主界面左侧显示在线用户列表：
+4. 登录后主界面左侧是好友树，按「管理员 / 普通用户 / 离线」分组并显示人数，离线用户置灰保留在树中：
+   - 搜索框输入用户名或昵称即可过滤
    - 双击某个用户 → 打开私聊窗口
    - 「进入群聊大厅」→ 群聊窗口
    - 「发送文件」→ 选择文件并发送，对方确认后开始传输，窗口内显示进度条
    - 「查询聊天记录」→ 按用户名与日期范围检索
    - 「导出我的聊天记录」→ 导出到 `data/export/`
-5. 多开几个客户端即可体验多人在线、私聊、群聊与文件互传。
+5. 所有窗口无系统边框：按住标题栏拖动可移动窗口，双击标题栏最大化/还原，拖动右边缘、下边缘或右下角可缩放。
+6. 多开几个客户端即可体验多人在线、私聊、群聊与文件互传。
 
 ---
 
@@ -203,6 +225,7 @@ LANChat/
 │   ├── service/       业务层：用户、消息、文件三大服务
 │   ├── server/        服务器端：主服务、连接处理器、用户管理、UDP 发现、控制台界面
 │   └── client/        客户端：网络层 + ui 子包的 Swing 界面
+│       └── ui/theme/  界面皮肤：配色与字体、Java2D 图标与头像、自绘按钮与标题栏、窗口缩放手柄
 ├── src/test/java/com/chat/test/       测试代码（零依赖自研测试框架）
 ├── scripts/           构建、启动、测试、清理脚本（sh + bat）
 ├── config/            chat.properties 配置文件
@@ -211,7 +234,7 @@ LANChat/
 ├── dist/              构建输出的可执行 jar（构建后生成）
 └── docs/              文档
     ├── design/        需求分析、系统设计、数据库设计、实现说明
-    ├── test/          测试报告、测试用例表
+    ├── test/          测试报告、测试用例表、界面走查截图（screenshots）与缺陷证据（evidence）
     ├── report/        课程设计报告
     ├── ppt/           答辩 PPT 大纲
     └── 用户手册.md
@@ -274,6 +297,7 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 |---|---|---|---|
 | 单元测试 | 47 | 全部通过 | 密码安全、用户 DAO、用户服务、消息服务与持久化、文件传输 |
 | 集成测试 | 7 | 全部通过 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景 |
+| 界面走查 | 13 | 全部通过 | 无边框窗口与拖动缩放、好友树分组、私聊/群聊渲染次数、文件传输进度、离线归组（Xvfb + Robot，截图见 `docs/test/screenshots/`） |
 
 详细的用例清单与结果见 `docs/test/测试报告.md` 与 `docs/test/测试用例表.md`。
 

@@ -1,0 +1,92 @@
+# D-15 现场证据：接收文件时客户端死锁的线程转储（修复前）
+#
+# 来源：Xvfb 界面走查脚本第 3 次运行（/tmp/uishots/run3.log），采集日期 2026-09-19。
+# 关键结论：chat-receiver 停在 ClientUI.routeFileMessage 的 setVisible 上并等待 JTextArea 文档读锁；
+#           AWT-EventQueue-0 停在 FileTransferUI.appendLog 的 JTextArea.append 上并等待 AWT 树锁；
+#           两者持锁顺序相反，构成死锁，界面自此不再响应任何绘制请求。
+
+[截图] SC-06-私聊窗口.png (620x480)
+9月 19, 2026 1:07:12 下午 com.chat.service.FileService prepareSend
+信息: 准备发送文件 lanchat-ui-shot13822189494150918741.bin（120.00 MB，1920 块）
+[信息] 传输编号 = 5885c5f3-a83d-42ac-b728-bfb5421415b7
+[诊断] 可见窗口:
+    ServerUI | 局域网聊天程序 - 服务器控制台 v1.0
+    ClientUI | 局域网聊天程序 - 系统管理员(admin)
+    GroupChatUI | 局域网聊天程序 - 群聊大厅
+    PrivateChatUI | 与 bob 私聊 - 局域网聊天程序
+    PrivateChatUI | 与 admin 私聊 - 局域网聊天程序
+[诊断] 已创建任意文件窗口: false
+[诊断] admin 客户端连接状态: true
+[诊断] 线程 chat-receiver 状态 WAITING
+        at java.base/java.lang.Object.wait0(Native Method)
+        at java.base/java.lang.Object.wait(Object.java:366)
+        at java.base/java.lang.Object.wait(Object.java:339)
+        at java.desktop/javax.swing.text.AbstractDocument.readLock(AbstractDocument.java:1421)
+        at java.desktop/javax.swing.plaf.basic.BasicTextUI.getPreferredSize(BasicTextUI.java:955)
+        at java.desktop/javax.swing.plaf.basic.BasicTextAreaUI.getPreferredSize(BasicTextAreaUI.java:121)
+        at java.desktop/javax.swing.JComponent.getPreferredSize(JComponent.java:1734)
+        at java.desktop/javax.swing.JTextArea.getPreferredSize(JTextArea.java:623)
+        at java.desktop/javax.swing.text.JTextComponent.getPreferredScrollableViewportSize(JTextComponent.java:1995)
+        at java.desktop/javax.swing.JTextArea.getPreferredScrollableViewportSize(JTextArea.java:702)
+        at java.desktop/javax.swing.ViewportLayout.preferredLayoutSize(ViewportLayout.java:100)
+        at java.desktop/java.awt.Container.preferredSize(Container.java:1826)
+        at java.desktop/java.awt.Container.getPreferredSize(Container.java:1810)
+        at java.desktop/javax.swing.JComponent.getPreferredSize(JComponent.java:1736)
+        at java.desktop/javax.swing.ScrollPaneLayout.preferredLayoutSize(ScrollPaneLayout.java:500)
+        at java.desktop/java.awt.Container.preferredSize(Container.java:1826)
+        at java.desktop/java.awt.Container.getPreferredSize(Container.java:1810)
+        at java.desktop/javax.swing.JComponent.getPreferredSize(JComponent.java:1736)
+        at java.desktop/java.awt.BorderLayout.layoutContainer(BorderLayout.java:826)
+        at java.desktop/java.awt.Container.layout(Container.java:1541)
+        at java.desktop/java.awt.Container.doLayout(Container.java:1530)
+        at java.desktop/java.awt.Container.validateTree(Container.java:1725)
+        at java.desktop/java.awt.Container.validateTree(Container.java:1734)
+        at java.desktop/java.awt.Container.validateTree(Container.java:1734)
+        at java.desktop/java.awt.Container.validateTree(Container.java:1734)
+        at java.desktop/java.awt.Container.validateTree(Container.java:1734)
+        at java.desktop/java.awt.Container.validate(Container.java:1660)
+        at java.desktop/java.awt.Container.validateUnconditionally(Container.java:1697)
+        at java.desktop/java.awt.Window.show(Window.java:1055)
+        at java.desktop/java.awt.Component.show(Component.java:1728)
+        at java.desktop/java.awt.Component.setVisible(Component.java:1675)
+        at java.desktop/java.awt.Window.setVisible(Window.java:1036)
+        at com.chat.client.ui.ClientUI.routeFileMessage(ClientUI.java:614)
+        at com.chat.client.ui.ClientUI.onMessage(ClientUI.java:566)
+        at com.chat.client.ChatClient.notifyMessage(ChatClient.java:655)
+        at com.chat.client.ChatClient.handleIncoming(ChatClient.java:253)
+        at com.chat.client.ChatClient.receiveLoop(ChatClient.java:210)
+        at java.base/java.lang.Thread.run(Thread.java:1583)
+[诊断] 线程 AWT-EventQueue-0 状态 BLOCKED
+        at java.desktop/java.awt.Component.invalidate(Component.java:3023)
+        at java.desktop/java.awt.Container.invalidate(Container.java:1617)
+        at java.desktop/javax.swing.JComponent.revalidate(JComponent.java:4954)
+        at java.desktop/javax.swing.plaf.basic.BasicTextUI$RootView.preferenceChanged(BasicTextUI.java:1523)
+        at java.desktop/javax.swing.text.View.preferenceChanged(View.java:286)
+        at java.desktop/javax.swing.text.PlainView.updateDamage(PlainView.java:697)
+        at java.desktop/javax.swing.text.PlainView.insertUpdate(PlainView.java:591)
+        at java.desktop/javax.swing.plaf.basic.BasicTextUI$RootView.insertUpdate(BasicTextUI.java:1727)
+        at java.desktop/javax.swing.plaf.basic.BasicTextUI$UpdateHandler.insertUpdate(BasicTextUI.java:1994)
+        at java.desktop/javax.swing.text.AbstractDocument.fireInsertUpdate(AbstractDocument.java:227)
+        at java.desktop/javax.swing.text.AbstractDocument.handleInsertString(AbstractDocument.java:781)
+        at java.desktop/javax.swing.text.AbstractDocument.insertString(AbstractDocument.java:740)
+        at java.desktop/javax.swing.text.PlainDocument.insertString(PlainDocument.java:131)
+        at java.desktop/javax.swing.JTextArea.append(JTextArea.java:482)
+        at com.chat.client.ui.FileTransferUI.lambda$appendLog$4(FileTransferUI.java:229)
+        at java.desktop/java.awt.event.InvocationEvent.dispatch(InvocationEvent.java:318)
+        at java.desktop/java.awt.EventQueue.dispatchEventImpl(EventQueue.java:773)
+        at java.desktop/java.awt.EventQueue$4.run(EventQueue.java:720)
+        at java.desktop/java.awt.EventQueue$4.run(EventQueue.java:714)
+        at java.base/java.security.AccessController.doPrivileged(AccessController.java:400)
+        at java.base/java.security.ProtectionDomain$JavaSecurityAccessImpl.doIntersectionPrivilege(ProtectionDomain.java:87)
+        at java.desktop/java.awt.EventQueue.dispatchEvent(EventQueue.java:742)
+        at java.desktop/java.awt.EventDispatchThread.pumpOneEventForFilters(EventDispatchThread.java:203)
+        at java.desktop/java.awt.EventDispatchThread.pumpEventsForFilter(EventDispatchThread.java:124)
+        at java.desktop/java.awt.EventDispatchThread.pumpEventsForHierarchy(EventDispatchThread.java:113)
+        at java.desktop/java.awt.EventDispatchThread.pumpEvents(EventDispatchThread.java:109)
+        at java.desktop/java.awt.EventDispatchThread.pumpEvents(EventDispatchThread.java:101)
+        at java.desktop/java.awt.EventDispatchThread.run(EventDispatchThread.java:90)
+[诊断] 线程 auto-accept 状态 TIMED_WAITING
+        at java.base/java.lang.Thread.sleep0(Native Method)
+        at java.base/java.lang.Thread.sleep(Thread.java:509)
+        at UiShots.sleep(UiShots.java:574)
+        at UiShots.lambda$startAutoAccept$3(UiShots.java:229)
