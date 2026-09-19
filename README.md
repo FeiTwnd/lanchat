@@ -264,7 +264,8 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 
 **自动发现不到服务器**
 部分无线 AP 开启了客户端隔离或屏蔽 UDP 广播，此时请手动填写服务器 IP 地址。
-自动发现只是便捷入口，不影响核心功能。
+自动发现只是便捷入口，不影响核心功能。服务器与客户端在同一台机器上时，
+程序会额外走一次回环探测，因此在单机演示场景下也能被发现。
 
 **端口被占用**
 修改 `config/chat.properties` 中的 `server.port`（客户端登录界面同步修改端口）后重启。

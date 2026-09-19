@@ -338,11 +338,37 @@ public final class ChatServer {
     }
 
     /**
-     * 获取本机局域网地址，用于日志与 UDP 应答。
+     * 获取本机用于对外通告的局域网地址。
      *
-     * @return 本机 IP 字符串；获取失败时返回 127.0.0.1
+     * <p>取值顺序：优先返回第一个非回环网卡上的 IPv4 地址，全部取不到时再回退
+     * {@code InetAddress.getLocalHost()}，最后兜底 127.0.0.1。</p>
+     *
+     * <p>为什么不直接用 {@code getLocalHost()}：在不少 Linux 发行版上该名称解析到
+     * {@code /etc/hosts} 中指向回环地址的记录（例如 127.0.1.1），导致 UDP 自动发现
+     * 应答里通告的是回环地址，同机与局域网内的客户端都会连接失败或误判。</p>
+     *
+     * @return 本机 IP 字符串
      */
     public String localAddress() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> interfaces =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                java.net.NetworkInterface networkInterface = interfaces.nextElement();
+                if (!networkInterface.isUp() || networkInterface.isLoopback()
+                        || !networkInterface.supportsMulticast()) {
+                    continue;
+                }
+                for (java.net.InterfaceAddress address : networkInterface.getInterfaceAddresses()) {
+                    InetAddress candidate = address.getAddress();
+                    if (candidate instanceof java.net.Inet4Address && !candidate.isLoopbackAddress()) {
+                        return candidate.getHostAddress();
+                    }
+                }
+            }
+        } catch (java.net.SocketException e) {
+            LOGGER.log(Level.FINE, "网卡枚举失败，回退 getLocalHost()", e);
+        }
         try {
             return InetAddress.getLocalHost().getHostAddress();
         } catch (IOException e) {

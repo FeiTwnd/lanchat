@@ -163,6 +163,7 @@ public class DiscoveryClient {
                     LOGGER.fine(() -> "向 " + address + " 广播失败: " + e.getMessage());
                 }
             }
+            sendLoopbackProbe(socket, payload, port, servers);
             collectResponses(socket, servers, timeoutMillis);
         } catch (SocketException e) {
             LOGGER.log(Level.WARNING, "自动发现失败（无法创建 UDP 套接字）: " + e.getMessage(), e);
@@ -171,6 +172,41 @@ public class DiscoveryClient {
         result.sort((a, b) -> a.getHost().compareTo(b.getHost()));
         LOGGER.info(() -> "自动发现完成，共找到 " + result.size() + " 台服务器");
         return result;
+    }
+
+    /**
+     * 额外向回环地址发一次单播探测。
+     *
+     * <p>UDP 广播通常不会回到本机，而教室演示、开发自测与集成测试都常在同一台机器上
+     * 同时运行服务器与客户端。补一次回环单播，可让"本机服务器"立即可被发现，
+     * 无需依赖操作系统的广播回环行为。</p>
+     *
+     * @param socket  套接字
+     * @param payload 请求报文
+     * @param port    发现端口
+     * @param servers 结果集合
+     */
+    private void sendLoopbackProbe(DatagramSocket socket, byte[] payload, int port, Set<ServerInfo> servers) {
+        try {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            socket.send(new DatagramPacket(payload, payload.length, loopback, port));
+            // 本机应答几乎瞬时到达，单独收一次并设置短超时，避免拖慢整体发现过程
+            socket.setSoTimeout(300);
+            byte[] buffer = new byte[256];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            socket.receive(packet);
+            String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
+                    StandardCharsets.UTF_8);
+            ServerInfo info = parse(text);
+            if (info != null) {
+                // 应答中的地址可能是 0.0.0.0 或非回环地址，本机场景统一归一化为回环地址更可靠
+                servers.add(new ServerInfo(loopback.getHostAddress(), info.getPort(), info.getOnlineCount()));
+            }
+        } catch (SocketTimeoutException e) {
+            LOGGER.fine("回环探测未获应答，继续等待广播应答");
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "回环探测失败: " + e.getMessage(), e);
+        }
     }
 
     /**
