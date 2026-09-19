@@ -99,6 +99,14 @@ public class LoginUI extends BaseUI implements ChatListener {
     private transient ChatClient client;
 
     /**
+     * 会话所有权是否已交接给主窗口。
+     *
+     * <p>登录成功后连接由 {@link ClientUI} 接管，此时登录窗口的关闭动作只应释放窗口自身，
+     * 若仍然关闭连接会把刚建立的会话一并断开，导致主窗口一出现就提示连接已断开。</p>
+     */
+    private transient boolean sessionHandedOver;
+
+    /**
      * 构造登录窗口。
      */
     public LoginUI() {
@@ -279,6 +287,8 @@ public class LoginUI extends BaseUI implements ChatListener {
         setBusy(false, "登录成功");
         ClientUI main = new ClientUI(client);
         main.setVisible(true);
+        // 先标记所有权已交接，再关闭登录窗口，避免 dispose() 把正在使用的连接关掉
+        sessionHandedOver = true;
         dispose();
     }
 
@@ -590,7 +600,9 @@ public class LoginUI extends BaseUI implements ChatListener {
     public void dispose() {
         if (client != null) {
             client.removeListener(this);
-            client.close();
+            if (!sessionHandedOver) {
+                client.close();
+            }
         }
         super.dispose();
     }

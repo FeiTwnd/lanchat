@@ -595,8 +595,11 @@ public class ClientUI extends BaseUI implements ChatListener {
         onEdt(() -> {
             statusLabel.setText(reason);
             if (!connected) {
-                showError(reason + "\n程序将退出，请重新登录。");
+                // 断开是终态：先注销监听再关闭连接，否则 close() 会再次回调本方法，
+                // 用“已断开与服务器的连接”覆盖真实原因并弹出第二个对话框
+                client.removeListener(this);
                 client.close();
+                showError(reason + "\n程序将退出，请重新登录。");
                 dispose();
                 System.exit(0);
             }
