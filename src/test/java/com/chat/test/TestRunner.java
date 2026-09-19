@@ -20,6 +20,9 @@ import java.util.List;
  * <p>为什么自研而不引入 JUnit：见 {@link Test} 的说明；自研运行器同时让
  * “测试用例表”的生成变得直接——运行输出即是测试报告的数据来源。</p>
  *
+ * <p>计数口径：执行 = 通过 + 跳过 + 失败。跳过用于"环境不满足"（例如本机没有可用的
+ * MySQL），与失败区分开，避免环境问题被误读成代码缺陷。</p>
+ *
  * @author Java 课程设计
  * @version 1.0
  */
@@ -31,6 +34,9 @@ public final class TestRunner {
     /** 通过用例数 */
     private static int passed;
 
+    /** 跳过用例数：环境不满足（例如数据库不可用）时用于如实统计 */
+    private static int skipped;
+
     /** 失败用例列表 */
     private static final List<String> failures = new ArrayList<>();
 
@@ -39,6 +45,37 @@ public final class TestRunner {
 
     /** 私有构造，禁止实例化 */
     private TestRunner() {
+    }
+
+    /**
+     * 跳过当前用例。
+     *
+     * <p>用于"环境不满足"而非"代码有问题"的场景：本项目的存储只保留数据库，
+     * 单元测试与集成测试都需要 MySQL，未安装或未启动时应当报告跳过，
+     * 而不是把 20 多个用例全部判为失败。</p>
+     *
+     * @param reason 跳过原因
+     */
+    public static void skip(String reason) {
+        throw new SkippedCaseException(reason);
+    }
+
+    /**
+     * 用例被跳过的信号。
+     */
+    public static final class SkippedCaseException extends RuntimeException {
+
+        /** 序列化版本号 */
+        private static final long serialVersionUID = 20260919L;
+
+        /**
+         * 构造跳过信号。
+         *
+         * @param reason 跳过原因
+         */
+        SkippedCaseException(String reason) {
+            super(reason);
+        }
     }
 
     /**
@@ -123,6 +160,12 @@ public final class TestRunner {
             System.out.println("  [通过] " + title + " (" + method.getName() + ")");
         } catch (InvocationTargetException e) {
             Throwable cause = e.getTargetException();
+            if (cause instanceof SkippedCaseException) {
+                skipped++;
+                System.out.println("  [跳过] " + title + " (" + method.getName() + ")");
+                System.out.println("         原因: " + cause.getMessage());
+                return;
+            }
             failures.add(testClass.getSimpleName() + "." + method.getName() + " - " + title
                     + " : " + cause.getMessage());
             System.out.println("  [失败] " + title + " (" + method.getName() + ")");
@@ -141,12 +184,16 @@ public final class TestRunner {
         System.out.println("\n========== 测试汇总 ==========");
         System.out.println("执行用例: " + executed);
         System.out.println("通过: " + passed);
+        System.out.println("跳过: " + skipped);
         System.out.println("失败: " + failures.size());
         if (!failures.isEmpty()) {
             System.out.println("失败明细:");
             failures.forEach(item -> System.out.println("  - " + item));
         }
-        System.out.println("结论: " + (failures.isEmpty() ? "全部通过" : "存在失败用例"));
+        String conclusion = failures.isEmpty()
+                ? (skipped > 0 ? "全部通过（" + skipped + " 条因环境不满足被跳过）" : "全部通过")
+                : "存在失败用例";
+        System.out.println("结论: " + conclusion);
         if (!failures.isEmpty()) {
             System.exit(1);
         }

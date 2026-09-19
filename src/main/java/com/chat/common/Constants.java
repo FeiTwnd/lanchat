@@ -83,20 +83,26 @@ public final class Constants {
     /** 配置文件路径 */
     public static final String CONFIG_FILE = ROOT_DIR + File.separator + "config" + File.separator + "chat.properties";
 
-    /** 数据目录 */
+    /** 数据目录：仅用于接收文件与导出聊天记录，用户与聊天记录本身存数据库 */
     public static final String DATA_DIR = ROOT_DIR + File.separator + "data";
-
-    /** 用户数据文件路径（文件型持久化） */
-    public static final String USER_FILE = DATA_DIR + File.separator + "users.txt";
-
-    /** 聊天历史目录，按天分文件存放 */
-    public static final String HISTORY_DIR = DATA_DIR + File.separator + "history";
 
     /** 接收文件的默认保存目录 */
     public static final String RECEIVED_DIR = DATA_DIR + File.separator + "received";
 
     /** 聊天记录导出目录 */
     public static final String EXPORT_DIR = DATA_DIR + File.separator + "export";
+
+    // ==================== 数据库（唯一存储） ====================
+
+    /** 数据库驱动类名默认值 */
+    public static final String DB_DRIVER = "com.mysql.cj.jdbc.Driver";
+
+    /** 数据库连接地址默认值：本机 lanchat 库 */
+    public static final String DB_URL = "jdbc:mysql://localhost:3306/lanchat?useSSL=false"
+            + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&characterEncoding=utf8";
+
+    /** 数据库用户名默认值 */
+    public static final String DB_USER = "root";
 
     // ==================== 默认账号 ====================
 
@@ -143,10 +149,10 @@ public final class Constants {
     /** 编码统一使用 UTF-8，避免中文乱码 */
     public static final Charset CHARSET = StandardCharsets.UTF_8;
 
-    /** 日期时间格式：用于界面展示与历史记录落盘 */
+    /** 日期时间格式：用于界面展示与消息记录 */
     public static final String DATE_TIME_PATTERN = "yyyy-MM-dd HH:mm:ss";
 
-    /** 仅日期格式：用于历史文件按天切分 */
+    /** 仅日期格式：用于按日期检索与展示 */
     public static final String DATE_PATTERN = "yyyy-MM-dd";
 
     /** 字段分隔符：用户文件与历史日志均使用制表符分隔，避免与消息正文中的空格冲突 */

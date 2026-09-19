@@ -2,9 +2,10 @@
 -- 局域网聊天程序 数据库初始化脚本（可选加分项）
 -- ============================================================================
 -- 说明：
---   1. 本项目默认使用文件存储（data/users.txt 与 data/history/*.log），
---      零依赖即可运行；数据库属于可选增强，需在 config/chat.properties 中
---      显式设置 db.enabled=true 后才会启用。
+--   1. 本项目只使用数据库存储：用户账号存 chat_user，聊天记录存 chat_message；
+--      磁盘上仅保留接收到的文件（data/received）与导出的聊天记录（data/export）。
+--      服务器启动时会自动建表（CREATE TABLE IF NOT EXISTS），本脚本用于手工初始化
+--      或重建库表，两者结构保持一致。
 --   2. 本脚本按 MySQL 8.x 语法编写，字符集统一 utf8mb4 以完整支持中文与特殊符号。
 --   3. 执行方式：
 --        mysql -u root -p < sql/schema.sql

@@ -5,7 +5,6 @@ import com.chat.common.Result;
 import com.chat.common.User;
 import com.chat.dao.JdbcUserDao;
 import com.chat.dao.UserDao;
-import com.chat.dao.UserDaoImpl;
 import com.chat.exception.ChatException;
 import com.chat.exception.UserNotFoundException;
 import com.chat.util.SecurityUtil;
@@ -41,21 +40,14 @@ public class UserService {
     private final UserDao userDao;
 
     /**
-     * 默认构造：优先使用数据库（若驱动与配置可用），否则回退文件存储。
+     * 默认构造：使用数据库存储（本项目唯一的存储方式）。
      *
-     * <p>该策略使“加分项数据库”成为可选增强，而不是运行前提。</p>
+     * <p>不做任何降级：数据库不可用时把原因记录下来，由
+     * {@link #isStorageAvailable()} 交给服务器启动自检统一汇报。</p>
      */
     public UserService() {
-        UserDao dao;
-        JdbcUserDao jdbc = JdbcUserDao.fromConfig();
-        if (jdbc.isAvailable()) {
-            dao = jdbc;
-            LOGGER.info("用户服务使用数据库存储");
-        } else {
-            dao = new UserDaoImpl();
-            LOGGER.info("用户服务使用文件存储");
-        }
-        this.userDao = dao;
+        this.userDao = JdbcUserDao.fromConfig();
+        LOGGER.info("用户服务使用数据库存储");
     }
 
     /**
@@ -69,6 +61,24 @@ public class UserService {
             throw new IllegalArgumentException("UserDao 不能为 null");
         }
         this.userDao = userDao;
+    }
+
+    /**
+     * 判断用户存储是否可用。
+     *
+     * @return 可用返回 true
+     */
+    public boolean isStorageAvailable() {
+        return userDao instanceof JdbcUserDao && ((JdbcUserDao) userDao).isAvailable();
+    }
+
+    /**
+     * 获取用户存储不可用的原因。
+     *
+     * @return 原因描述；可用时返回空字符串
+     */
+    public String storageFailureReason() {
+        return userDao instanceof JdbcUserDao ? ((JdbcUserDao) userDao).failureReason() : "";
     }
 
     /**

@@ -11,8 +11,7 @@ import com.chat.common.MessageType;
 import com.chat.common.Result;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
-import com.chat.dao.MessageDaoImpl;
-import com.chat.dao.UserDaoImpl;
+import com.chat.dao.JdbcUserDao;
 import com.chat.server.ChatServer;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
@@ -141,6 +140,11 @@ public class IntegrationTest {
      */
     public static void main(String[] args) {
         IntegrationTest test = new IntegrationTest();
+        if (!test.useTestDatabase()) {
+            System.out.println("========== 集成测试汇总 ==========");
+            System.out.println("结论: 已跳过（" + TestDatabase.unavailableReason() + "）");
+            return;
+        }
         int failures = 0;
         failures += test.runSafely("集成测试 1：服务器启动与客户端登录", test::testLogin);
         failures += test.runSafely("集成测试 2：在线用户列表实时刷新", test::testUserListRefresh);
@@ -436,9 +440,25 @@ public class IntegrationTest {
         shutdownClients();
         buffers.clear();
         root = TestRunner.createTempDir("integration");
+        // 接收文件与导出记录仍落磁盘，因此仍用临时根目录隔离
         System.setProperty("lanchat.data.dir", root.toString());
         port = findFreePort();
+        // 用户与聊天记录在数据库里，每个用例前清库再重新造数据
+        TestDatabase.reset();
         seedUsers();
+    }
+
+    /**
+     * 让本次运行只使用独立的测试库，避免污染开发者真实使用的库。
+     *
+     * @return 测试库可用返回 true；不可用时返回 false 并给出原因
+     */
+    private boolean useTestDatabase() {
+        System.setProperty("lanchat.db.url", TestDatabase.url());
+        System.setProperty("lanchat.db.user", TestDatabase.user());
+        System.setProperty("lanchat.db.password", TestDatabase.password());
+        System.setProperty("lanchat.db.driver", TestDatabase.driver());
+        return TestDatabase.isAvailable();
     }
 
     /**
@@ -448,7 +468,8 @@ public class IntegrationTest {
      */
     private void seedUsers() {
         try {
-            UserDaoImpl dao = new UserDaoImpl(com.chat.common.Config.userFile());
+            JdbcUserDao dao = new JdbcUserDao(TestDatabase.driver(), TestDatabase.url(),
+                    TestDatabase.user(), TestDatabase.password());
             for (String username : new String[]{"alice01", "bob01"}) {
                 User user = new User(username, username + "的昵称");
                 user.setSalt(com.chat.util.SecurityUtil.generateSalt());
@@ -457,8 +478,7 @@ public class IntegrationTest {
                 dao.save(user);
             }
         } catch (Exception e) {
-            throw new IllegalStateException("测试用户初始化失败(" + com.chat.common.Config.userFile()
-                    + "): " + e, e);
+            throw new IllegalStateException("测试用户初始化失败(" + TestDatabase.url() + "): " + e, e);
         }
     }
 
@@ -552,6 +572,14 @@ public class IntegrationTest {
      * 关闭服务器与客户端，清理临时目录。
      */
     private void shutdown() {
+        // 清理测试库中的残留数据，避免影响下一次运行
+        try {
+            if (TestDatabase.isAvailable()) {
+                TestDatabase.reset();
+            }
+        } catch (RuntimeException e) {
+            System.out.println("[警告] 测试数据清理失败: " + e.getMessage());
+        }
         shutdownClients();
         shutdownServer();
         TestRunner.deleteRecursively(root);

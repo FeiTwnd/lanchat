@@ -18,14 +18,15 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 用户数据访问的 JDBC 实现（可选加分项）。
+ * 用户数据访问的 JDBC 实现。
  *
- * <p>职责：把用户持久化到关系型数据库，与 {@link UserDaoImpl} 构成 {@link UserDao} 的两种实现，
- * 由 {@link #isAvailable()} 在运行期探测驱动是否存在，实现“有数据库用数据库、没有则降级文件”的无缝切换。</p>
+ * <p>职责：把用户持久化到 {@code chat_user} 表。本类是 {@link UserDao} 的唯一实现——
+ * 文件型实现已随"存储只保留数据库"的调整删除，因此不存在任何降级路径。</p>
  *
- * <p>为什么不在编译期依赖驱动：项目要求不使用任何第三方框架且需保持“零依赖即可编译运行”。
+ * <p>为什么不在编译期依赖驱动：项目要求不使用任何第三方框架。
  * 本类只使用 {@code java.sql} 标准接口，驱动类名由配置提供，通过反射加载，
- * 因此没有 JDBC 驱动时也能照常编译，只是运行期 {@link #isAvailable()} 返回 false。</p>
+ * 因此驱动不在 classpath 上时也能照常编译，只是运行期 {@link #isAvailable()} 返回 false，
+ * 并由启动自检把原因报出来。</p>
  *
  * <p>SQL 注入防护：所有涉及用户输入的语句一律使用 {@link PreparedStatement} 参数占位符，
  * 禁止字符串拼接 SQL。</p>
@@ -48,7 +49,10 @@ public class JdbcUserDao implements UserDao {
     private final String dbPassword;
 
     /** 是否可用：驱动类加载成功且建表语句执行成功 */
-    private boolean available;
+    private volatile boolean available;
+
+    /** 不可用原因，供启动自检与界面提示展示 */
+    private volatile String failureReason = "";
 
     /**
      * 使用配置构造 DAO，并尝试建表。
@@ -78,13 +82,15 @@ public class JdbcUserDao implements UserDao {
         try {
             Class.forName(driverClass);
             createTableIfAbsent();
-            LOGGER.info(() -> "数据库模式已启用: " + url);
+            LOGGER.info(() -> "用户数据存储已就绪: " + url);
             return true;
         } catch (ClassNotFoundException e) {
-            LOGGER.info("未找到 JDBC 驱动 " + driverClass + "，用户数据将使用文件存储");
+            failureReason = "未找到 JDBC 驱动 " + driverClass + "，请把驱动加入项目依赖";
+            LOGGER.severe(failureReason);
             return false;
         } catch (SQLException e) {
-            LOGGER.log(Level.WARNING, "数据库初始化失败，用户数据将使用文件存储: " + e.getMessage(), e);
+            failureReason = "数据库连接或建表失败: " + e.getMessage();
+            LOGGER.log(Level.SEVERE, failureReason, e);
             return false;
         }
     }
@@ -120,12 +126,21 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 判断数据库模式是否可用。
+     * 判断存储是否可用。
      *
      * @return 可用返回 true
      */
     public boolean isAvailable() {
         return available;
+    }
+
+    /**
+     * 获取不可用原因。
+     *
+     * @return 原因描述；可用时为空字符串
+     */
+    public String failureReason() {
+        return failureReason;
     }
 
     /**
@@ -373,28 +388,17 @@ public class JdbcUserDao implements UserDao {
     /**
      * 从配置文件构造 JDBC DAO 的工厂方法。
      *
-     * <p>数据库属于可选加分项，必须由使用者在 {@code config/chat.properties} 中
-     * 显式设置 {@code db.enabled=true} 才会尝试连接。这一“显式开启”策略是必要的：
-     * 若仅凭 classpath 上是否存在驱动就自动连库，一旦本机恰好在运行 MySQL，
-     * 程序会静默改用数据库存储，导致用户数据出现在预期之外的位置（测试环境尤其危险）。</p>
+     * <p>数据库是本项目唯一的存储，因此不再有"是否启用"的开关：
+     * 连接参数来自 {@code config/chat.properties}，并允许用系统属性
+     * {@code lanchat.db.url} 等覆盖，便于测试使用独立库。</p>
      *
-     * @return JDBC DAO 实例；未启用或配置缺失时返回不可用实例
+     * @return JDBC DAO 实例，可通过 {@link #isAvailable()} 判断是否真的可用
      */
     public static JdbcUserDao fromConfig() {
-        boolean enabled = com.chat.common.Config.getBoolean("db.enabled", false);
-        if (!enabled) {
-            LOGGER.info("未启用数据库模式（db.enabled=false），用户数据使用文件存储");
-            return new JdbcUserDao("未启用", "未启用", "", "");
-        }
-        String driver = com.chat.common.Config.get("db.driver", "com.mysql.cj.jdbc.Driver");
-        String url = com.chat.common.Config.get("db.url", "");
-        String user = com.chat.common.Config.get("db.username", "");
-        String password = com.chat.common.Config.get("db.password", "");
-        if (url.isEmpty()) {
-            url = "jdbc:mysql://localhost:3306/lanchat?useSSL=false&serverTimezone=UTC"
-                    + "&allowPublicKeyRetrieval=true";
-        }
-        return new JdbcUserDao(driver, url, user, password);
+        return new JdbcUserDao(com.chat.common.Config.dbDriver(),
+                com.chat.common.Config.dbUrl(),
+                com.chat.common.Config.dbUser(),
+                com.chat.common.Config.dbPassword());
     }
 
     /**

@@ -155,30 +155,69 @@ public final class Config {
     }
 
     /**
-     * 获取用户数据文件路径。
-     *
-     * @return 用户数据文件路径
-     */
-    public static String userFile() {
-        return dataDir() + java.io.File.separator + "users.txt";
-    }
-
-    /**
-     * 获取聊天历史目录。
-     *
-     * @return 历史记录目录路径
-     */
-    public static String historyDir() {
-        return dataDir() + java.io.File.separator + "history";
-    }
-
-    /**
      * 获取聊天记录导出目录。
      *
      * @return 导出目录路径
      */
     public static String exportDir() {
         return dataDir() + java.io.File.separator + "export";
+    }
+
+    /**
+     * 获取数据库驱动类名。
+     *
+     * <p>取值优先级：系统属性 {@code lanchat.db.driver} > 配置文件 {@code db.driver}。</p>
+     *
+     * @return 驱动类名
+     */
+    public static String dbDriver() {
+        return override("lanchat.db.driver", get("db.driver", Constants.DB_DRIVER));
+    }
+
+    /**
+     * 获取数据库连接地址。
+     *
+     * <p>取值优先级：系统属性 {@code lanchat.db.url} > 配置文件 {@code db.url}。
+     * 提供系统属性覆盖是为了让自动化测试与演示使用独立的库，
+     * 避免测试数据写进开发者的真实数据库。</p>
+     *
+     * @return JDBC 连接地址
+     */
+    public static String dbUrl() {
+        return override("lanchat.db.url", get("db.url", Constants.DB_URL));
+    }
+
+    /**
+     * 获取数据库用户名。
+     *
+     * @return 数据库用户名
+     */
+    public static String dbUser() {
+        return override("lanchat.db.user", get("db.username", Constants.DB_USER));
+    }
+
+    /**
+     * 获取数据库密码。
+     *
+     * @return 数据库密码；未配置时为空字符串
+     */
+    public static String dbPassword() {
+        return override("lanchat.db.password", get("db.password", ""));
+    }
+
+    /**
+     * 读取系统属性覆盖值。
+     *
+     * @param property      系统属性名
+     * @param fromFileValue 配置文件中的取值
+     * @return 系统属性存在且非空时优先返回，否则返回配置文件取值
+     */
+    private static String override(String property, String fromFileValue) {
+        String value = System.getProperty(property);
+        if (value != null && !value.trim().isEmpty()) {
+            return value.trim();
+        }
+        return fromFileValue;
     }
 
     /**

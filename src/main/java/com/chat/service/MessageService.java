@@ -3,8 +3,8 @@ package com.chat.service;
 import com.chat.common.Constants;
 import com.chat.common.Message;
 import com.chat.common.Result;
+import com.chat.dao.JdbcMessageDao;
 import com.chat.dao.MessageDao;
-import com.chat.dao.MessageDaoImpl;
 import com.chat.exception.ChatException;
 
 import java.io.File;
@@ -18,7 +18,7 @@ import java.util.logging.Logger;
 /**
  * 消息业务服务。
  *
- * <p>职责：聊天消息的落盘、检索与导出。检索支持“用户名 + 时间范围”两种条件的任意组合，
+ * <p>职责：聊天消息的保存（数据库）、检索与导出。检索支持“用户名 + 时间范围”两种条件的任意组合，
  * 以及按关键字全文模糊检索。</p>
  *
  * <p>设计要点：所有时间范围参数在进入 DAO 之前统一补全边界值
@@ -36,10 +36,10 @@ public class MessageService {
     private final MessageDao messageDao;
 
     /**
-     * 默认构造：使用文件型历史记录存储。
+     * 默认构造：使用数据库存储（本项目唯一的存储方式）。
      */
     public MessageService() {
-        this(new MessageDaoImpl());
+        this(JdbcMessageDao.fromConfig());
     }
 
     /**
@@ -53,6 +53,24 @@ public class MessageService {
             throw new IllegalArgumentException("MessageDao 不能为 null");
         }
         this.messageDao = messageDao;
+    }
+
+    /**
+     * 判断聊天记录存储是否可用。
+     *
+     * @return 可用返回 true
+     */
+    public boolean isStorageAvailable() {
+        return messageDao instanceof JdbcMessageDao && ((JdbcMessageDao) messageDao).isAvailable();
+    }
+
+    /**
+     * 获取聊天记录存储不可用的原因。
+     *
+     * @return 原因描述；可用时返回空字符串
+     */
+    public String storageFailureReason() {
+        return messageDao instanceof JdbcMessageDao ? ((JdbcMessageDao) messageDao).failureReason() : "";
     }
 
     /**

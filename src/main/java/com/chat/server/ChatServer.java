@@ -126,6 +126,16 @@ public final class ChatServer {
         }
         try {
             initServices();
+            // 存储只保留数据库，因此数据库不可用时不存在"降级运行"这一选项：
+            // 与其让服务器起来却无法注册/登录/查历史，不如明确拒绝启动并说明原因
+            if (!userService.isStorageAvailable() || !messageService.isStorageAvailable()) {
+                String reason = !userService.isStorageAvailable()
+                        ? userService.storageFailureReason() : messageService.storageFailureReason();
+                LOGGER.severe("数据库不可用，服务器拒绝启动: " + reason);
+                notify(ServerObserver.EventType.ERROR, "数据库不可用，服务器拒绝启动: " + reason);
+                rollback();
+                return false;
+            }
             userService.initAdminIfAbsent();
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);

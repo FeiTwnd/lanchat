@@ -15,13 +15,16 @@ import com.chat.exception.ChatException;
  * <p>职责：在 {@link BaseDao} 通用能力之上，补充“按用户 + 时间范围”的检索能力，
  * 以及历史记录导出能力——这正是课程设计“消息持久化与查询”评分点的落点。</p>
  *
+ * <p>实现只有数据库一种：{@link JdbcMessageDao}。接口保留是为了让业务层依赖抽象，
+ * 也便于测试注入不同数据源。</p>
+ *
  * @author Java 课程设计
  * @version 1.0
  */
 public interface MessageDao extends BaseDao<Message, Long> {
 
     /**
-     * 追加一条消息到历史记录（按天分文件）。
+     * 追加一条聊天记录到数据库。
      *
      * @param message 待保存消息
      * @return 保存成功返回 true

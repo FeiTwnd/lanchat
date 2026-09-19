@@ -27,7 +27,7 @@ public final class DateUtil {
     private static final DateTimeFormatter TIME_FORMATTER =
             DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    /** 仅日期格式器：yyyy-MM-dd，用于历史文件按天切分 */
+    /** 仅日期格式器：yyyy-MM-dd，用于按日期检索与展示 */
     private static final DateTimeFormatter DATE_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
