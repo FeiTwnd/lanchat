@@ -4,7 +4,6 @@ import com.chat.common.ChatMessageFactory;
 import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.MessageType;
-import com.chat.common.Result;
 import com.chat.exception.FileTransferException;
 import com.chat.util.FileUtil;
 
