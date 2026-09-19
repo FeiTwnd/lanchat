@@ -12,6 +12,7 @@ import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import java.awt.Component;
+import java.awt.Graphics;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -22,7 +23,7 @@ import java.util.Map;
  *
  * <p>结构：根节点（在线用户 N 人）→ 分组节点（管理员 / 普通用户 / 离线）→ 用户叶子节点。</p>
  *
- * <p>叶子节点用 Java2D 头像区分状态：在线用户使用彩色头像加绿色状态点，
+ * <p>叶子节点用默认头像区分状态：在线用户头像底色较深并带绿色状态点，
  * 管理员额外带橙色描边；本次会话出现过、随后从服务器列表中消失的用户归入"离线"分组并置灰。
  * 之所以保留离线用户，是因为"谁刚刚还在"对使用者有信息价值，也便于说明服务器推送的是
  * 实时在线列表而不是好友关系（本项目没有好友关系表）。</p>
@@ -73,7 +74,7 @@ public class OnlineUserTree extends JTree {
         setBackground(Theme.CARD);
         setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
         UserNodeRenderer renderer = new UserNodeRenderer();
-        renderer.setBackgroundSelectionColor(Theme.PRIMARY_LIGHT);
+        renderer.setBackgroundSelectionColor(Theme.SELECTION_BG);
         renderer.setTextSelectionColor(Theme.TEXT);
         renderer.setBorderSelectionColor(null);
         renderer.setBackgroundNonSelectionColor(Theme.CARD);
@@ -254,11 +255,19 @@ public class OnlineUserTree extends JTree {
 
     /**
      * 节点渲染器：分组节点显示人数与群组头像，用户节点显示头像与两行文本。
+     *
+     * <p>选中态不依赖外观默认行为：整行背景由本类自己在 {@link #paint(Graphics)} 中填满。
+     * 默认实现只从图标之后开始填充，头像所在的图标区不会被覆盖，于是露出底层外观的
+     * 选中色——系统外观是 GTK 时那是一块橙色，看起来就像"选中效果坏了"。
+     * 文字配色不随选中与否改变，是为了让浅色头像与主色分组图标在浅蓝选中底上依然清晰。</p>
      */
     private static final class UserNodeRenderer extends DefaultTreeCellRenderer {
 
         /** 序列化版本号 */
         private static final long serialVersionUID = 20260920L;
+
+        /** 当前渲染的行是否处于选中态 */
+        private transient boolean selectedRow;
 
         /**
          * 渲染节点。
@@ -277,8 +286,10 @@ public class OnlineUserTree extends JTree {
                                                      boolean expanded, boolean leaf, int row,
                                                      boolean hasFocus) {
             super.getTreeCellRendererComponent(tree, value, selected, expanded, leaf, row, hasFocus);
+            selectedRow = selected;
             Object payload = ((DefaultMutableTreeNode) value).getUserObject();
             setFont(Theme.fontBase());
+            setIconTextGap(6);
             if (payload instanceof Entry) {
                 Entry entry = (Entry) payload;
                 User user = entry.user;
@@ -287,20 +298,34 @@ public class OnlineUserTree extends JTree {
                 String state = entry.online ? "在线" : "离线";
                 String role = user.isAdmin() ? "管理员" : "普通用户";
                 setText("<html><body style='margin:0'>"
-                        + nickname + "<br><font color='" + hex(entry.online ? Theme.TEXT_WEAK : Theme.OFFLINE)
-                        + "'>" + user.getUsername() + " · " + role + " · " + state + "</font></body></html>");
-                setIcon(AvatarFactory.avatar(nickname, entry.online, user.isAdmin(), 34));
+                        + "<font color='" + hex(entry.online ? Theme.TEXT : Theme.TEXT_WEAK) + "'>"
+                        + nickname + "</font><br>"
+                        + "<font color='" + hex(entry.online ? Theme.TEXT_WEAK : Theme.OFFLINE) + "'>"
+                        + user.getUsername() + " · " + role + " · " + state + "</font></body></html>");
+                setIcon(AvatarFactory.avatar(entry.online, user.isAdmin(), 34));
                 setToolTipText(nickname + "（" + user.getUsername() + "）· " + role + " · " + state);
-                if (!entry.online && !selected) {
-                    setForeground(Theme.TEXT_WEAK);
-                }
             } else {
                 setText(String.valueOf(payload));
                 setFont(Theme.fontBold());
                 setIcon(AvatarFactory.groupAvatar(26));
+                setForeground(Theme.TEXT);
                 setToolTipText(String.valueOf(payload));
             }
             return this;
+        }
+
+        /**
+         * 绘制单元格：选中行先填满整行浅主色底，再交给父类绘制图标与文字。
+         *
+         * @param g 画笔
+         */
+        @Override
+        public void paint(Graphics g) {
+            if (selectedRow) {
+                g.setColor(Theme.SELECTION_BG);
+                g.fillRect(0, 0, getWidth(), getHeight());
+            }
+            super.paint(g);
         }
 
         /**

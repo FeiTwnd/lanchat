@@ -24,13 +24,14 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.event.ActionListener;
+import java.io.File;
 import java.time.LocalDateTime;
 
 /**
  * 聊天面板抽象基类。
  *
- * <p>职责：统一实现“消息渲染 + 输入发送”这一聊天窗口的公共部分，
- * 私聊窗口与群聊窗口只需提供标题与发送策略即可复用全部界面逻辑。</p>
+ * <p>职责：统一实现“消息渲染 + 输入发送 + 发送文件”这一聊天窗口的公共部分，
+ * 私聊窗口与群聊窗口只需提供标题、发送目标与文件接收方策略即可复用全部界面逻辑。</p>
  *
  * <p>为什么用 {@code JTextPane} 而不是 {@code JTextArea}：聊天记录需要按消息来源
  * 使用不同颜色（本人、他人、系统通知）区分，只有 {@code StyledDocument} 才能做到
@@ -70,8 +71,10 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     protected final JTextField inputField = new JTextField();
 
     /** 发送按钮 */
-    /** 发送按钮 */
     protected final JButton sendButton = new SkinButton("发送", SkinButton.Kind.PRIMARY);
+
+    /** 发送文件按钮：接收方由当前聊天窗口决定，因此不需要使用者再去选人 */
+    protected final JButton fileButton = new SkinButton("发送文件", SkinButton.Kind.NORMAL);
 
     /** 清空按钮 */
     protected final JButton clearButton = new SkinButton("清空", SkinButton.Kind.NORMAL);
@@ -129,14 +132,59 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         panel.add(inputField, BorderLayout.CENTER);
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         buttons.setOpaque(false);
+        buttons.add(fileButton);
         buttons.add(sendButton);
         buttons.add(clearButton);
         panel.add(buttons, BorderLayout.EAST);
         ActionListener sendAction = e -> sendCurrentInput();
         sendButton.addActionListener(sendAction);
         inputField.addActionListener(sendAction);
+        fileButton.setIcon(com.chat.client.ui.theme.Glyphs.file(14, Theme.TEXT));
+        fileButton.setIconTextGap(6);
+        fileButton.addActionListener(e -> chooseAndSendFile());
         clearButton.addActionListener(e -> clearHistory());
         return panel;
+    }
+
+    /**
+     * 弹出文件选择框并把选中的文件交给子类发送。
+     *
+     * <p>文件发送入口放在聊天窗口内而不是主窗口的用户列表上：聊天窗口本来就知道
+     * "我在跟谁聊"，接收方不必再由使用者选一次。</p>
+     */
+    protected void chooseAndSendFile() {
+        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+        chooser.setDialogTitle("选择要发送的文件");
+        chooser.setFileSelectionMode(javax.swing.JFileChooser.FILES_ONLY);
+        if (chooser.showOpenDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        File file = chooser.getSelectedFile();
+        if (file == null || !file.isFile()) {
+            return;
+        }
+        sendFileTo(file);
+    }
+
+    /**
+     * 执行实际的文件发送，由子类决定接收方。
+     *
+     * @param file 已选中的待发送文件
+     */
+    protected abstract void sendFileTo(File file);
+
+    /**
+     * 弹出确认框。
+     *
+     * <p>只允许在事件分发线程调用：本面板的按钮回调本身就运行在该线程上。</p>
+     *
+     * @param message 询问内容
+     * @return 选择"是"返回 true
+     */
+    protected boolean askConfirm(String message) {
+        return javax.swing.JOptionPane.showConfirmDialog(this, message, "请确认",
+                javax.swing.JOptionPane.YES_NO_OPTION,
+                javax.swing.JOptionPane.QUESTION_MESSAGE) == javax.swing.JOptionPane.YES_OPTION;
     }
 
     /**

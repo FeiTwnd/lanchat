@@ -347,31 +347,17 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 获取对端用户名。
+     * 以指定文件立即发起一次传输。
      *
-     * @return 对端用户名
-     */
-    public String getPeer() {
-        return peer;
-    }
-
-    /**
-     * 为发送场景直接设置文件（供工具栏“发送文件”按钮复用）。
+     * <p>聊天窗口内的"发送文件"按钮已经知道接收方是谁（私聊窗口是对端、群聊窗口是全部在线用户），
+     * 因此选择文件后可以直接发起，不需要再让使用者回到本窗口点一次"发送"。</p>
      *
-     * @param file 文件
+     * @param file 待发送文件
      */
-    public void presetFile(File file) {
-        this.selectedFile = file;
+    public void sendNow(File file) {
+        selectedFile = file;
         fileLabel.setText("已选择: " + file.getName() + "（" + FileUtil.humanSize(file.length()) + "）");
-    }
-
-    /**
-     * 获取当前活跃的传输窗口数量，用于测试断言。
-     *
-     * @return 窗口数量
-     */
-    public static int activeWindowCount() {
-        return WINDOWS.size();
+        startSend();
     }
 
     /**

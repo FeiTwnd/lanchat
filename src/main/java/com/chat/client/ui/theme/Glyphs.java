@@ -155,6 +155,34 @@ public final class Glyphs {
     }
 
     /**
+     * 树节点的展开/收起三角。
+     *
+     * <p>之所以自绘而不用外观自带的图标：好友树改用基础外观实现后（见 {@link Theme#installDefaults()}），
+     * 系统外观提供的树形图标不一定能正常绘制，自绘可以保证任何平台都显示同一套三角。</p>
+     *
+     * @param expanded 展开时为向下三角，收起时为向右三角
+     * @param size     边长
+     * @param color    颜色
+     * @return 图标
+     */
+    public static Icon treeArrow(final boolean expanded, final int size, final Color color) {
+        return of(size, color, (g, s) -> {
+            int left = Math.round(s * 0.30f);
+            int right = Math.round(s * 0.72f);
+            int top = Math.round(s * 0.24f);
+            int bottom = Math.round(s * 0.76f);
+            int middle = Math.round(s / 2f);
+            if (expanded) {
+                g.fillPolygon(new int[]{left, right, middle},
+                        new int[]{top, top, bottom}, 3);
+            } else {
+                g.fillPolygon(new int[]{left, right, left},
+                        new int[]{top, middle, bottom}, 3);
+            }
+        });
+    }
+
+    /**
      * 群聊图标：两个重叠气泡。
      *
      * @param size  边长

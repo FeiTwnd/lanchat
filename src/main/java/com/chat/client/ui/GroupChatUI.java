@@ -4,6 +4,8 @@ import com.chat.client.ChatClient;
 import com.chat.common.Constants;
 
 import java.awt.BorderLayout;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * 群聊窗口。
@@ -28,12 +30,13 @@ public class GroupChatUI extends BaseUI {
     /**
      * 构造群聊窗口。
      *
-     * @param client 客户端实例
-     * @param nickname 当前用户昵称，仅用于标题展示
+     * @param client      客户端实例
+     * @param nickname    当前用户昵称，仅用于标题展示
+     * @param onlineUsers 在线用户名提供者，用于群发文件
      */
-    public GroupChatUI(ChatClient client, String nickname) {
+    public GroupChatUI(ChatClient client, String nickname, Supplier<List<String>> onlineUsers) {
         super(Constants.APP_NAME + " - 群聊大厅");
-        this.panel = new GroupChatPanel(client);
+        this.panel = new GroupChatPanel(client, onlineUsers);
         body().setLayout(new BorderLayout());
         body().add(panel, BorderLayout.CENTER);
         panel.appendLine("[系统] 已进入群聊大厅（当前用户: " + nickname + "），发言对所有在线用户可见",

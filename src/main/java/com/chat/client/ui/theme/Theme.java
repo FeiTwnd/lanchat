@@ -30,8 +30,11 @@ public final class Theme {
     /** 主色调深色：渐变终点、按钮按下态 */
     public static final Color PRIMARY_DARK = new Color(0x0A8FC4);
 
-    /** 主色调浅色：列表悬停与选中背景 */
+    /** 主色调浅色：按钮悬停底、浅色强调底 */
     public static final Color PRIMARY_LIGHT = new Color(0xE4F5FD);
+
+    /** 列表与表格的选中背景：比 PRIMARY_LIGHT 略深，保证选中行一眼可辨，又不淹没浅色头像 */
+    public static final Color SELECTION_BG = new Color(0xCFE9FA);
 
     /** 窗口背景色 */
     public static final Color BG = new Color(0xF2F5F9);
@@ -56,6 +59,18 @@ public final class Theme {
 
     /** 管理员标识色 */
     public static final Color ADMIN = new Color(0xF5A623);
+
+    /** 默认头像底色（在线） */
+    public static final Color AVATAR_BG = new Color(0xD7E1EB);
+
+    /** 默认头像人形颜色（在线） */
+    public static final Color AVATAR_FG = new Color(0x8FA3B8);
+
+    /** 默认头像底色（离线，整体更浅以体现"不在线"） */
+    public static final Color AVATAR_BG_OFFLINE = new Color(0xEDF1F5);
+
+    /** 默认头像人形颜色（离线） */
+    public static final Color AVATAR_FG_OFFLINE = new Color(0xC2CCD6);
 
     /** 危险操作色 */
     public static final Color DANGER = new Color(0xE05B5B);
@@ -161,6 +176,31 @@ public final class Theme {
         // 空槽用 selectionBackground，故按“蓝底白字、灰底深字”设置
         UIManager.put("ProgressBar.selectionForeground", java.awt.Color.WHITE);
         UIManager.put("ProgressBar.selectionBackground", TEXT);
+        // 选中色必须显式覆盖：系统外观在带 GTK 的 Linux 上是 GTK 主题色（Ubuntu 为橙色 #E95420），
+        // 与蓝色主题冲突
+        UIManager.put("Tree.selectionBackground", SELECTION_BG);
+        UIManager.put("Tree.selectionForeground", TEXT);
+        UIManager.put("Table.selectionBackground", SELECTION_BG);
+        UIManager.put("Table.selectionForeground", TEXT);
+        UIManager.put("List.selectionBackground", SELECTION_BG);
+        UIManager.put("List.selectionForeground", TEXT);
+        UIManager.put("TextField.selectionBackground", SELECTION_BG);
+        UIManager.put("TextField.selectionForeground", TEXT);
+        UIManager.put("PasswordField.selectionBackground", SELECTION_BG);
+        UIManager.put("PasswordField.selectionForeground", TEXT);
+        UIManager.put("TextArea.selectionBackground", SELECTION_BG);
+        UIManager.put("TextArea.selectionForeground", TEXT);
+        UIManager.put("TextPane.selectionBackground", SELECTION_BG);
+        UIManager.put("TextPane.selectionForeground", TEXT);
+        // 树与表格改用基础外观实现，这是好友树"选中行颜色不对"的根因修复：
+        // 系统外观若为 GTK，会用自己的主题强调色填充整行选中背景（Ubuntu 是橙色）与行内空隙，
+        // 而树单元格渲染器只覆盖"头像 + 文字"这一块，于是两侧露出橙边；
+        // 基础实现把行背景完全交给渲染器，配色才由主题说了算。
+        // 代价是系统外观自带的展开/收起图标不再可用，因此改为自绘三角。
+        UIManager.put("TreeUI", "javax.swing.plaf.basic.BasicTreeUI");
+        UIManager.put("TableUI", "javax.swing.plaf.basic.BasicTableUI");
+        UIManager.put("Tree.collapsedIcon", Glyphs.treeArrow(false, 12, TEXT_WEAK));
+        UIManager.put("Tree.expandedIcon", Glyphs.treeArrow(true, 12, TEXT_WEAK));
         ready = true;
     }
 
@@ -179,23 +219,6 @@ public final class Theme {
         bar.setBorderPainted(false);
         bar.setStringPainted(true);
         bar.setFont(fontSmall());
-    }
-
-    /**
-     * 依据用户名稳定地挑选头像底色。
-     *
-     * <p>同一用户名每次得到相同颜色，避免列表刷新时头像闪烁。</p>
-     *
-     * @param seed 用户名或昵称
-     * @return 底色
-     */
-    public static Color avatarColor(String seed) {
-        Color[] palette = {
-                new Color(0x4A90D9), new Color(0x36B37E), new Color(0xF2994A),
-                new Color(0x9B59B6), new Color(0xE05B7B), new Color(0x2AA6B9),
-                new Color(0x7B8FA1), new Color(0xD4A017)};
-        String key = seed == null || seed.isEmpty() ? "?" : seed;
-        return palette[Math.floorMod(key.hashCode(), palette.length)];
     }
 
     /**

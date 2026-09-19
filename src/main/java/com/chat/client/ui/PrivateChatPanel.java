@@ -9,8 +9,8 @@ import com.chat.common.TextMessage;
  * 私聊面板：仅处理与指定好友之间的私聊消息。
  *
  * <p>继承 {@link BaseChatPanel} 复用消息渲染与输入发送逻辑，
- * 本类只负责两件差异化的行为：过滤条件（{@link #accepts(Message)}）
- * 与发送目标（{@link #doSend(String)}）。</p>
+ * 本类只负责三件差异化的行为：过滤条件（{@link #accepts(Message)}）、
+ * 发送目标（{@link #doSend(String)}）与文件接收方（{@link #sendFileTo(java.io.File)}）。</p>
  *
  * <p>为什么是独立类而不是私有内部类：{@link ClientUI} 需要按对端用户名
  * 复用并操作面板，若定义为私有内部类，其类型对外不可见，
@@ -63,6 +63,20 @@ public class PrivateChatPanel extends BaseChatPanel {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }
         return sent;
+    }
+
+    /**
+     * 发送文件：接收方固定为当前私聊窗口的对端。
+     *
+     * @param file 待发送文件
+     */
+    @Override
+    protected void sendFileTo(java.io.File file) {
+        FileTransferUI window = FileTransferUI.windowFor(client, peer);
+        window.setVisible(true);
+        window.sendNow(file);
+        appendLine("[系统] 已向 " + peer + " 发起文件传输：" + file.getName() + "（" + peer
+                + " 确认后开始传输）", COLOR_SYSTEM);
     }
 
     /**

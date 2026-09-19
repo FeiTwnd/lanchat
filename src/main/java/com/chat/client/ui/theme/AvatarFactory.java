@@ -1,24 +1,28 @@
 package com.chat.client.ui.theme;
 
 import javax.swing.Icon;
+import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Component;
-import java.awt.Font;
-import java.awt.FontMetrics;
-import java.awt.GradientPaint;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
+import java.awt.geom.Ellipse2D;
+import java.awt.Shape;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 头像绘制工厂。
  *
- * <p>职责：用 Java2D 绘制圆形渐变头像，并在右下角叠加在线状态点、在边缘叠加管理员标记。
- * 名称只取首字（中文取一个字，英文取首字母），无需任何图片素材。</p>
+ * <p>职责：用 Java2D 绘制默认头像（圆底人形剪影），并在右下角叠加在线状态点、
+ * 在边缘叠加管理员标记。所有用户共用同一个默认头像，不使用任何图片素材。</p>
  *
- * <p>绘制结果按"显示名 + 在线状态 + 管理员标记 + 尺寸"缓存，避免列表每次刷新都重绘。</p>
+ * <p>为什么不再按用户名生成彩色首字头像：首字头像需要给每个名字稳定地分配底色，
+ * 于是每家聊天软件都长得不一样，而渐变色在浅色列表里显得杂乱；默认头像只保留
+ * "这里是一个人"这一个语义，在线状态交给状态点表达，视觉上更干净、也更容易维护。</p>
+ *
+ * <p>绘制结果按"账号、在线状态、管理员标记、尺寸"缓存，避免列表每次刷新都重绘。</p>
  *
  * @author Java 课程设计
  * @version 1.0
@@ -33,22 +37,20 @@ public final class AvatarFactory {
     }
 
     /**
-     * 获取用户头像。
+     * 获取默认头像。
      *
-     * @param displayName 显示名（昵称优先，空时使用用户名）
-     * @param online      是否在线
-     * @param admin       是否管理员
-     * @param size        边长
+     * @param online 是否在线，决定底色深浅
+     * @param admin  是否管理员，决定是否描边
+     * @param size   边长
      * @return 图标
      */
-    public static Icon avatar(String displayName, boolean online, boolean admin, int size) {
-        String name = displayName == null || displayName.trim().isEmpty() ? "?" : displayName.trim();
-        String key = name + '|' + online + '|' + admin + '|' + size;
-        return CACHE.computeIfAbsent(key, ignored -> draw(name, online, admin, size));
+    public static Icon avatar(boolean online, boolean admin, int size) {
+        String key = "person|" + online + '|' + admin + '|' + size;
+        return CACHE.computeIfAbsent(key, ignored -> draw(online, admin, size));
     }
 
     /**
-     * 获取群聊头像：圆角底上三个白色人形剪影。
+     * 获取群聊头像：主色圆角底上三个白色人形剪影。
      *
      * @param size 边长
      * @return 图标
@@ -72,7 +74,7 @@ public final class AvatarFactory {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
                 g2.translate(x, y);
-                g2.setPaint(new GradientPaint(0, 0, Theme.PRIMARY, 0, size, Theme.PRIMARY_DARK));
+                g2.setColor(Theme.PRIMARY);
                 g2.fillRoundRect(0, 0, size - 1, size - 1, size / 3, size / 3);
                 g2.setColor(Color.WHITE);
                 int head = Math.max(3, size / 5);
@@ -89,15 +91,17 @@ public final class AvatarFactory {
     }
 
     /**
-     * 实际绘制头像。
+     * 实际绘制默认头像。
      *
-     * @param name   显示名
+     * <p>人形由"头部圆 + 肩部椭圆"两部分组成，绘制前把画布裁剪成外圆，
+     * 肩部超出圆的部分会被自动裁掉，不需要手工计算交点。</p>
+     *
      * @param online 是否在线
      * @param admin  是否管理员
      * @param size   边长
      * @return 图标
      */
-    private static Icon draw(final String name, final boolean online, final boolean admin, final int size) {
+    private static Icon draw(final boolean online, final boolean admin, final int size) {
         return new Icon() {
 
             @Override
@@ -114,25 +118,27 @@ public final class AvatarFactory {
             public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
-                        RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
                 g2.translate(x, y);
-                Color base = online ? Theme.avatarColor(name) : Theme.OFFLINE;
-                g2.setPaint(new GradientPaint(0, 0, base.brighter(), 0, size, base.darker()));
-                int arc = Math.max(6, size / 3);
-                g2.fillRoundRect(0, 0, size - 1, size - 1, arc, arc);
+                int diameter = size - 1;
+                g2.setColor(online ? Theme.AVATAR_BG : Theme.AVATAR_BG_OFFLINE);
+                g2.fillOval(0, 0, diameter, diameter);
+
+                Shape outer = new Ellipse2D.Float(0, 0, diameter, diameter);
+                Shape oldClip = g2.getClip();
+                g2.clip(outer);
+                g2.setColor(online ? Theme.AVATAR_FG : Theme.AVATAR_FG_OFFLINE);
+                int head = Math.round(size * 0.30f);
+                g2.fillOval((size - head) / 2, Math.round(size * 0.22f), head, head);
+                int bodyWidth = Math.round(size * 0.60f);
+                int bodyHeight = Math.round(size * 0.48f);
+                g2.fillOval((size - bodyWidth) / 2, Math.round(size * 0.58f), bodyWidth, bodyHeight);
+                g2.setClip(oldClip);
+
                 if (admin) {
                     g2.setColor(Theme.ADMIN);
-                    g2.setStroke(new java.awt.BasicStroke(Math.max(1.5f, size / 14f)));
-                    g2.drawRoundRect(1, 1, size - 3, size - 3, arc, arc);
+                    g2.setStroke(new BasicStroke(Math.max(1.5f, size / 14f)));
+                    g2.drawOval(1, 1, size - 3, size - 3);
                 }
-                g2.setColor(Color.WHITE);
-                g2.setFont(Theme.font(Math.max(9, (int) (size * 0.46)), Font.BOLD));
-                FontMetrics metrics = g2.getFontMetrics();
-                String initial = new String(Character.toChars(name.codePointAt(0)));
-                int textX = (size - metrics.stringWidth(initial)) / 2;
-                int textY = (size - metrics.getHeight()) / 2 + metrics.getAscent();
-                g2.drawString(initial, textX, textY);
                 paintStatusDot(g2, size, online);
                 g2.dispose();
             }

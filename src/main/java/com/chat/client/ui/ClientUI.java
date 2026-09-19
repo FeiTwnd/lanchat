@@ -17,7 +17,6 @@ import com.chat.common.UserListCodec;
 import com.chat.service.MessageService;
 
 import javax.swing.BorderFactory;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -42,8 +41,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 客户端主窗口。
  *
  * <p>职责：登录成功后的操作中枢——展示在线用户列表，提供打开私聊、进入群聊、
- * 发送文件、查询历史记录、修改昵称、删除用户（管理员）等入口，
- * 并把服务器推送的消息路由到对应窗口。</p>
+ * 查询历史记录、修改昵称、删除用户（管理员）等入口，并把服务器推送的消息路由到对应窗口。
+ * 发送文件的入口在各聊天窗口内（见 {@link BaseChatPanel}），本窗口不再提供"先选人再发文件"的路径。</p>
  *
  * <p>消息路由规则：</p>
  * <ul>
@@ -163,7 +162,7 @@ public class ClientUI extends BaseUI implements ChatListener {
         actions.add(SkinButton.normal("刷新列表", e -> client.requestUserList())
                 .withIcon(Glyphs.refresh(16, Theme.PRIMARY)));
 
-        headerAvatar.setIcon(AvatarFactory.avatar(displayName(), true, false, 48));
+        headerAvatar.setIcon(AvatarFactory.avatar(true, false, 48));
         card.add(headerAvatar, BorderLayout.WEST);
         card.add(identity, BorderLayout.CENTER);
         card.add(actions, BorderLayout.EAST);
@@ -231,7 +230,6 @@ public class ClientUI extends BaseUI implements ChatListener {
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
         buttons.setOpaque(false);
         buttons.add(SkinButton.primary("发起私聊", e -> openPrivateChatWithSelected()));
-        buttons.add(SkinButton.normal("发送文件", e -> openFileTransferWithSelected()));
         buttons.add(SkinButton.normal("刷新列表", e -> client.requestUserList()));
         panel.add(buttons, BorderLayout.SOUTH);
         panel.setPreferredSize(new Dimension(450, 480));
@@ -250,8 +248,6 @@ public class ClientUI extends BaseUI implements ChatListener {
 
         panel.add(SkinButton.menu("进入群聊大厅", Glyphs.group(18, Theme.PRIMARY),
                 e -> openGroupWindow(true)));
-        panel.add(SkinButton.menu("发送文件…", Glyphs.file(18, Theme.PRIMARY),
-                e -> chooseAndSendFile()));
         panel.add(SkinButton.menu("查询聊天记录…", Glyphs.history(18, Theme.PRIMARY),
                 e -> showHistoryDialog()));
         panel.add(SkinButton.menu("导出我的聊天记录", Glyphs.export(18, Theme.PRIMARY),
@@ -273,8 +269,9 @@ public class ClientUI extends BaseUI implements ChatListener {
         tips.setText("使用提示：\n"
                 + "1. 在线用户列表由服务器实时推送，用户上线/下线会自动刷新。\n"
                 + "2. 双击某个用户即可开始私聊；离线的用户会被置灰并归入“离线”分组。\n"
-                + "3. 文件传输支持进度显示，接收到的文件保存在 data/received 目录。\n"
-                + "4. 聊天记录按天保存在 data/history 目录，可按时间范围查询与导出。");
+                + "3. 发送文件在私聊窗口或群聊窗口内点击“发送文件”：私聊发给对方，群聊发给全部在线用户。\n"
+                + "4. 接收到的文件保存在 data/received 目录，聊天记录按天保存在 data/history 目录。\n"
+                + "5. 聊天记录可按时间范围查询，也可以一键导出为文本文件。");
         panel.add(new JScrollPane(tips));
         return panel;
     }
@@ -341,23 +338,6 @@ public class ClientUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 打开当前选中用户的文件传输窗口。
-     */
-    private void openFileTransferWithSelected() {
-        String username = selectedUsername();
-        if (username == null) {
-            showInfo("请先在左侧列表中选择一个用户");
-            return;
-        }
-        if (username.equals(client.getUsername())) {
-            showInfo("不能给自己发送文件");
-            return;
-        }
-        FileTransferUI window = FileTransferUI.windowFor(client, username);
-        window.setVisible(true);
-    }
-
-    /**
      * 获取当前选中的用户名。
      *
      * @return 用户名；未选中用户节点时返回 null
@@ -393,7 +373,9 @@ public class ClientUI extends BaseUI implements ChatListener {
      */
     public GroupChatUI openGroupWindow(boolean toFront) {
         if (groupWindow == null) {
-            groupWindow = new GroupChatUI(client, client.getNickname());
+            // 群发文件需要知道"此刻有哪些人在线"，面板只接收一份只读快照，不反向依赖本窗口
+            groupWindow = new GroupChatUI(client, client.getNickname(),
+                    () -> new java.util.ArrayList<>(userTree.onlineUsers().keySet()));
         }
         if (!groupWindow.isVisible()) {
             groupWindow.setVisible(true);
@@ -402,31 +384,6 @@ public class ClientUI extends BaseUI implements ChatListener {
             groupWindow.toFront();
         }
         return groupWindow;
-    }
-
-    /**
-     * 弹出文件选择框并向选中用户发送文件。
-     */
-    private void chooseAndSendFile() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("选择要发送的文件");
-        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
-            return;
-        }
-        File file = chooser.getSelectedFile();
-        String receiver = selectedUsername();
-        if (receiver == null || receiver.equals(client.getUsername())) {
-            String input = JOptionPane.showInputDialog(this, "请输入接收方用户名:", "选择接收方",
-                    JOptionPane.QUESTION_MESSAGE);
-            if (input == null || input.trim().isEmpty()) {
-                return;
-            }
-            receiver = input.trim();
-        }
-        FileTransferUI window = FileTransferUI.windowFor(client, receiver);
-        window.setVisible(true);
-        window.presetFile(file);
-        window.appendLog("已选择文件 " + file.getAbsolutePath() + "，点击“发送”开始传输");
     }
 
     /**
@@ -522,7 +479,7 @@ public class ClientUI extends BaseUI implements ChatListener {
         onEdt(() -> {
             int count = userTree.update(users);
             boolean admin = isAdmin();
-            headerAvatar.setIcon(AvatarFactory.avatar(displayName(), true, admin, 48));
+            headerAvatar.setIcon(AvatarFactory.avatar(true, admin, 48));
             headerMeta.setText((admin ? "管理员" : "普通用户")
                     + " · 在线用户 " + count + " 人"
                     + (userTree.offlineCount() > 0 ? "，离线 " + userTree.offlineCount() + " 人" : "")
