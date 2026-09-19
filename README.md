@@ -2,7 +2,7 @@
 
 一个基于 **Java SE + Socket + 多线程 + Swing** 的类 QQ 局域网聊天系统，采用 C/S 架构，
 纯标准库实现，**不依赖任何第三方框架**（不使用 Netty、Spring、JavaFX）。
-代码原创，总计 13063 行主源码（55 个文件）与 2283 行测试代码，全部中文注释。
+代码原创，总计 13186 行主源码（55 个文件）与 2284 行测试代码，全部中文注释。
 
 ---
 
@@ -54,7 +54,7 @@
 |---|---|
 | `theme/Theme` | 统一配色常量、字体探测（微软雅黑 → 苹方 → Noto Sans CJK → 文泉驿 → 逻辑字体）与少量全局外观键 |
 | `theme/Glyphs` | 用 `Painter` 函数式接口 + lambda 描述图标，`Glyphs.of(size, color, painter)` 生成 `Icon` |
-| `theme/AvatarFactory` | 按昵称首字与配色表生成渐变圆角头像，带在线状态圆点与管理员描边，并做缓存 |
+| `theme/AvatarFactory` | 绘制统一的默认头像（圆底人形剪影）：在线底色更深并带绿色状态圆点，离线底色更浅、状态点为灰色，管理员带橙色描边，结果按状态缓存 |
 | `theme/SkinButton` | 自绘按钮，提供 `PRIMARY` / `NORMAL` / `GHOST` / `DANGER` 四种形态与图标 + 文本布局 |
 | `theme/SkinTitleBar` | 自绘标题栏：拖动移动窗口、双击最大化/还原、最小化与关闭按钮 |
 | `theme/WindowResizer` | 在 `JLayeredPane` 上叠加右/下/右下三个透明手柄，实现无边框窗口缩放 |
@@ -82,98 +82,28 @@ javac -version
 
 ## 四、快速开始
 
-### 方式一：使用脚本（推荐）
+### 方式一：在 IntelliJ IDEA 中运行（推荐）
 
-Linux / macOS：
-
-```bash
-# 1. 编译并运行全部测试，同时打包可执行 jar 到 dist/
-./scripts/build.sh
-
-# 2. 启动服务器（图形控制台）
-./scripts/run-server.sh
-#    或控制台模式（无图形界面，适合远程环境）
-./scripts/run-server.sh --console
-
-# 3. 启动客户端（可开多个终端模拟多个用户）
-./scripts/run-client.sh
-#    单机演示：自动先启动内置服务器再打开客户端
-./scripts/run-client.sh --local-server
-
-# 4. 仅运行测试
-./scripts/test.sh              # 单元测试 + 集成测试
-./scripts/test.sh unit         # 仅 47 个单元测试用例
-./scripts/test.sh integration  # 仅 7 个集成测试用例
-
-# 5. 清理构建产物（--all 会同时删除运行期数据）
-./scripts/clean.sh
-```
-
-Windows：
-
-```bat
-scripts\build.bat
-scripts\run-server.bat
-scripts\run-client.bat
-scripts\test.bat
-scripts\clean.bat
-```
-
-### 方式二：手动命令
-
-```bash
-# 编译主源码
-mkdir -p build/classes
-find src/main/java -name '*.java' > build/main-sources.txt
-javac -encoding UTF-8 -d build/classes @build/main-sources.txt
-
-# 启动服务器（图形控制台）
-java -cp build/classes com.chat.server.ChatServer
-
-# 启动服务器（控制台模式）
-java -cp build/classes com.chat.server.ChatServer --console
-
-# 启动客户端（可多开）
-java -cp build/classes com.chat.client.ChatClientApp
-
-# 运行测试
-javac -encoding UTF-8 -cp build/classes -d build/test-classes $(find src/test/java -name '*.java')
-java -cp build/classes:build/test-classes com.chat.test.TestRunner
-java -cp build/classes:build/test-classes com.chat.test.IntegrationTest
-```
-
-Windows 下把类路径分隔符 `:` 换成 `;`。
-
-### 方式三：运行已打包的 jar
-
-```bash
-java -jar dist/chat-server.jar            # 服务器
-java -jar dist/chat-client.jar            # 客户端
-java -jar dist/chat-client.jar --help     # 查看命令行帮助
-java -jar dist/chat-test.jar              # 运行单元测试
-```
-
-### 方式四：在 IntelliJ IDEA 中运行
-
-本项目是普通 Java 工程，不依赖 Maven/Gradle，导入 IDEA 后只需三步。
+本项目是普通 Java 工程，不依赖 Maven/Gradle，用 IDEA 打开后按以下步骤操作即可。
 
 1. 打开工程：`File -> Open`，选择项目根目录（本工程没有 pom.xml，直接以普通工程打开即可）。
 2. 确认 SDK 与源码根：`File -> Project Structure -> Project` 中 SDK 选择 JDK 17 及以上
-   （本项目在 JDK 21 上验证）；右键 `src/main/java` 标记为 `Sources Root`，
-   右键 `src/test/java` 标记为 `Test Sources Root`。测试源码根未标记时，
+   （本项目在 JDK 21 上验证）；确认 `src/main/java` 已标记为 `Sources Root`、
+   `src/test/java` 已标记为 `Test Sources Root`。测试源码根未标记时，
    `com.chat.test` 包下的类会全部报红，测试也无法运行。
-3. 运行配置：`Run -> Edit Configurations` 新增 `Application` 类型配置，按需填写：
+3. 编译：菜单 `Build -> Rebuild Project`。主源码产物在 `out/production/LANChat`，
+   测试源码产物在 `out/test/LANChat`。
+4. 运行：在工具栏的运行配置下拉框中选择下表中的任一配置，点击 `Run`。
 
 | 配置名 | 主类 | 程序参数 | 说明 |
 | --- | --- | --- | --- |
 | 服务器（图形控制台） | `com.chat.server.ChatServer` | 无 | 带 Swing 控制台的服务器 |
-| 服务器（控制台模式） | `com.chat.server.ChatServer` | `--console` | 无图形界面，适合远程或无显示环境 |
 | 客户端（可多开） | `com.chat.client.ChatClientApp` | 无 | 演示多用户必须先允许并行运行 |
 | 客户端（含内置服务器） | `com.chat.client.ChatClientApp` | `--local-server` | 单机一键演示 |
 | 单元测试（47 用例） | `com.chat.test.TestRunner` | 无 | 项目自带的零依赖测试框架 |
 | 集成测试（7 用例） | `com.chat.test.IntegrationTest` | 无 | 内部自行启动服务器与多个客户端 |
 
-本机 `.idea/runConfigurations/` 下已生成上述 6 个配置，打开 IDEA 后可直接在下拉框中选择
+本机 `.idea/runConfigurations/` 下已生成上述 5 个配置，打开 IDEA 后可直接在下拉框中选择
 （IDE 工程文件按惯例不入库，因此只在本机生效）；若列表中没有出现，按上表手工新增即可。
 
 四个必须注意的坑：
@@ -183,14 +113,41 @@ java -jar dist/chat-test.jar              # 运行单元测试
   `out/`，会读不到配置文件而静默退化成内置默认值。
 - **多开客户端**：客户端配置需在 `Modify options` 中勾选 `Allow multiple instances`，
   否则第二次运行时 IDEA 会弹出 `Stop and Rerun` 并终止已登录的客户端，无法演示双人聊天。
-- **端口占用**：同一时刻只保留一个服务器实例（IDEA 中启动的、`scripts/run-server.sh` 启动的、
-  `dist/chat-server.jar` 启动的互斥），否则新实例会因 9527 端口被占用而启动失败，
-  运行集成测试前尤其需要检查。
+- **端口占用**：同一时刻只保留一个服务器实例（IDEA 中启动的与命令行启动的互斥），
+  否则新实例会因 9527 端口被占用而启动失败，运行集成测试前尤其需要检查。
 - **编码**：`File -> Settings -> Editor -> File Encodings` 统一选择 UTF-8，源码含中文注释与
   中文界面文案；另外 `config/chat.properties` 由 `Properties.load(InputStream)` 读取，
   该方法按 ISO-8859-1 解码，若要在配置值中写中文，需使用 `\uXXXX` 转义形式。
 
-IDEA 的编译输出目录是 `out/`，与脚本使用的 `build/`、`dist/` 互不干扰，两种方式可混用。
+IDEA 的编译输出目录是 `out/production/LANChat`（主源码）与 `out/test/LANChat`（测试源码），
+源码本身不产生其它中间目录。
+
+### 方式二：命令行方式（可选）
+
+在 IDEA 中构建过一次之后，也可以直接用命令行运行它的产物：
+
+```bash
+# 服务器（图形控制台）
+java -cp out/production/LANChat com.chat.server.ChatServer
+
+# 客户端（可多开）
+java -cp out/production/LANChat com.chat.client.ChatClientApp
+
+# 测试
+java -cp "out/production/LANChat:out/test/LANChat" com.chat.test.TestRunner
+java -cp "out/production/LANChat:out/test/LANChat" com.chat.test.IntegrationTest
+```
+
+Windows 下把类路径分隔符 `:` 换成 `;`。
+
+若不想依赖 IDEA 的产物目录，也可以自己编译到临时目录：
+
+```bash
+mkdir -p /tmp/lanchat-classes
+find src/main/java -name '*.java' > /tmp/lanchat-sources.txt
+javac -encoding UTF-8 -d /tmp/lanchat-classes @/tmp/lanchat-sources.txt
+java -cp /tmp/lanchat-classes com.chat.server.ChatServer
+```
 
 ---
 
@@ -205,7 +162,8 @@ IDEA 的编译输出目录是 `out/`，与脚本使用的 `build/`、`dist/` 互
    - 搜索框输入用户名或昵称即可过滤
    - 双击某个用户 → 打开私聊窗口
    - 「进入群聊大厅」→ 群聊窗口
-   - 「发送文件」→ 选择文件并发送，对方确认后开始传输，窗口内显示进度条
+   - 发送文件：在私聊窗口内点击「发送文件」直接把文件发给对方；在群聊窗口内点击
+     「发送文件」会先确认接收名单，然后群发给全部在线用户。接收方确认后开始传输，窗口内显示进度条
    - 「查询聊天记录」→ 按用户名与日期范围检索
    - 「导出我的聊天记录」→ 导出到 `data/export/`
 5. 所有窗口无系统边框：按住标题栏拖动可移动窗口，双击标题栏最大化/还原，拖动右边缘、下边缘或右下角可缩放。
@@ -227,11 +185,9 @@ LANChat/
 │   └── client/        客户端：网络层 + ui 子包的 Swing 界面
 │       └── ui/theme/  界面皮肤：配色与字体、Java2D 图标与头像、自绘按钮与标题栏、窗口缩放手柄
 ├── src/test/java/com/chat/test/       测试代码（零依赖自研测试框架）
-├── scripts/           构建、启动、测试、清理脚本（sh + bat）
 ├── config/            chat.properties 配置文件
 ├── sql/               schema.sql 数据库建表脚本（可选加分项）
 ├── data/              运行期数据（用户数据、聊天记录、接收与导出文件）
-├── dist/              构建输出的可执行 jar（构建后生成）
 └── docs/              文档
     ├── design/        需求分析、系统设计、数据库设计、实现说明
     ├── test/          测试报告、测试用例表、界面走查截图（screenshots）与缺陷证据（evidence）
@@ -276,8 +232,9 @@ mysql -u root -p < sql/schema.sql
 #    db.username=你的账号
 #    db.password=你的密码
 
-# 3. 把 MySQL 驱动加入类路径后启动服务器
-java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatServer
+# 3. 把 MySQL 驱动加入类路径后启动服务器（IDEA 中通过 File -> Project Structure -> Libraries
+#    添加驱动 jar；下面是命令行等价写法）
+java -cp "out/production/LANChat:/path/to/mysql-connector-j-8.0.33.jar" com.chat.server.ChatServer
 ```
 
 未显式设置 `db.enabled=true` 时，程序一律使用文件存储，不会尝试连接数据库。
@@ -287,17 +244,15 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 ## 八、测试
 
 项目采用**零依赖自研测试框架**（`@Test` 注解 + 反射运行器），不引入 JUnit，
-保证任何 JDK 环境都能直接编译运行。
-
-```bash
-./scripts/test.sh
-```
+保证任何 JDK 环境都能直接编译运行。在 IDEA 的运行配置下拉框中选择
+`单元测试（47 用例）` 或 `集成测试（7 用例）` 后点击 `Run` 即可（命令行等价写法见第四节）。
 
 | 测试类型 | 用例数 | 结果 | 覆盖范围 |
 |---|---|---|---|
 | 单元测试 | 47 | 全部通过 | 密码安全、用户 DAO、用户服务、消息服务与持久化、文件传输 |
 | 集成测试 | 7 | 全部通过 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景 |
-| 界面走查 | 13 | 全部通过 | 无边框窗口与拖动缩放、好友树分组、私聊/群聊渲染次数、文件传输进度、离线归组（Xvfb + Robot，截图见 `docs/test/screenshots/`） |
+| 组件级界面校验 | 6 | 全部通过 | 默认头像无渐变、在线/离线状态标记与管理员描边、好友树选中行整行浅蓝且无系统外观橙色、选中态像素断言、私聊与群聊窗口的"发送文件"按钮（离屏渲染 + 像素断言，截图见 `docs/test/screenshots/`） |
+| 界面走查 | 14 | 上一轮通过，本轮未重跑 | 无边框窗口与拖动缩放、好友树分组、私聊/群聊渲染次数、文件传输进度、离线归组（Xvfb + Robot，上一轮快照） |
 
 详细的用例清单与结果见 `docs/test/测试报告.md` 与 `docs/test/测试用例表.md`。
 
@@ -313,7 +268,7 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 | 数据库与持久化设计 | `docs/design/03-数据库与持久化设计.md` | 文件存储格式、ER 图、表结构、索引与安全设计 |
 | 实现说明 | `docs/design/04-实现说明.md` | 文件清单、关键方法签名、关键算法、扩展指南 |
 | 测试报告 | `docs/test/测试报告.md` | 测试策略、结果汇总、需求覆盖矩阵、缺陷记录 |
-| 测试用例表 | `docs/test/测试用例表.md` | 54 个用例的输入、预期、实际与结论 |
+| 测试用例表 | `docs/test/测试用例表.md` | 74 个用例（47 单元 + 7 集成 + 6 组件级界面校验 + 14 上一轮界面走查）的输入、预期、实际与结论 |
 | 课程设计报告 | `docs/report/课程设计报告.md` | 按高校模板撰写的完整报告 |
 | 答辩 PPT 大纲 | `docs/ppt/答辩PPT大纲.md` | 逐页大纲、演示脚本、答辩问题准备 |
 
@@ -334,8 +289,8 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 修改 `config/chat.properties` 中的 `server.port`（客户端登录界面同步修改端口）后重启。
 
 **界面中文显示异常**
-代码统一使用 UTF-8，编译时务必带 `-encoding UTF-8`（脚本中已包含）。若在部分 Linux 桌面环境
-字体缺失，可安装中文字体包后重启程序。
+代码统一使用 UTF-8：IDEA 中确认 `File -> Settings -> Editor -> File Encodings` 已设为 UTF-8，
+命令行编译时务必带 `-encoding UTF-8`。若在部分 Linux 桌面环境字体缺失，可安装中文字体包后重启程序。
 
 **文件传输失败**
 检查文件是否超过 200MB 上限；确认对方在线且同意接收；接收目录 `data/received` 需可写；
@@ -343,7 +298,9 @@ java -cp "build/classes:lib/mysql-connector-j-8.0.33.jar" com.chat.server.ChatSe
 
 **数据在哪里，如何重置**
 用户数据 `data/users.txt`，聊天记录 `data/history/`，接收文件 `data/received/`，
-导出文件 `data/export/`。执行 `./scripts/clean.sh --all` 可清空全部运行期数据恢复出厂状态。
+导出文件 `data/export/`。停掉服务器与客户端后删除这些内容，再重新启动服务器即可恢复到出厂状态
+（服务器会自动重建目录骨架与默认管理员）。
+删除 IDEA 的 `out/` 目录则等于清理编译产物，重新 `Build -> Rebuild Project` 即可恢复。
 
 ---
 
