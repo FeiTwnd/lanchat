@@ -15,3 +15,7 @@ data/received/*
 # 日志与编辑器临时文件
 *.log
 *.tmp
+
+# IDE 工程文件
+.idea/
+*.iml
