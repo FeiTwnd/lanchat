@@ -203,7 +203,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (message.getType() == MessageType.TEXT_GROUP) {
             message.setReceiver("");
             server.getUserManager().broadcastText(message);
-            server.getMessageService().saveMessage(message);
+            saveOrWarn(message, "(群聊)");
             server.notify(ServerObserver.EventType.GROUP_MESSAGE,
                     username + " 群发: " + message.getSummary());
             return;
@@ -221,13 +221,33 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "用户 " + receiver + " 不在线，消息未送达"));
             return;
         }
-        server.getMessageService().saveMessage(message);
+        saveOrWarn(message, receiver);
         // 回执给发送方，使其界面确认消息已发出
         TextMessage echo = ChatMessageFactory.text(username, username, message.getSummary(),
                 MessageType.TEXT_PRIVATE);
         send(echo);
         server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
                 username + " -> " + receiver + ": " + message.getSummary());
+    }
+
+    /**
+     * 保存聊天记录，失败时告知发送方。
+     *
+     * <p>消息已经送达却没能入库，事后在聊天窗口里补拉历史时就看不到这条，
+     * 使用者只会看到"对方说发了、我这里没有"的矛盾现象。因此保存失败必须回执给发送方，
+     * 而不是只写一行服务器日志。</p>
+     *
+     * @param message 已送达的消息
+     * @param peer    接收者描述，仅用于日志
+     */
+    private void saveOrWarn(Message message, String peer) {
+        Result<Boolean> saved = server.getMessageService().saveMessage(message);
+        if (saved.isSuccess()) {
+            return;
+        }
+        LOGGER.warning(() -> "消息已送达但记录保存失败: " + username + " -> " + peer
+                + " - " + saved.getMessage());
+        send(ChatMessageFactory.error(username, "消息已送达，但服务器未能写入聊天记录：" + saved.getMessage()));
     }
 
     /**
