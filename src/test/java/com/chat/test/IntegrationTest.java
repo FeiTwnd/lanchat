@@ -3,6 +3,7 @@ package com.chat.test;
 import com.chat.client.ChatClient;
 import com.chat.client.ChatListener;
 import com.chat.common.ChatMessageFactory;
+import com.chat.common.Config;
 import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.Message;
@@ -368,10 +369,16 @@ public class IntegrationTest {
         bob.close();
         waitUntil(() -> ChatServer.getInstance().getUserManager().size() == 1, 5000,
                 "bob 断开后服务器在线人数应降为 1");
-        Message list = alice.waitForMessage(message -> message.getType() == MessageType.USER_LIST
+        // 必须从连接时就注册的缓冲监听器里检索：下线广播与系统通知往往在断言开始等待前就已到达，
+        // 若在此处才注册监听器会稳定地错过消息（这是本用例此前偶发失败的根因）
+        Message list = bufferOf("alice01").await(message -> message.getType() == MessageType.USER_LIST
                 && !message.getSummary().contains("bob01") && message.getSummary().contains("alice01"),
                 5000);
         TestRunner.assertNotNull(list, "alice 应收到不含 bob01 的最新用户列表");
+
+        Message offlineNotice = bufferOf("alice01").await(message -> message.getType() == MessageType.SYSTEM
+                && message.getSummary().contains("bob01") && message.getSummary().contains("下线"), 5000);
+        TestRunner.assertNotNull(offlineNotice, "alice 应收到 bob01 下线的系统通知");
     }
 
     /**
@@ -411,9 +418,12 @@ public class IntegrationTest {
             accessor.setLength(Constants.MAX_FILE_SIZE + 1);
         }
         TestRunner.assertNull(alice.sendFile("bob01", huge), "超限文件发送应返回 null（被拒绝）");
+        // 用实际生效的上限做断言，避免与配置文件中的自定义值或提示文本格式脱钩
+        String limitText = com.chat.util.FileUtil.humanSize(Config.maxFileSize());
         Message sizeError = bufferOf("alice01").await(message -> message.getType() == MessageType.ERROR
-                && message.getSummary().contains(Constants.MAX_FILE_SIZE_TEXT), 5000);
-        TestRunner.assertNotNull(sizeError, "应收到文件超限的错误提示");
+                && message.getSummary().contains("大小上限")
+                && message.getSummary().contains(limitText), 5000);
+        TestRunner.assertNotNull(sizeError, "应收到文件超限的错误提示（上限 " + limitText + "）");
     }
 
     /**

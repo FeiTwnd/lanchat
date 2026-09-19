@@ -55,11 +55,14 @@ public final class Constants {
     /** 网络连接处理线程池大小上限，限制同时在线连接数 */
     public static final int MAX_CONNECTIONS = 200;
 
-    /** 业务线程池核心线程数 */
-    public static final int CORE_POOL_SIZE = 8;
-
-    /** 消息队列容量，超出后拒绝任务并回执系统消息 */
-    public static final int QUEUE_CAPACITY = 1000;
+    /**
+     * 连接线程池的空闲线程保活时间（秒）。
+     *
+     * <p>连接处理线程整个生命周期都阻塞在读取消息上，属于「一个连接一个线程」模型，
+     * 因此线程池必须按需创建而不是固定大小：固定线程池会在连接数超过线程数时
+     * 让新连接永久排队（服务器看起来接受了连接却毫无响应）。</p>
+     */
+    public static final long WORKER_KEEP_ALIVE_SECONDS = 60L;
 
     // ==================== 文件传输 ====================
 

@@ -190,9 +190,11 @@ LANChat/
 | `server.port` | 9527 | 服务器 TCP 端口，客户端需一致 |
 | `discovery.port` | 30000 | UDP 自动发现端口 |
 | `heartbeat.interval.ms` | 15000 | 客户端心跳发送间隔 |
+| `heartbeat.timeout.ms` | 60000 | 服务器判定连接掉线的心跳超时阈值，必须明显大于心跳间隔 |
+| `server.max.connections` | 200 | 允许的最大并发连接数 |
 | `data.dir` | `./data` | 数据根目录（用户数据、聊天记录、导出文件） |
 | `file.received.dir` | `./data/received` | 接收文件的保存目录 |
-| `file.max.size` | 209715200 | 单文件大小上限（字节），默认 200MB |
+| `file.max.size` | 209715200 | 单文件大小上限（字节），默认 200MB；收发两端均按此校验 |
 | `admin.password` | admin123 | 首次启动时创建的默认管理员密码 |
 | `db.enabled` | false | 是否启用 MySQL 存储（可选加分项） |
 | `db.driver` | com.mysql.cj.jdbc.Driver | JDBC 驱动类名 |

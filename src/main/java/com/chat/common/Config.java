@@ -182,6 +182,42 @@ public final class Config {
     }
 
     /**
+     * 获取客户端心跳发送间隔。
+     *
+     * @return 毫秒数，默认 {@link Constants#HEARTBEAT_INTERVAL_MS}
+     */
+    public static long heartbeatIntervalMs() {
+        return getLong("heartbeat.interval.ms", Constants.HEARTBEAT_INTERVAL_MS);
+    }
+
+    /**
+     * 获取服务器判定连接掉线的心跳超时阈值。
+     *
+     * @return 毫秒数，默认 {@link Constants#HEARTBEAT_TIMEOUT_MS}
+     */
+    public static long heartbeatTimeoutMs() {
+        return getLong("heartbeat.timeout.ms", Constants.HEARTBEAT_TIMEOUT_MS);
+    }
+
+    /**
+     * 获取单文件大小上限。
+     *
+     * @return 字节数，默认 {@link Constants#MAX_FILE_SIZE}
+     */
+    public static long maxFileSize() {
+        return getLong("file.max.size", Constants.MAX_FILE_SIZE);
+    }
+
+    /**
+     * 获取允许的最大并发连接数。
+     *
+     * @return 连接数，默认 {@link Constants#MAX_CONNECTIONS}
+     */
+    public static int maxConnections() {
+        return getInt("server.max.connections", Constants.MAX_CONNECTIONS);
+    }
+
+    /**
      * 获取服务器端口。
      *
      * @return 实际生效的 TCP 端口

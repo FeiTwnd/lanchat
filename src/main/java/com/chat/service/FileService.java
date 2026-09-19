@@ -51,11 +51,32 @@ public class FileService {
     /** 发送会话表：传输编号 -> 发送句柄 */
     private final Map<String, SendingFile> sendingFiles = new ConcurrentHashMap<>();
 
+    /** 单文件大小上限（字节），读取自配置文件，缺省为内置默认值 */
+    private final long maxFileSize = com.chat.common.Config.maxFileSize();
+
     /**
      * 构造文件服务。
      */
     public FileService() {
-        // 无状态初始化，接收目录在真正落盘时按需创建
+        // 上限在构造时固化，避免每条消息都读取配置
+    }
+
+    /**
+     * 获取当前生效的单文件大小上限。
+     *
+     * @return 字节数
+     */
+    public long getMaxFileSize() {
+        return maxFileSize;
+    }
+
+    /**
+     * 把字节上限转换为可读文本，用于错误提示。
+     *
+     * @return 形如 {@code 200.00 MB} 的文本
+     */
+    private String maxFileSizeText() {
+        return FileUtil.humanSize(maxFileSize);
     }
 
     /**
@@ -81,8 +102,8 @@ public class FileService {
         if (!file.canRead()) {
             throw new FileTransferException("文件不可读: " + file.getAbsolutePath());
         }
-        if (file.length() > Constants.MAX_FILE_SIZE) {
-            throw new FileTransferException("文件超过大小上限 " + Constants.MAX_FILE_SIZE_TEXT
+        if (file.length() > maxFileSize) {
+            throw new FileTransferException("文件超过大小上限 " + maxFileSizeText()
                     + "，当前 " + FileUtil.humanSize(file.length()));
         }
         try {
@@ -298,8 +319,8 @@ public class FileService {
         if (request == null || request.getTransferId() == null) {
             throw new FileTransferException("无效的文件传输请求");
         }
-        if (request.getFileSize() > Constants.MAX_FILE_SIZE) {
-            throw new FileTransferException("对方发送的文件超过大小上限 " + Constants.MAX_FILE_SIZE_TEXT);
+        if (request.getFileSize() > maxFileSize) {
+            throw new FileTransferException("对方发送的文件超过大小上限 " + maxFileSizeText());
         }
         if (request.getFileName() == null || request.getFileName().trim().isEmpty()) {
             throw new FileTransferException("对方发送的文件名为空");

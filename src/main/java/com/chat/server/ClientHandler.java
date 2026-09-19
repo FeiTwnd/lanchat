@@ -64,6 +64,12 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /** 服务器引用，用于访问在线表与业务服务 */
     private final ChatServer server;
 
+    /** 单文件大小上限（字节），取自服务器配置，保证提示文本与实际取值一致 */
+    private final long maxFileSize;
+
+    /** 心跳超时阈值（毫秒），取自服务器配置 */
+    private final long heartbeatTimeoutMs;
+
     /** 对象输入流，读取客户端消息 */
     private ObjectInputStream in;
 
@@ -88,9 +94,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * @param socket 已接受的客户端连接
      * @param server 服务器实例
      */
-    public ClientHandler(Socket socket, ChatServer server) {
+    public ClientHandler(Socket socket, ChatServer server, long maxFileSize, long heartbeatTimeoutMs) {
         this.socket = socket;
         this.server = server;
+        this.maxFileSize = maxFileSize;
+        this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     }
 
     /**
@@ -298,9 +306,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * @param receiver 接收者用户名
      */
     private void handleFileRequest(Message original, FileMessage request, String receiver) {
-        if (request.getFileSize() > Constants.MAX_FILE_SIZE) {
+        if (request.getFileSize() > maxFileSize) {
             send(ChatMessageFactory.error(username,
-                    "文件超过大小上限 " + Constants.MAX_FILE_SIZE_TEXT));
+                    "文件超过大小上限 " + com.chat.util.FileUtil.humanSize(maxFileSize)));
             return;
         }
         if (!server.getUserManager().isOnline(receiver)) {
@@ -729,7 +737,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * @return 超时返回 true
      */
     public boolean isTimeout(long now) {
-        return now - lastActiveTime > Constants.HEARTBEAT_TIMEOUT_MS;
+        return now - lastActiveTime > heartbeatTimeoutMs;
     }
 
     /**

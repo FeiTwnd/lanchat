@@ -616,11 +616,12 @@ public class ChatClient {
             thread.setDaemon(true);
             return thread;
         });
+        long interval = Config.heartbeatIntervalMs();
         heartbeatScheduler.scheduleWithFixedDelay(() -> {
             if (connected) {
                 send(ChatMessageFactory.control(username, Constants.SYSTEM_SENDER, MessageType.HEARTBEAT));
             }
-        }, Constants.HEARTBEAT_INTERVAL_MS, Constants.HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }, interval, interval, TimeUnit.MILLISECONDS);
     }
 
     /**

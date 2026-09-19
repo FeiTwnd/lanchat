@@ -13,6 +13,8 @@ import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -127,7 +129,11 @@ public final class ChatServer {
             userService.initAdminIfAbsent();
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);
-            connectionPool = Executors.newFixedThreadPool(Constants.CORE_POOL_SIZE, namedFactory("chat-worker-"));
+            // 采用「按需创建、空闲回收」的线程池：每个连接的处理线程会一直阻塞在读取消息上，
+            // 固定大小线程池会让超出线程数的连接永久排队（表现为服务器已接受连接却毫无响应）。
+            connectionPool = new ThreadPoolExecutor(0, Config.maxConnections(),
+                    Constants.WORKER_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+                    new SynchronousQueue<>(), namedFactory("chat-worker-"));
             heartbeatScanner = Executors.newSingleThreadScheduledExecutor(namedFactory("chat-heartbeat-"));
             running = true;
             acceptThread = new Thread(this::acceptLoop, "chat-accept");
@@ -250,12 +256,13 @@ public final class ChatServer {
                 Socket socket = serverSocket.accept();
                 socket.setKeepAlive(true);
                 socket.setTcpNoDelay(true);
-                if (handlers.size() >= Constants.MAX_CONNECTIONS) {
+                if (handlers.size() >= Config.maxConnections()) {
                     LOGGER.warning("连接数达到上限，拒绝新连接: " + socket.getRemoteSocketAddress());
                     socket.close();
                     continue;
                 }
-                ClientHandler handler = new ClientHandler(socket, this);
+                ClientHandler handler = new ClientHandler(socket, this,
+                        Config.maxFileSize(), Config.heartbeatTimeoutMs());
                 registerHandler(handler);
                 connectionPool.execute(handler);
                 LOGGER.info(() -> "接受新连接: " + socket.getRemoteSocketAddress()
