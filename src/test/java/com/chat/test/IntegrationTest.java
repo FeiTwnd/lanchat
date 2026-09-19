@@ -349,10 +349,6 @@ public class IntegrationTest {
 
         Message senderResult = bufferOf("alice01").await(
                 message -> message.getType() == MessageType.FILE_RESULT, 5000);
-        for (Message m : buffers.get("alice01").received) {
-            System.out.println("   [alice buffer] " + m.getType() + " :: " + m.getSummary());
-        }
-        System.out.println("   [bob buffer] size=" + bufferOf("bob01").size());
         TestRunner.assertNotNull(senderResult, "发送方应收到文件传输回执");
         TestRunner.assertTrue(((FileMessage) senderResult).isAccepted(), "发送方应收收到成功回执");
     }

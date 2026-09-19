@@ -404,7 +404,6 @@ public class ChatClient {
         // 进度通过 message 字段传递：data 字段承载二进制块，不适合再复用，
         // 而新增一个 double 字段会让每帧都多传 8 字节且污染协议，故采用文本形式
         message.setMessage(String.valueOf(progress));
-        message.setData(new byte[source.getChunkIndex() + 1]);
         return message;
     }
 

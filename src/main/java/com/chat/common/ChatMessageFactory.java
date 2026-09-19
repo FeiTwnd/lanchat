@@ -79,10 +79,6 @@ public final class ChatMessageFactory {
     public static FileMessage file(String sender, String receiver, MessageType type) {
         FileMessage message = new FileMessage(sender, receiver);
         apply(message, type);
-        if (type == MessageType.FILE_RESULT) {
-            System.out.println("[FAC] file() argSender=" + sender + " argReceiver=" + receiver
-                    + " msgSender=" + message.getSender() + " msgReceiver=" + message.getReceiver());
-        }
         return message;
     }
 
