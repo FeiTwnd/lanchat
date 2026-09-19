@@ -85,7 +85,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             new SkinButton("自动发现服务器", SkinButton.Kind.NORMAL);
 
     /** 登录结果等待锁 */
-    private transient CountDownLatch loginLatch;
+    private transient volatile CountDownLatch loginLatch;
 
     /** 登录是否成功 */
     private transient volatile boolean loginSucceeded;
@@ -94,13 +94,19 @@ public class LoginUI extends BaseUI implements ChatListener {
     private transient volatile String loginFailure = "";
 
     /** 注册结果等待锁 */
-    private transient CountDownLatch registerLatch;
+    private transient volatile CountDownLatch registerLatch;
 
     /** 注册是否成功 */
     private transient volatile boolean registerSucceeded;
 
     /** 注册结果说明 */
     private transient volatile String registerMessage = "";
+
+    /** 改密回执等待锁 */
+    private transient volatile CountDownLatch noticeLatch;
+
+    /** 是否正在等待改密回执（用于把下一条系统通知当作回执处理） */
+    private transient volatile boolean awaitingNotice;
 
     /** 当前客户端实例 */
     private transient ChatClient client;
@@ -117,7 +123,26 @@ public class LoginUI extends BaseUI implements ChatListener {
      * 构造登录窗口。
      */
     public LoginUI() {
+        this(null, 0);
+    }
+
+    /**
+     * 构造登录窗口并预填服务器地址。
+     *
+     * <p>退出登录后重新回到本窗口时会复用上次连接的服务器地址：在多机使用场景下，
+     * 服务器 IP 不固定为 127.0.0.1，每次都让使用者重新输入既繁琐又容易输错。</p>
+     *
+     * @param host 服务器地址，为 null 或空时使用默认值 127.0.0.1
+     * @param port 服务器端口，小于等于 0 时使用配置中的端口
+     */
+    public LoginUI(String host, int port) {
         super(Constants.APP_NAME + " " + Constants.APP_VERSION + " - 登录");
+        if (host != null && !host.trim().isEmpty()) {
+            hostField.setText(host.trim());
+        }
+        if (port > 0) {
+            portField.setText(String.valueOf(port));
+        }
         initComponents();
         setSize(580, 470);
         centerOnScreen();
@@ -244,81 +269,91 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         setBusy(true, "正在连接服务器……");
-        loginSucceeded = false;
-        loginFailure = "";
-        loginLatch = new CountDownLatch(1);
-        client = new ChatClient();
-        client.addListener(this);
+        resetLoginState();
+        createClient();
 
         new SwingWorker<Boolean, Void>() {
             /**
-             * 后台线程执行连接。
+             * 后台线程执行连接并发送登录请求。
              *
-             * @return 是否连接成功
+             * @return 请求是否已提交
              */
             @Override
             protected Boolean doInBackground() {
-                return client.connect(host, port, name, password);
+                return client.openConnection(host, port) && client.login(name, password);
             }
 
             /**
-             * 连接动作完成后等待服务器返回登录结果。
+             * 连接失败直接提示；提交成功则进入统一的登录结果等待流程。
              *
-             * @param connected 连接是否成功
+             * @param requested 请求是否已提交
              */
             @Override
             protected void done() {
-                boolean connected = false;
+                boolean requested = false;
                 try {
-                    connected = get();
+                    requested = get();
                 } catch (Exception e) {
                     loginFailure = "连接异常: " + e.getMessage();
                 }
-                if (!connected) {
-                    setBusy(false, loginFailure.isEmpty() ? "无法连接服务器" : loginFailure);
+                if (!requested) {
+                    String reason = loginFailure.isEmpty() ? "无法连接服务器" : loginFailure;
+                    setBusy(false, reason);
                     showError(loginFailure.isEmpty() ? "无法连接服务器，请检查地址与端口" : loginFailure);
                     cleanupClient();
                     return;
                 }
-                new SwingWorker<Boolean, Void>() {
-                    /**
-                     * 后台等待登录结果。
-                     *
-                     * @return 是否登录成功
-                     */
-                    @Override
-                    protected Boolean doInBackground() {
-                        try {
-                            return loginLatch.await(6, TimeUnit.SECONDS) && loginSucceeded;
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return false;
-                        }
-                    }
+                awaitLoginResult();
+            }
+        }.execute();
+    }
 
-                    /**
-                     * 登录成功则打开主窗口。
-                     *
-                     * @param success 是否成功
-                     */
-                    @Override
-                    protected void done() {
-                        boolean success = false;
-                        try {
-                            success = get();
-                        } catch (Exception e) {
-                            loginFailure = "登录响应异常";
-                        }
-                        if (success) {
-                            openMainWindow();
-                        } else {
-                            String reason = loginFailure.isEmpty() ? "登录超时或失败" : loginFailure;
-                            setBusy(false, reason);
-                            showError(reason);
-                            cleanupClient();
-                        }
-                    }
-                }.execute();
+    /**
+     * 等待服务器返回登录结果。
+     *
+     * <p>本方法是打开主窗口的唯一入口：登录与"注册后自动登录"都必须经过它。
+     * 早期版本的注册分支只发出了登录请求却没有等待结果，于是界面永远停在登录页，
+     * 而服务器端账号已经在线，再次点击登录就会被拒绝为"已在其它位置登录"。</p>
+     */
+    private void awaitLoginResult() {
+        new SwingWorker<Boolean, Void>() {
+            /**
+             * 后台等待登录结果。
+             *
+             * @return 是否登录成功
+             */
+            @Override
+            protected Boolean doInBackground() {
+                try {
+                    CountDownLatch latch = loginLatch;
+                    return latch != null && latch.await(6, TimeUnit.SECONDS) && loginSucceeded;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+
+            /**
+             * 登录成功则打开主窗口，否则复位界面并释放连接。
+             *
+             * @param success 是否成功
+             */
+            @Override
+            protected void done() {
+                boolean success = false;
+                try {
+                    success = get();
+                } catch (Exception e) {
+                    loginFailure = "登录响应异常";
+                }
+                if (success) {
+                    openMainWindow();
+                    return;
+                }
+                String reason = loginFailure.isEmpty() ? "登录超时或失败" : loginFailure;
+                setBusy(false, reason);
+                showError(reason);
+                cleanupClient();
             }
         }.execute();
     }
@@ -336,7 +371,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 执行注册：需要先建立连接，注册成功后自动登录。
+     * 执行注册：连接服务器提交注册，成功后在同一连接上自动登录。
      */
     private void doRegister() {
         String host = hostField.getText().trim();
@@ -358,8 +393,7 @@ public class LoginUI extends BaseUI implements ChatListener {
         registerSucceeded = false;
         registerMessage = "";
         registerLatch = new CountDownLatch(1);
-        client = new ChatClient();
-        client.addListener(this);
+        createClient();
 
         new SwingWorker<Boolean, Void>() {
             /**
@@ -369,12 +403,15 @@ public class LoginUI extends BaseUI implements ChatListener {
              */
             @Override
             protected Boolean doInBackground() {
-                if (!client.connect(host, port, name, password)) {
+                if (!client.openConnection(host, port)) {
                     return false;
                 }
                 client.sendRegister(name, password, nickname);
                 try {
-                    registerLatch.await(6, TimeUnit.SECONDS);
+                    CountDownLatch latch = registerLatch;
+                    if (latch != null) {
+                        latch.await(6, TimeUnit.SECONDS);
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -382,7 +419,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             }
 
             /**
-             * 根据注册结果显示提示。
+             * 根据注册结果决定是否继续自动登录。
              */
             @Override
             protected void done() {
@@ -398,37 +435,22 @@ public class LoginUI extends BaseUI implements ChatListener {
                     cleanupClient();
                     return;
                 }
-                if (registerSucceeded) {
-                    setBusy(false, "注册成功，正在登录……");
-                    // 注册成功后直接用同一连接登录，减少用户一次输入
-                    client.send(loginMessageOf(usernameField.getText().trim(),
-                            new String(passwordField.getPassword())));
-                    loginSucceeded = false;
-                    loginFailure = "";
-                    loginLatch = new CountDownLatch(1);
-                    showInfo("注册成功，正在自动登录……");
-                } else {
+                if (!registerSucceeded) {
                     String reason = registerMessage.isEmpty() ? "注册失败" : registerMessage;
                     setBusy(false, reason);
                     showError(reason);
                     cleanupClient();
+                    return;
                 }
+                // 注册成功：复用同一条连接登录，并交给统一的等待流程打开主窗口
+                // 此处保持忙碌状态，避免使用者在自动登录期间重复点击而新建连接
+                setBusy(true, "注册成功，正在自动登录……");
+                showInfo("注册成功，正在自动登录……");
+                resetLoginState();
+                client.login(name, password);
+                awaitLoginResult();
             }
         }.execute();
-    }
-
-    /**
-     * 构造登录请求消息（供注册成功后自动登录复用）。
-     *
-     * @param name     用户名
-     * @param password 密码
-     * @return 登录消息
-     */
-    private TextMessage loginMessageOf(String name, String password) {
-        TextMessage message = com.chat.common.ChatMessageFactory.text(name, Constants.SYSTEM_SENDER,
-                name + "|" + password, MessageType.TEXT_PRIVATE);
-        message.setType(MessageType.LOGIN);
-        return message;
     }
 
     /**
@@ -498,7 +520,10 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 修改密码：需先建立连接，通过 PASSWORD_CHANGE 消息由服务器校验。
+     * 修改密码：先登录校验身份，再通过 PASSWORD_CHANGE 消息请求服务器改密。
+     *
+     * <p>服务器要求登录态才能改密，因此本流程会短暂登录：改密回执到达后立刻断开连接，
+     * 否则使用者的账号会以"只改了个密码"的方式挂在在线列表里，本人却看不到任何界面。</p>
      */
     private void changePassword() {
         String host = hostField.getText().trim();
@@ -522,45 +547,133 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         setBusy(true, "正在提交密码修改请求……");
+        awaitingNotice = false;
+        resetLoginState();
+        createClient();
+
         new SwingWorker<Boolean, Void>() {
             /**
-             * 后台连接并发送修改密码请求。
+             * 后台连接、登录并等待登录结果。
              *
-             * @return 是否连接成功
+             * @return 是否已登录成功
              */
             @Override
             protected Boolean doInBackground() {
-                if (!client.connect(host, port, name, oldPassword)) {
+                if (!client.openConnection(host, port)) {
                     return false;
                 }
+                client.login(name, oldPassword);
+                try {
+                    CountDownLatch latch = loginLatch;
+                    return latch != null && latch.await(6, TimeUnit.SECONDS) && loginSucceeded;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+
+            /**
+             * 登录成功则发送改密请求并等待回执。
+             *
+             * @param loggedIn 是否已登录
+             */
+            @Override
+            protected void done() {
+                boolean loggedIn = false;
+                try {
+                    loggedIn = get();
+                } catch (Exception e) {
+                    loginFailure = "连接异常: " + e.getMessage();
+                }
+                if (!loggedIn) {
+                    String reason = loginFailure.isEmpty() ? "登录失败，无法修改密码" : loginFailure;
+                    setBusy(false, reason);
+                    showError(reason);
+                    cleanupClient();
+                    return;
+                }
+                awaitingNotice = true;
+                noticeLatch = new CountDownLatch(1);
                 TextMessage message = com.chat.common.ChatMessageFactory.text(name,
                         Constants.SYSTEM_SENDER, oldPassword + "|" + newPassword, MessageType.TEXT_PRIVATE);
                 message.setType(MessageType.PASSWORD_CHANGE);
                 client.send(message);
-                return true;
+                ackPasswordChange();
+            }
+        }.execute();
+    }
+
+    /**
+     * 等待改密回执（服务器的系统通知）并断开临时连接。
+     */
+    private void ackPasswordChange() {
+        new SwingWorker<Boolean, Void>() {
+            /**
+             * 后台等待回执。
+             *
+             * @return 是否收到回执
+             */
+            @Override
+            protected Boolean doInBackground() {
+                try {
+                    CountDownLatch latch = noticeLatch;
+                    return latch != null && latch.await(6, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
             }
 
             /**
-             * 提示用户查看服务器回执。
+             * 无论是否收到回执都要断开连接，避免账号被临时登录态挂住。
+             *
+             * @param received 是否收到回执
              */
             @Override
             protected void done() {
-                boolean connected = false;
+                boolean received = false;
                 try {
-                    connected = get();
+                    received = get();
                 } catch (Exception e) {
-                    // 连接失败原因会在监听器中提示，这里只需复位界面状态
-                    connected = false;
+                    received = false;
                 }
-                setBusy(false, connected ? "密码修改请求已发送，请查看提示" : "无法连接服务器");
-                if (connected) {
-                    showInfo("密码修改请求已发送。\n\n若原密码正确，服务器会返回“密码修改成功”，"
-                            + "随后请使用新密码登录。");
-                } else {
-                    showError("无法连接服务器，请检查地址与端口");
-                }
+                awaitingNotice = false;
+                cleanupClient();
+                setBusy(false, received ? "密码修改已处理，请查看提示" : "未收到服务器回执，请稍后用新密码尝试登录");
             }
         }.execute();
+    }
+
+    /**
+     * 关闭上一个客户端连接（若有）。
+     *
+     * <p>登录、注册、改密都会新建连接：若不先清理旧连接，旧连接会一直保持登录态，
+     * 新连接再登录同一账号时会被服务器判定为"已在其它位置登录"。</p>
+     */
+    private void closePreviousClient() {
+        if (client != null) {
+            client.removeListener(this);
+            client.close();
+            client = null;
+        }
+    }
+
+    /**
+     * 重置登录等待状态，必须在发送登录请求之前调用。
+     */
+    private void resetLoginState() {
+        loginSucceeded = false;
+        loginFailure = "";
+        loginLatch = new CountDownLatch(1);
+    }
+
+    /**
+     * 创建客户端并注册本窗口为监听器。
+     */
+    private void createClient() {
+        closePreviousClient();
+        client = new ChatClient();
+        client.addListener(this);
     }
 
     /**
@@ -591,7 +704,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 处理服务器消息：分别唤醒登录或注册等待线程。
+     * 处理服务器消息：分别唤醒登录、注册或改密等待线程。
      *
      * @param message 消息
      */
@@ -616,6 +729,10 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         if (message.getType() == MessageType.SYSTEM || message.getType() == MessageType.ERROR) {
+            // 改密请求的回执是一条系统通知：此时唤醒等待线程，由它负责断开临时登录态
+            if (awaitingNotice && noticeLatch != null) {
+                noticeLatch.countDown();
+            }
             onEdt(() -> {
                 statusLabel.setText(message.getSummary());
                 if (message.getType() == MessageType.ERROR) {

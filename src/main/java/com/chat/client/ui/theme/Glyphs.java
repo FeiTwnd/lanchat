@@ -288,6 +288,26 @@ public final class Glyphs {
     }
 
     /**
+     * 退出登录图标：门框加向外箭头。
+     *
+     * @param size  边长
+     * @param color 颜色
+     * @return 图标
+     */
+    public static Icon logout(final int size, final Color color) {
+        return of(size, color, (g, s) -> {
+            // 门框只画左、上、下三边，右侧留出缺口表示"离开这扇门"
+            g.drawLine((int) (s * 0.20), (int) (s * 0.14), (int) (s * 0.20), (int) (s * 0.86));
+            g.drawLine((int) (s * 0.20), (int) (s * 0.14), (int) (s * 0.48), (int) (s * 0.14));
+            g.drawLine((int) (s * 0.20), (int) (s * 0.86), (int) (s * 0.48), (int) (s * 0.86));
+            // 向外箭头
+            g.drawLine((int) (s * 0.46), (int) (s * 0.50), (int) (s * 0.86), (int) (s * 0.50));
+            g.drawLine((int) (s * 0.68), (int) (s * 0.34), (int) (s * 0.86), (int) (s * 0.50));
+            g.drawLine((int) (s * 0.68), (int) (s * 0.66), (int) (s * 0.86), (int) (s * 0.50));
+        });
+    }
+
+    /**
      * 删除图标：垃圾桶。
      *
      * @param size  边长

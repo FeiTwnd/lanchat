@@ -107,8 +107,14 @@ public class ChatClient {
     /** 最近一次登录失败原因，供界面与自动化测试读取 */
     private volatile String lastLoginFailure = "";
 
-    /** 登录结果等待锁，便于命令行与测试同步等待登录完成 */
-    private transient CountDownLatch loginLatch;
+    /** 登录结果等待锁，便于命令行与测试同步等待登录完成（volatile：由接收线程计数、工作线程等待） */
+    private transient volatile CountDownLatch loginLatch;
+
+    /** 最近一次连接的服务器地址，供退出登录后回填登录窗口 */
+    private volatile String serverHost = "";
+
+    /** 最近一次连接的服务器端口，供退出登录后回填登录窗口 */
+    private volatile int serverPort;
 
     /**
      * 构造客户端。
@@ -118,15 +124,18 @@ public class ChatClient {
     }
 
     /**
-     * 连接服务器并发送登录请求。
+     * 建立与服务器的连接（不发送任何业务请求）。
      *
-     * @param host     服务器地址
-     * @param port     服务器端口
-     * @param name     用户名
-     * @param password 明文密码
+     * <p>把"连接"与"登录"拆成两步，是因为登录界面还需要在未登录状态下做两件事：
+     * 注册新账号、修改密码（需先登录校验原密码）。若连接时隐式带上登录请求，
+     * 注册会把一个尚不存在的账号拿去登录，修改密码则会让用户凭一次改密动作"顺便上线"，
+     * 在其它客户端的在线列表里留下一个看不见的幽灵用户。</p>
+     *
+     * @param host 服务器地址
+     * @param port 服务器端口
      * @return 连接成功返回 true；失败时通过监听器回调原因
      */
-    public boolean connect(String host, int port, String name, String password) {
+    public boolean openConnection(String host, int port) {
         if (connected) {
             LOGGER.warning("客户端已连接，忽略重复连接请求");
             return true;
@@ -141,7 +150,8 @@ public class ChatClient {
             out.flush();
             in = new ObjectInputStream(socket.getInputStream());
             connected = true;
-            this.username = name;
+            serverHost = host;
+            serverPort = port;
             senderPool = Executors.newFixedThreadPool(2, runnable -> {
                 Thread thread = new Thread(runnable, "chat-sender");
                 thread.setDaemon(true);
@@ -152,11 +162,7 @@ public class ChatClient {
             receiverThread.start();
             startHeartbeat();
             notifyConnection(true, "已连接服务器 " + host + ":" + port);
-            // 先重置等待锁再发送登录请求，避免服务器响应比锁初始化更快导致永久等待
-            loginLatch = new CountDownLatch(1);
-            lastLoginFailure = "";
-            send(loginMessage(name, password));
-            LOGGER.info(() -> "已连接服务器并发送登录请求: " + name + "@" + host + ":" + port);
+            LOGGER.info(() -> "已连接服务器: " + host + ":" + port);
             return true;
         } catch (IOException e) {
             closeQuietly();
@@ -165,6 +171,38 @@ public class ChatClient {
             notifyConnection(false, reason);
             return false;
         }
+    }
+
+    /**
+     * 在已建立的连接上发送登录请求。
+     *
+     * @param name     用户名
+     * @param password 明文密码
+     * @return 请求已提交返回 true；尚未连接时返回 false
+     */
+    public boolean login(String name, String password) {
+        if (!connected || out == null) {
+            notifyMessage(ChatMessageFactory.error(username, "尚未连接服务器，无法登录"));
+            return false;
+        }
+        this.username = name;
+        // 先重置等待锁再发送登录请求，避免服务器响应比锁初始化更快导致永久等待
+        loginLatch = new CountDownLatch(1);
+        lastLoginFailure = "";
+        return send(loginMessage(name, password));
+    }
+
+    /**
+     * 连接服务器并发送登录请求。
+     *
+     * @param host     服务器地址
+     * @param port     服务器端口
+     * @param name     用户名
+     * @param password 明文密码
+     * @return 连接成功返回 true；失败时通过监听器回调原因
+     */
+    public boolean connect(String host, int port, String name, String password) {
+        return openConnection(host, port) && login(name, password);
     }
 
     /**
@@ -605,6 +643,46 @@ public class ChatClient {
                 MessageType.TEXT_PRIVATE);
         message.setType(MessageType.HISTORY_REQUEST);
         return send(message);
+    }
+
+    /**
+     * 发送退出登录请求。
+     *
+     * <p>刻意使用同步发送：退出后马上就要关闭连接，若走异步发送队列，
+     * 报文可能还没写出连接就断了，服务器只能等探测到 socket 关闭才清理在线状态。
+     * 虽然最终结果一样，但其它客户端要多等一个心跳周期才能看到下线通知。</p>
+     *
+     * @return 发送成功返回 true；未连接或写入失败返回 false
+     */
+    public boolean sendLogout() {
+        if (!connected || out == null) {
+            return false;
+        }
+        try {
+            return sendSync(ChatMessageFactory.control(username, Constants.SYSTEM_SENDER,
+                    MessageType.LOGOUT));
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "退出登录请求发送失败（连接可能已断开）", e);
+            return false;
+        }
+    }
+
+    /**
+     * 获取最近一次连接的服务器地址。
+     *
+     * @return 服务器地址；从未连接过时为空字符串
+     */
+    public String getServerHost() {
+        return serverHost;
+    }
+
+    /**
+     * 获取最近一次连接的服务器端口。
+     *
+     * @return 服务器端口；从未连接过时为 0
+     */
+    public int getServerPort() {
+        return serverPort;
     }
 
     /**

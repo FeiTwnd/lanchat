@@ -73,6 +73,20 @@ public class ClientUI extends BaseUI implements ChatListener {
     /** 群聊窗口 */
     private transient GroupChatUI groupWindow;
 
+    /** 群聊入口按钮，用于展示未读条数 */
+    private transient SkinButton groupButton;
+
+    /** 群聊未读条数：群聊窗口未打开时累计，打开后清零 */
+    private transient int unreadGroupCount;
+
+    /**
+     * 是否正在退出登录。
+     *
+     * <p>退出登录会主动断开连接，而"意外断开"的处理分支会直接结束进程；
+     * 用本标志把主动退出与意外断开区分开，否则点击退出登录会变成关闭整个程序。</p>
+     */
+    private transient volatile boolean loggingOut;
+
     /** 在线用户树（按角色分组、头像区分在线离线、支持关键字过滤） */
     private final OnlineUserTree userTree = new OnlineUserTree();
 
@@ -101,7 +115,8 @@ public class ClientUI extends BaseUI implements ChatListener {
         client.requestUserList();
         setSize(880, 600);
         centerOnScreen();
-        openGroupWindow(false);
+        // 刻意不在此处打开群聊大厅：登录后应先看到在线用户列表，
+        // 群聊由使用者点击"进入群聊大厅"按需打开；窗口未打开期间的群聊消息会累计未读条数
     }
 
     /**
@@ -246,8 +261,9 @@ public class ClientUI extends BaseUI implements ChatListener {
         panel.setBackground(Theme.BG);
         panel.setBorder(BorderFactory.createEmptyBorder(8, 2, 8, 8));
 
-        panel.add(SkinButton.menu("进入群聊大厅", Glyphs.group(18, Theme.PRIMARY),
-                e -> openGroupWindow(true)));
+        groupButton = SkinButton.menu("进入群聊大厅", Glyphs.group(18, Theme.PRIMARY),
+                e -> openGroupWindow(true));
+        panel.add(groupButton);
         panel.add(SkinButton.menu("查询聊天记录…", Glyphs.history(18, Theme.PRIMARY),
                 e -> showHistoryDialog()));
         panel.add(SkinButton.menu("导出我的聊天记录", Glyphs.export(18, Theme.PRIMARY),
@@ -256,6 +272,8 @@ public class ClientUI extends BaseUI implements ChatListener {
                 e -> changeNickname()));
         panel.add(SkinButton.menu("修改密码…", Glyphs.lock(18, Theme.PRIMARY),
                 e -> showPasswordHint()));
+        panel.add(SkinButton.menu("退出登录", Glyphs.logout(18, Theme.TEXT_WEAK),
+                e -> logout()));
         panel.add(SkinButton.menu("删除用户（管理员）…", Glyphs.trash(18, Theme.DANGER),
                 SkinButton.Kind.DANGER, e -> deleteUser()));
 
@@ -270,8 +288,9 @@ public class ClientUI extends BaseUI implements ChatListener {
                 + "1. 在线用户列表由服务器实时推送，用户上线/下线会自动刷新。\n"
                 + "2. 双击某个用户即可开始私聊；离线的用户会被置灰并归入“离线”分组。\n"
                 + "3. 发送文件在私聊窗口或群聊窗口内点击“发送文件”：私聊发给对方，群聊发给全部在线用户。\n"
-                + "4. 接收到的文件保存在 data/received 目录，聊天记录按天保存在 data/history 目录。\n"
-                + "5. 聊天记录可按时间范围查询，也可以一键导出为文本文件。");
+                + "4. 接收到的文件保存在 data/received 目录；聊天记录保存在服务器数据库中，可随时查询或导出。\n"
+                + "5. 聊天记录可按时间范围查询，也可以一键导出为文本文件。\n"
+                + "6. 点击“退出登录”会注销当前账号并返回登录界面，可换账号继续使用。");
         panel.add(new JScrollPane(tips));
         return panel;
     }
@@ -368,22 +387,90 @@ public class ClientUI extends BaseUI implements ChatListener {
     /**
      * 打开群聊窗口。
      *
-     * @param toFront 是否置顶显示
+     * @param show 是否显示窗口：false 只保证窗口对象存在（用于缓存消息），true 才真正显示并置顶
      * @return 群聊窗口
      */
-    public GroupChatUI openGroupWindow(boolean toFront) {
+    public GroupChatUI openGroupWindow(boolean show) {
         if (groupWindow == null) {
             // 群发文件需要知道"此刻有哪些人在线"，面板只接收一份只读快照，不反向依赖本窗口
             groupWindow = new GroupChatUI(client, client.getNickname(),
                     () -> new java.util.ArrayList<>(userTree.onlineUsers().keySet()));
         }
-        if (!groupWindow.isVisible()) {
-            groupWindow.setVisible(true);
-        }
-        if (toFront) {
+        if (show) {
+            unreadGroupCount = 0;
+            updateGroupButtonText();
+            if (!groupWindow.isVisible()) {
+                groupWindow.setVisible(true);
+            }
             groupWindow.toFront();
         }
         return groupWindow;
+    }
+
+    /**
+     * 获取群聊面板，窗口未打开时只把消息缓存进面板并累计未读条数。
+     *
+     * <p>本方法必须在事件分发线程调用（调用点均已通过 {@link BaseUI#onEdt(Runnable)} 调度）。</p>
+     *
+     * @return 群聊面板
+     */
+    private GroupChatPanel groupPanel() {
+        openGroupWindow(false);
+        if (!groupWindow.isVisible()) {
+            unreadGroupCount++;
+            updateGroupButtonText();
+        }
+        return groupWindow.getPanel();
+    }
+
+    /**
+     * 刷新群聊入口按钮的未读提示。
+     */
+    private void updateGroupButtonText() {
+        if (groupButton != null) {
+            groupButton.setText(unreadGroupCount == 0
+                    ? "进入群聊大厅" : "进入群聊大厅（" + unreadGroupCount + " 条未读）");
+        }
+    }
+
+    /**
+     * 退出登录：注销服务器会话、关闭全部子窗口并返回登录界面。
+     *
+     * <p>显式发送 LOGOUT 而不是直接关闭 socket：服务器收到 LOGOUT 会立即注销在线状态并
+     * 广播最新列表，其它客户端不用等读操作失败才发现本用户已下线。</p>
+     */
+    private void logout() {
+        if (!confirm("确定要退出当前账号 " + client.getUsername() + " 吗？")) {
+            return;
+        }
+        loggingOut = true;
+        final String host = client.getServerHost();
+        final int port = client.getServerPort();
+        // 发送要在后台线程完成：网络写入不应该阻塞事件分发线程
+        new javax.swing.SwingWorker<Boolean, Void>() {
+
+            /**
+             * 后台发送退出登录请求。
+             *
+             * @return 是否发送成功
+             */
+            @Override
+            protected Boolean doInBackground() {
+                return client.sendLogout();
+            }
+
+            /**
+             * 释放当前窗口并回到登录界面，同时预填原来的服务器地址。
+             *
+             * @param sent 是否发送成功
+             */
+            @Override
+            protected void done() {
+                dispose();
+                LoginUI login = new LoginUI(host, port);
+                login.setVisible(true);
+            }
+        }.execute();
     }
 
     /**
@@ -507,12 +594,13 @@ public class ClientUI extends BaseUI implements ChatListener {
                 handlePrivateMessage((TextMessage) message);
                 break;
             case TEXT_GROUP:
-                onEdt(() -> openGroupWindow(false).getPanel().onMessage(message));
+                // 群聊窗口未打开时消息先入面板并计未读，不主动弹出窗口打扰使用者
+                onEdt(() -> groupPanel().onMessage(message));
                 break;
             case SYSTEM:
             case ERROR:
                 onEdt(() -> {
-                    openGroupWindow(false).getPanel().onMessage(message);
+                    groupPanel().onMessage(message);
                     statusLabel.setText(message.getSummary());
                 });
                 break;
@@ -666,7 +754,7 @@ public class ClientUI extends BaseUI implements ChatListener {
             if (groupWindow != null) {
                 groupWindow.getPanel().onConnectionChanged(connected, reason);
             }
-            if (!connected) {
+            if (!connected && !loggingOut) {
                 // 断开是终态：先注销监听再关闭连接，否则 close() 会再次回调本方法，
                 // 用“已断开与服务器的连接”覆盖真实原因并弹出第二个对话框
                 client.removeListener(this);
