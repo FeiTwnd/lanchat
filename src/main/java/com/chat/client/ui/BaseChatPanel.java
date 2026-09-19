@@ -249,6 +249,28 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     }
 
     /**
+     * 在聊天记录最前面插入一行。
+     *
+     * <p>补拉历史记录时使用：这些消息比当前会话中已有的内容更早，
+     * 只有插在最前面才能保持时间顺序。</p>
+     *
+     * @param text  文本内容
+     * @param color 文本颜色
+     */
+    protected void prependLine(String text, Color color) {
+        StyledDocument document = historyPane.getStyledDocument();
+        SimpleAttributeSet attributes = new SimpleAttributeSet();
+        StyleConstants.setForeground(attributes, color);
+        StyleConstants.setFontFamily(attributes, FONT_NORMAL.getFamily());
+        try {
+            document.insertString(0, text + System.lineSeparator(), attributes);
+        } catch (BadLocationException e) {
+            // 插入位置固定为文档开头，理论上不会越界
+            System.err.println("历史记录插入失败: " + e.getMessage());
+        }
+    }
+
+    /**
      * 追加一条带时间戳的消息。
      *
      * @param prefix  前缀（发送者或提示）

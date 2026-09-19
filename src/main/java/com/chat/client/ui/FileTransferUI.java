@@ -50,6 +50,9 @@ public class FileTransferUI extends BaseUI {
     /** 传输编号到窗口的映射，用于接收进度与结果回执 */
     private static final Map<String, FileTransferUI> TRANSFER_OWNERS = new ConcurrentHashMap<>();
 
+    /** 发送成功后的自动关闭延时（毫秒）：留一点时间让使用者看到"传输完成" */
+    private static final int AUTO_CLOSE_DELAY_MS = 2000;
+
     /** 客户端实例 */
     private final transient ChatClient client;
 
@@ -273,11 +276,17 @@ public class FileTransferUI extends BaseUI {
     /**
      * 处理传输结果回执。
      *
+     * <p>发送成功后本窗口会在短暂延时后自动关闭，只留聊天窗口：传输已经结束，
+     * 再挂着一个窗口只会挡住聊天。失败与"对方拒绝"不自动关闭，
+     * 因为使用者需要看到原因并可能重试；接收方也不自动关闭，它要显示文件的保存位置。</p>
+     *
      * @param result 结果消息
      */
     public void handleResult(FileMessage result) {
         TRANSFER_OWNERS.remove(result.getTransferId());
         boolean success = result.isAccepted();
+        // 结果回执由接收方发出：发送者字段不是自己，说明本窗口是发起方
+        boolean senderSide = !client.getUsername().equals(result.getSender());
         onEdt(() -> {
             progressBar.setValue(success ? 100 : 0);
             progressLabel.setText(success ? "传输完成" : "传输失败");
@@ -285,7 +294,29 @@ public class FileTransferUI extends BaseUI {
         appendLog((success ? "[成功] " : "[失败] ") + result.getMessage());
         if (!success) {
             showError(result.getMessage());
+            return;
         }
+        if (senderSide) {
+            appendLog("传输已完成，本窗口将在 " + (AUTO_CLOSE_DELAY_MS / 1000) + " 秒后自动关闭");
+            scheduleAutoClose();
+        }
+    }
+
+    /**
+     * 安排一次延时自动关闭。
+     *
+     * <p>使用 Swing 定时器而不是新线程：回调直接发生在事件分发线程上，可以安全操作窗口。</p>
+     */
+    private void scheduleAutoClose() {
+        javax.swing.Timer timer = new javax.swing.Timer(AUTO_CLOSE_DELAY_MS, event -> {
+            if (TRANSFER_OWNERS.containsValue(this)) {
+                // 同一对端可能还有别的传输在进行，此时不能关闭
+                return;
+            }
+            dispose();
+        });
+        timer.setRepeats(false);
+        timer.start();
     }
 
     /**

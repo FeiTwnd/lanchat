@@ -7,6 +7,7 @@ import com.chat.common.FileTransferCodec;
 import com.chat.common.Message;
 import com.chat.common.MessageType;
 import com.chat.common.Result;
+import com.chat.common.SystemMessage;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
 import com.chat.common.UserListCodec;
@@ -22,6 +23,7 @@ import java.io.ObjectOutputStream;
 import java.net.Socket;
 import java.net.SocketException;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -213,7 +215,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         }
         boolean delivered = server.getUserManager().sendTo(receiver, message);
         if (!delivered) {
-            // 接收者不在线时明确回执失败，而不是静默丢弃
+            // 接收者不在线时明确回执失败，而不是静默丢弃；
+            // 同时在服务器日志留痕：这条消息没有入库，事后排查"对方没收到"时可直接对照
+            LOGGER.warning(() -> "私聊消息未送达（接收者不在线）: " + username + " -> " + receiver);
             send(ChatMessageFactory.error(username, "用户 " + receiver + " 不在线，消息未送达"));
             return;
         }
@@ -573,7 +577,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /**
      * 处理历史记录查询请求。
      *
-     * <p>正文格式：{@code 用户名|起始日期|结束日期}，日期可为空表示不限制。</p>
+     * <p>正文格式：{@code 用户名|起始日期|结束日期|会话对象}。
+     * 日期可为空表示不限制；会话对象为空时返回"本人收发的全部记录 + 广播"，
+     * 非空时只返回这两个人之间的私聊记录——私聊窗口在打开时用它补拉最近的对话。</p>
      *
      * @param message 携带查询条件的文本消息
      */
@@ -587,26 +593,76 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 ? DateUtil.parse(parts[1] + " 00:00:00") : null;
         LocalDateTime to = parts.length > 2 && !parts[2].isEmpty()
                 ? DateUtil.parse(parts[2] + " 23:59:59") : null;
+        String peer = parts.length > 3 ? parts[3].trim() : "";
         MessageService messageService = server.getMessageService();
         Result<List<Message>> result = messageService.queryHistory(target, from, to);
         StringBuilder builder = new StringBuilder();
         if (!result.isSuccess()) {
             builder.append('0').append('|').append(result.getMessage());
         } else {
-            List<Message> messages = result.getData();
-            builder.append('1').append('|').append(messages.size());
+            List<Message> messages = conversationOf(result.getData(), target, peer);
+            builder.append('1').append('|').append(messages.size()).append('|').append(peer);
             for (Message item : messages) {
                 builder.append('\n')
                         .append(DateUtil.format(item.getTimestamp())).append('|')
                         .append(item.getSender()).append('|')
                         .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver()).append('|')
-                        .append(item.getSummary().replace('\n', ' '));
+                        .append(historyText(item));
             }
         }
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
                 builder.toString(), MessageType.TEXT_PRIVATE);
         response.setType(MessageType.HISTORY_RESULT);
         send(response);
+    }
+
+    /**
+     * 按会话对象过滤历史记录。
+     *
+     * @param messages 查询结果
+     * @param target   查询发起方（本人）
+     * @param peer     会话对象；为空时原样返回
+     * @return 过滤后的记录
+     */
+    private List<Message> conversationOf(List<Message> messages, String target, String peer) {
+        if (peer == null || peer.isEmpty()) {
+            return messages;
+        }
+        List<Message> filtered = new ArrayList<>();
+        for (Message item : messages) {
+            // 广播消息接收者为空，不属于任何一对一会话，直接排除
+            if (item.isBroadcast()) {
+                continue;
+            }
+            boolean selfToPeer = target.equals(item.getSender()) && peer.equals(item.getReceiver());
+            boolean peerToSelf = peer.equals(item.getSender()) && target.equals(item.getReceiver());
+            if (selfToPeer || peerToSelf) {
+                filtered.add(item);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * 取历史记录条目用于展示的正文。
+     *
+     * <p>刻意不用 {@code getSummary()}：文本消息的摘要会截断到 30 个字符，
+     * 用它补拉聊天窗口会让历史记录缺一半内容。</p>
+     *
+     * @param item 消息
+     * @return 可安全放入"竖线分隔的单行文本"的正文
+     */
+    private String historyText(Message item) {
+        String text;
+        if (item instanceof TextMessage) {
+            text = ((TextMessage) item).getContent();
+        } else if (item instanceof SystemMessage) {
+            text = ((SystemMessage) item).getContent();
+        } else {
+            text = item.getSummary();
+        }
+        // 换行会破坏"一行一条记录"的格式，统一压成空格
+        return text == null ? "" : text.replace('\n', ' ').replace('\r', ' ');
     }
 
     /**

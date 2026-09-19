@@ -80,6 +80,38 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
+     * 用服务器返回的历史记录填充聊天区。
+     *
+     * <p>只在窗口刚创建时调用一次，用于补齐"关闭窗口再打开"或"重启客户端"之后
+     * 看不到此前对话的问题。已经由实时通道渲染过的消息会被跳过，避免同一条消息出现两次。</p>
+     *
+     * @param records 历史记录，每项为 {@code {时间, 发送者用户名, 正文}}
+     * @return 实际渲染的条数
+     */
+    public int fillHistory(java.util.List<String[]> records) {
+        int rendered = 0;
+        // 从后往前插入到文档开头，插入完成后自然恢复为时间升序
+        for (int i = records.size() - 1; i >= 0; i--) {
+            String[] record = records.get(i);
+            if (record.length < 3) {
+                continue;
+            }
+            boolean fromPeer = peer.equals(record[1]);
+            String who = fromPeer ? peer : "我";
+            if (historyPane.getText().contains(who + ": " + record[2])) {
+                continue;
+            }
+            prependLine("[" + record[0] + "] " + who + ": " + record[2],
+                    fromPeer ? COLOR_OTHER : COLOR_SELF);
+            rendered++;
+        }
+        if (rendered > 0) {
+            prependLine("[系统] 以上为最近 " + rendered + " 条历史记录", COLOR_SYSTEM);
+        }
+        return rendered;
+    }
+
+    /**
      * 获取聊天对象名称。
      *
      * @return 对方用户名

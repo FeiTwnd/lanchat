@@ -375,8 +375,14 @@ public class ClientUI extends BaseUI implements ChatListener {
     public PrivateChatUI openPrivateWindow(String username) {
         // 面板不再单独注册为客户端监听器：消息统一由本窗口分发，
         // 否则同一条消息会被“面板自监听”与“本窗口转发”各渲染一次
-        PrivateChatUI window = privateWindows.computeIfAbsent(username,
-                key -> new PrivateChatUI(client, key));
+        PrivateChatUI window = privateWindows.get(username);
+        if (window == null) {
+            window = new PrivateChatUI(client, username);
+            privateWindows.put(username, window);
+            // 新建窗口时补拉与该用户的最近对话：面板里的内容只存在于内存，
+            // 关闭窗口或重启客户端后若不补拉，使用者会以为对方的消息丢了
+            client.requestHistory(client.getUsername(), "", "", username);
+        }
         if (!window.isVisible()) {
             window.setVisible(true);
         }
@@ -598,10 +604,18 @@ public class ClientUI extends BaseUI implements ChatListener {
                 onEdt(() -> groupPanel().onMessage(message));
                 break;
             case SYSTEM:
+                onEdt(() -> {
+                    groupPanel().onMessage(message);
+                    statusLabel.setText(message.getSummary());
+                });
+                break;
             case ERROR:
                 onEdt(() -> {
                     groupPanel().onMessage(message);
                     statusLabel.setText(message.getSummary());
+                    // 发送方界面上消息已经回显，若把"未送达"之类的错误只写进状态栏，
+                    // 使用者会误以为对方收到了，因此这里必须弹窗明确提示
+                    showError(message.getSummary());
                 });
                 break;
             case FILE_REQUEST:
@@ -708,16 +722,24 @@ public class ClientUI extends BaseUI implements ChatListener {
     /**
      * 展示历史记录查询结果。
      *
+     * <p>两种用途共用一条响应：正文头部第三个字段是"会话对象"，
+     * 非空表示这是私聊窗口补拉的历史（渲染进窗口），为空表示使用者主动查询（弹对话框）。</p>
+     *
      * @param message 历史记录结果消息
      */
     private void showHistoryResult(TextMessage message) {
         String[] lines = message.getContent().split("\n", -1);
         String[] head = lines.length > 0 ? lines[0].split("\\|", -1) : new String[]{"0", "无数据"};
+        String peer = head.length > 2 ? head[2] : "";
         if (head.length < 2 || !"1".equals(head[0])) {
             onEdt(() -> {
                 statusLabel.setText("查询失败");
                 showError("聊天记录查询失败: " + (head.length > 1 ? head[1] : "未知原因"));
             });
+            return;
+        }
+        if (!peer.isEmpty()) {
+            onEdt(() -> renderConversationHistory(peer, lines));
             return;
         }
         StringBuilder builder = new StringBuilder();
@@ -734,6 +756,33 @@ public class ClientUI extends BaseUI implements ChatListener {
             JOptionPane.showMessageDialog(this, new JScrollPane(area),
                     "聊天记录（共 " + head[1] + " 条）", JOptionPane.INFORMATION_MESSAGE);
         });
+    }
+
+    /**
+     * 把补拉到的会话历史渲染进对应的私聊窗口。
+     *
+     * @param peer  会话对象用户名
+     * @param lines 响应正文按行切分后的数组，首行为头部
+     */
+    private void renderConversationHistory(String peer, String[] lines) {
+        PrivateChatUI window = privateWindows.get(peer);
+        if (window == null) {
+            // 窗口已被关闭（例如使用者在响应到达前又关掉了），无需再渲染
+            return;
+        }
+        List<String[]> records = new java.util.ArrayList<>();
+        for (int i = 1; i < lines.length; i++) {
+            if (lines[i].isEmpty()) {
+                continue;
+            }
+            // 正文里可能含竖线，限制切分次数可保证它完整落在最后一个字段
+            String[] fields = lines[i].split("\\|", 4);
+            if (fields.length < 4) {
+                continue;
+            }
+            records.add(new String[]{fields[0], fields[1], fields[3]});
+        }
+        window.getPanel().fillHistory(records);
     }
 
     /**

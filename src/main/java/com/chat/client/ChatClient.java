@@ -637,8 +637,22 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean requestHistory(String target, String fromDate, String toDate) {
+        return requestHistory(target, fromDate, toDate, "");
+    }
+
+    /**
+     * 请求历史聊天记录（可限定会话对象）。
+     *
+     * @param target   目标用户名，为空表示查询全部
+     * @param fromDate 起始日期，格式 yyyy-MM-dd，可为空
+     * @param toDate   结束日期，格式 yyyy-MM-dd，可为空
+     * @param peer     会话对象用户名；非空时只返回 target 与该用户之间的私聊记录，
+     *                 为空时保持"本人全部收发 + 广播"的旧语义
+     * @return 发送成功返回 true
+     */
+    public boolean requestHistory(String target, String fromDate, String toDate, String peer) {
         String body = (target == null ? "" : target) + "|" + (fromDate == null ? "" : fromDate)
-                + "|" + (toDate == null ? "" : toDate);
+                + "|" + (toDate == null ? "" : toDate) + "|" + (peer == null ? "" : peer);
         TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER, body,
                 MessageType.TEXT_PRIVATE);
         message.setType(MessageType.HISTORY_REQUEST);
