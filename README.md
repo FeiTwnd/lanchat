@@ -133,6 +133,45 @@ java -jar dist/chat-client.jar --help     # 查看命令行帮助
 java -jar dist/chat-test.jar              # 运行单元测试
 ```
 
+### 方式四：在 IntelliJ IDEA 中运行
+
+本项目是普通 Java 工程，不依赖 Maven/Gradle，导入 IDEA 后只需三步。
+
+1. 打开工程：`File -> Open`，选择项目根目录（本工程没有 pom.xml，直接以普通工程打开即可）。
+2. 确认 SDK 与源码根：`File -> Project Structure -> Project` 中 SDK 选择 JDK 17 及以上
+   （本项目在 JDK 21 上验证）；右键 `src/main/java` 标记为 `Sources Root`，
+   右键 `src/test/java` 标记为 `Test Sources Root`。测试源码根未标记时，
+   `com.chat.test` 包下的类会全部报红，测试也无法运行。
+3. 运行配置：`Run -> Edit Configurations` 新增 `Application` 类型配置，按需填写：
+
+| 配置名 | 主类 | 程序参数 | 说明 |
+| --- | --- | --- | --- |
+| 服务器（图形控制台） | `com.chat.server.ChatServer` | 无 | 带 Swing 控制台的服务器 |
+| 服务器（控制台模式） | `com.chat.server.ChatServer` | `--console` | 无图形界面，适合远程或无显示环境 |
+| 客户端（可多开） | `com.chat.client.ChatClientApp` | 无 | 演示多用户必须先允许并行运行 |
+| 客户端（含内置服务器） | `com.chat.client.ChatClientApp` | `--local-server` | 单机一键演示 |
+| 单元测试（47 用例） | `com.chat.test.TestRunner` | 无 | 项目自带的零依赖测试框架 |
+| 集成测试（7 用例） | `com.chat.test.IntegrationTest` | 无 | 内部自行启动服务器与多个客户端 |
+
+本机 `.idea/runConfigurations/` 下已生成上述 6 个配置，打开 IDEA 后可直接在下拉框中选择
+（IDE 工程文件按惯例不入库，因此只在本机生效）；若列表中没有出现，按上表手工新增即可。
+
+四个必须注意的坑：
+
+- **工作目录**：每个配置的 `Working directory` 保持默认的 `$PROJECT_DIR$`。程序以系统属性
+  `user.dir` 为基准定位 `config/chat.properties` 与 `data/` 目录，工作目录若改成模块目录或
+  `out/`，会读不到配置文件而静默退化成内置默认值。
+- **多开客户端**：客户端配置需在 `Modify options` 中勾选 `Allow multiple instances`，
+  否则第二次运行时 IDEA 会弹出 `Stop and Rerun` 并终止已登录的客户端，无法演示双人聊天。
+- **端口占用**：同一时刻只保留一个服务器实例（IDEA 中启动的、`scripts/run-server.sh` 启动的、
+  `dist/chat-server.jar` 启动的互斥），否则新实例会因 9527 端口被占用而启动失败，
+  运行集成测试前尤其需要检查。
+- **编码**：`File -> Settings -> Editor -> File Encodings` 统一选择 UTF-8，源码含中文注释与
+  中文界面文案；另外 `config/chat.properties` 由 `Properties.load(InputStream)` 读取，
+  该方法按 ISO-8859-1 解码，若要在配置值中写中文，需使用 `\uXXXX` 转义形式。
+
+IDEA 的编译输出目录是 `out/`，与脚本使用的 `build/`、`dist/` 互不干扰，两种方式可混用。
+
 ---
 
 ## 五、首次使用流程
