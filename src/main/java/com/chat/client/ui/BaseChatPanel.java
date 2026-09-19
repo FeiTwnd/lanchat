@@ -2,10 +2,13 @@ package com.chat.client.ui;
 
 import com.chat.client.ChatClient;
 import com.chat.client.ChatListener;
+import com.chat.client.ui.theme.SkinButton;
+import com.chat.client.ui.theme.Theme;
 import com.chat.common.Constants;
 import com.chat.common.Message;
 import com.chat.util.DateUtil;
 
+import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
@@ -67,10 +70,11 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     protected final JTextField inputField = new JTextField();
 
     /** 发送按钮 */
-    protected final JButton sendButton = new JButton("发送");
+    /** 发送按钮 */
+    protected final JButton sendButton = new SkinButton("发送", SkinButton.Kind.PRIMARY);
 
     /** 清空按钮 */
-    protected final JButton clearButton = new JButton("清空");
+    protected final JButton clearButton = new SkinButton("清空", SkinButton.Kind.NORMAL);
 
     /** 客户端引用 */
     protected final transient ChatClient client;
@@ -83,6 +87,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     protected BaseChatPanel(ChatClient client) {
         this.client = client;
         setLayout(new BorderLayout(4, 4));
+        setBackground(Theme.CARD);
         initHistoryPane();
         add(buildHistoryScroll(), BorderLayout.CENTER);
         add(buildInputPanel(), BorderLayout.SOUTH);
@@ -115,9 +120,15 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * @return 输入面板
      */
     private JPanel buildInputPanel() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
+        JPanel panel = new JPanel(new BorderLayout(6, 6));
+        panel.setBackground(Theme.CARD);
+        panel.setBorder(BorderFactory.createEmptyBorder(6, 8, 8, 8));
+        inputField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Theme.BORDER),
+                BorderFactory.createEmptyBorder(5, 6, 5, 6)));
         panel.add(inputField, BorderLayout.CENTER);
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        buttons.setOpaque(false);
         buttons.add(sendButton);
         buttons.add(clearButton);
         panel.add(buttons, BorderLayout.EAST);

@@ -3,13 +3,16 @@ package com.chat.client.ui;
 import com.chat.client.ChatClient;
 import com.chat.client.ChatListener;
 import com.chat.client.DiscoveryClient;
+import com.chat.client.ui.theme.Glyphs;
+import com.chat.client.ui.theme.SkinButton;
+import com.chat.client.ui.theme.Theme;
 import com.chat.common.Config;
 import com.chat.common.Constants;
 import com.chat.common.Message;
 import com.chat.common.MessageType;
 import com.chat.common.TextMessage;
 
-import javax.swing.JButton;
+import javax.swing.BorderFactory;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JOptionPane;
@@ -19,10 +22,13 @@ import javax.swing.JScrollPane;
 import javax.swing.JTextField;
 import javax.swing.SwingWorker;
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
+import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
+import java.awt.GridLayout;
 import java.awt.Insets;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -69,13 +75,14 @@ public class LoginUI extends BaseUI implements ChatListener {
     private final JLabel statusLabel = new JLabel("请输入账号信息或点击“自动发现服务器”");
 
     /** 登录按钮 */
-    private final JButton loginButton = new JButton("登录");
+    private final SkinButton loginButton = new SkinButton("登录", SkinButton.Kind.PRIMARY);
 
     /** 注册按钮 */
-    private final JButton registerButton = new JButton("注册新账号");
+    private final SkinButton registerButton = new SkinButton("注册新账号", SkinButton.Kind.NORMAL);
 
     /** 发现按钮 */
-    private final JButton discoverButton = new JButton("自动发现服务器");
+    private final SkinButton discoverButton =
+            new SkinButton("自动发现服务器", SkinButton.Kind.NORMAL);
 
     /** 登录结果等待锁 */
     private transient CountDownLatch loginLatch;
@@ -112,7 +119,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     public LoginUI() {
         super(Constants.APP_NAME + " " + Constants.APP_VERSION + " - 登录");
         initComponents();
-        setSize(560, 380);
+        setSize(580, 470);
         centerOnScreen();
         getRootPane().setDefaultButton(loginButton);
     }
@@ -122,6 +129,8 @@ public class LoginUI extends BaseUI implements ChatListener {
      */
     private void initComponents() {
         JPanel form = new JPanel(new GridBagLayout());
+        form.setBackground(Theme.CARD);
+        form.setBorder(BorderFactory.createEmptyBorder(14, 18, 8, 18));
         GridBagConstraints constraints = new GridBagConstraints();
         constraints.insets = new Insets(4, 6, 4, 6);
         constraints.anchor = GridBagConstraints.WEST;
@@ -132,11 +141,12 @@ public class LoginUI extends BaseUI implements ChatListener {
         addRow(form, constraints, 3, "密码:", passwordField);
         addRow(form, constraints, 4, "昵称（注册用）:", nicknameField);
 
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 6, 6));
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 10));
+        buttons.setBackground(Theme.CARD);
         buttons.add(loginButton);
         buttons.add(registerButton);
         buttons.add(discoverButton);
-        JButton passwordButton = new JButton("修改密码");
+        SkinButton passwordButton = new SkinButton("修改密码", SkinButton.Kind.GHOST);
         passwordButton.addActionListener(e -> changePassword());
         buttons.add(passwordButton);
 
@@ -145,14 +155,47 @@ public class LoginUI extends BaseUI implements ChatListener {
         discoverButton.addActionListener(e -> doDiscover());
 
         JPanel statusPanel = new JPanel(new BorderLayout());
+        statusPanel.setBackground(Theme.CARD);
         statusPanel.add(statusLabel, BorderLayout.WEST);
+        statusLabel.setForeground(Theme.TEXT_WEAK);
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(0, 18, 8, 0));
+        statusLabel.setPreferredSize(new Dimension(520, 24));
 
-        setLayout(new BorderLayout());
-        add(form, BorderLayout.CENTER);
-        add(buttons, BorderLayout.SOUTH);
-        add(statusPanel, BorderLayout.NORTH);
-        statusLabel.setBorder(javax.swing.BorderFactory.createEmptyBorder(8, 10, 0, 0));
-        statusLabel.setPreferredSize(new Dimension(520, 28));
+        JPanel south = new JPanel(new BorderLayout());
+        south.setBackground(Theme.CARD);
+        south.add(buttons, BorderLayout.CENTER);
+        south.add(statusPanel, BorderLayout.SOUTH);
+
+        body().setLayout(new BorderLayout());
+        body().add(buildBrand(), BorderLayout.NORTH);
+        body().add(form, BorderLayout.CENTER);
+        body().add(south, BorderLayout.SOUTH);
+    }
+
+    /**
+     * 构建品牌头部：徽标、程序名与副标题。
+     *
+     * @return 面板
+     */
+    private JPanel buildBrand() {
+        JPanel brand = new JPanel(new BorderLayout(14, 0));
+        brand.setBackground(Theme.PRIMARY);
+        brand.setBorder(BorderFactory.createEmptyBorder(14, 18, 14, 18));
+
+        JPanel text = new JPanel(new GridLayout(2, 1, 0, 2));
+        text.setOpaque(false);
+        JLabel title = new JLabel(Constants.APP_NAME);
+        title.setFont(Theme.font(18, Font.BOLD));
+        title.setForeground(Color.WHITE);
+        JLabel slogan = new JLabel("局域网即时通讯 · 私聊 / 群聊 / 文件传输");
+        slogan.setFont(Theme.fontSmall());
+        slogan.setForeground(new Color(0xE6F6FE));
+        text.add(title);
+        text.add(slogan);
+
+        brand.add(new JLabel(Glyphs.logo(40)), BorderLayout.WEST);
+        brand.add(text, BorderLayout.CENTER);
+        return brand;
     }
 
     /**

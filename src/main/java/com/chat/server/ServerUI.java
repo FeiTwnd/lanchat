@@ -1,12 +1,13 @@
 package com.chat.server;
 
 import com.chat.client.ui.BaseUI;
+import com.chat.client.ui.theme.SkinButton;
+import com.chat.client.ui.theme.Theme;
 import com.chat.common.Config;
 import com.chat.common.Constants;
 import com.chat.common.User;
 
 import javax.swing.BorderFactory;
-import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
@@ -72,10 +73,10 @@ public class ServerUI extends BaseUI implements ServerObserver {
     private final JLabel statusLabel = new JLabel("服务器未启动");
 
     /** 启动按钮 */
-    private final JButton startButton = new JButton("启动服务器");
+    private final SkinButton startButton = new SkinButton("启动服务器", SkinButton.Kind.PRIMARY);
 
     /** 停止按钮 */
-    private final JButton stopButton = new JButton("停止服务器");
+    private final SkinButton stopButton = new SkinButton("停止服务器", SkinButton.Kind.NORMAL);
 
     /** 在线人数标签 */
     private final JLabel onlineLabel = new JLabel("在线人数: 0");
@@ -119,9 +120,9 @@ public class ServerUI extends BaseUI implements ServerObserver {
         splitPane.setResizeWeight(0.25);
         splitPane.setDividerLocation(150);
 
-        setLayout(new BorderLayout());
-        add(splitPane, BorderLayout.CENTER);
-        add(buildControlPanel(), BorderLayout.SOUTH);
+        body().setLayout(new BorderLayout());
+        body().add(splitPane, BorderLayout.CENTER);
+        body().add(buildControlPanel(), BorderLayout.SOUTH);
 
         startButton.addActionListener(e -> startServer());
         stopButton.addActionListener(e -> stopServer());
@@ -139,10 +140,13 @@ public class ServerUI extends BaseUI implements ServerObserver {
      */
     private JPanel buildInfoPanel() {
         JPanel panel = new JPanel(new GridLayout(3, 1, 4, 4));
+        panel.setBackground(Theme.BG);
         panel.setBorder(BorderFactory.createTitledBorder("服务器状态"));
         panel.add(statusLabel);
         panel.add(onlineLabel);
-        panel.add(new JLabel("提示: 客户端启动后会自动发现本服务器，也可手动输入本机 IP"));
+        JLabel hint = new JLabel("提示: 客户端启动后会自动发现本服务器，也可手动输入本机 IP");
+        hint.setForeground(Theme.TEXT_WEAK);
+        panel.add(hint);
         return panel;
     }
 
@@ -152,13 +156,14 @@ public class ServerUI extends BaseUI implements ServerObserver {
      * @return 面板对象
      */
     private JPanel buildControlPanel() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
+        panel.setBackground(Theme.BG);
         panel.add(startButton);
         panel.add(stopButton);
-        JButton clearButton = new JButton("清空日志");
+        SkinButton clearButton = new SkinButton("清空日志", SkinButton.Kind.NORMAL);
         clearButton.addActionListener(e -> logArea.setText(""));
         panel.add(clearButton);
-        panel.setPreferredSize(new Dimension(100, 44));
+        panel.setPreferredSize(new Dimension(100, 48));
         return panel;
     }
 

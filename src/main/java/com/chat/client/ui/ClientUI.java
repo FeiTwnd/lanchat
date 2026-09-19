@@ -2,6 +2,10 @@ package com.chat.client.ui;
 
 import com.chat.client.ChatClient;
 import com.chat.client.ChatListener;
+import com.chat.client.ui.theme.AvatarFactory;
+import com.chat.client.ui.theme.Glyphs;
+import com.chat.client.ui.theme.SkinButton;
+import com.chat.client.ui.theme.Theme;
 import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.Message;
@@ -12,20 +16,20 @@ import com.chat.common.User;
 import com.chat.common.UserListCodec;
 import com.chat.service.MessageService;
 
-import javax.swing.JButton;
+import javax.swing.BorderFactory;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
-import javax.swing.JTable;
 import javax.swing.JTextArea;
-import javax.swing.ListSelectionModel;
-import javax.swing.table.DefaultTableModel;
+import javax.swing.JTextField;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
+import java.awt.Font;
+import java.awt.GridLayout;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
@@ -70,33 +74,17 @@ public class ClientUI extends BaseUI implements ChatListener {
     /** 群聊窗口 */
     private transient GroupChatUI groupWindow;
 
-    /** 在线用户表格模型 */
-    private final DefaultTableModel userTableModel = new DefaultTableModel(
-            new String[]{"用户名", "昵称", "角色"}, 0) {
-        /** 序列化版本号 */
-        private static final long serialVersionUID = 20250120L;
-
-        /**
-         * 禁止编辑单元格。
-         *
-         * @param row    行号
-         * @param column 列号
-         * @return 恒定返回 false
-         */
-        @Override
-        public boolean isCellEditable(int row, int column) {
-            return false;
-        }
-    };
-
-    /** 在线用户表格 */
-    private final JTable userTable = new JTable(userTableModel);
+    /** 在线用户树（按角色分组、头像区分在线离线、支持关键字过滤） */
+    private final OnlineUserTree userTree = new OnlineUserTree();
 
     /** 状态栏 */
     private final JLabel statusLabel = new JLabel("已连接");
 
-    /** 当前在线用户缓存，供私聊与删除操作使用 */
-    private final transient Map<String, User> onlineUsers = new ConcurrentHashMap<>();
+    /** 头部信息行：角色与在线人数 */
+    private final JLabel headerMeta = new JLabel();
+
+    /** 头部头像：用户列表到达后按真实角色重绘（管理员带橙色描边） */
+    private final JLabel headerAvatar = new JLabel();
 
     /** 消息业务服务，仅用于本地导出聊天记录 */
     private final transient MessageService messageService = new MessageService();
@@ -121,10 +109,9 @@ public class ClientUI extends BaseUI implements ChatListener {
      * 组装界面组件。
      */
     private void initComponents() {
-        userTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        userTable.setRowHeight(24);
-        // 双击用户行直接打开私聊窗口，符合即时通讯软件的通用交互习惯
-        userTable.addMouseListener(new MouseAdapter() {
+        // 双击用户节点直接打开私聊窗口，符合即时通讯软件的通用交互习惯
+        userTree.addMouseListener(new MouseAdapter() {
+
             /**
              * 双击打开私聊窗口。
              *
@@ -140,36 +127,114 @@ public class ClientUI extends BaseUI implements ChatListener {
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
                 buildUserPanel(), buildFunctionPanel());
-        splitPane.setDividerLocation(420);
+        splitPane.setDividerLocation(440);
         splitPane.setResizeWeight(0.55);
+        splitPane.setBorder(BorderFactory.createEmptyBorder());
+        splitPane.setOpaque(false);
 
-        setLayout(new BorderLayout());
-        add(splitPane, BorderLayout.CENTER);
-        add(buildStatusBar(), BorderLayout.SOUTH);
+        body().setLayout(new BorderLayout());
+        body().add(buildHeader(), BorderLayout.NORTH);
+        body().add(splitPane, BorderLayout.CENTER);
+        body().add(buildStatusBar(), BorderLayout.SOUTH);
     }
 
     /**
-     * 构建在线用户面板。
+     * 构建头部卡片：头像、昵称、角色与在线人数、刷新入口。
+     *
+     * @return 面板
+     */
+    private JPanel buildHeader() {
+        JPanel card = card();
+        card.setLayout(new BorderLayout(12, 0));
+
+        JPanel identity = new JPanel(new GridLayout(2, 1, 0, 2));
+        identity.setOpaque(false);
+        JLabel name = new JLabel(displayName() + "（" + client.getUsername() + "）");
+        name.setFont(Theme.font(16, Font.BOLD));
+        name.setForeground(Theme.TEXT);
+        headerMeta.setFont(Theme.fontSmall());
+        headerMeta.setForeground(Theme.TEXT_WEAK);
+        headerMeta.setText("正在获取在线用户……");
+        identity.add(name);
+        identity.add(headerMeta);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        actions.setOpaque(false);
+        actions.add(SkinButton.normal("刷新列表", e -> client.requestUserList())
+                .withIcon(Glyphs.refresh(16, Theme.PRIMARY)));
+
+        headerAvatar.setIcon(AvatarFactory.avatar(displayName(), true, false, 48));
+        card.add(headerAvatar, BorderLayout.WEST);
+        card.add(identity, BorderLayout.CENTER);
+        card.add(actions, BorderLayout.EAST);
+        return card;
+    }
+
+    /**
+     * 构建在线用户面板：搜索框 + 用户树 + 操作按钮。
      *
      * @return 面板
      */
     private JPanel buildUserPanel() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        panel.setBorder(javax.swing.BorderFactory.createTitledBorder("在线用户（双击开始私聊）"));
-        panel.add(new JScrollPane(userTable), BorderLayout.CENTER);
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.setBackground(Theme.CARD);
+        panel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
-        JButton privateButton = new JButton("发起私聊");
-        privateButton.addActionListener(e -> openPrivateChatWithSelected());
-        JButton fileButton = new JButton("发送文件");
-        fileButton.addActionListener(e -> openFileTransferWithSelected());
-        JButton refreshButton = new JButton("刷新列表");
-        refreshButton.addActionListener(e -> client.requestUserList());
-        buttons.add(privateButton);
-        buttons.add(fileButton);
-        buttons.add(refreshButton);
+        JTextField searchField = new JTextField();
+        searchField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Theme.BORDER),
+                BorderFactory.createEmptyBorder(4, 6, 4, 6)));
+        searchField.setToolTipText("按昵称或账号过滤用户");
+        searchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+
+            /**
+             * 输入内容时刷新过滤。
+             *
+             * @param e 文档事件
+             */
+            @Override
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                userTree.setFilter(searchField.getText());
+            }
+
+            /**
+             * 删除内容时刷新过滤。
+             *
+             * @param e 文档事件
+             */
+            @Override
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                userTree.setFilter(searchField.getText());
+            }
+
+            /**
+             * 属性变化时刷新过滤。
+             *
+             * @param e 文档事件
+             */
+            @Override
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                userTree.setFilter(searchField.getText());
+            }
+        });
+        JPanel searchRow = new JPanel(new BorderLayout(6, 0));
+        searchRow.setOpaque(false);
+        searchRow.add(new JLabel(Glyphs.search(16, Theme.TEXT_WEAK)), BorderLayout.WEST);
+        searchRow.add(searchField, BorderLayout.CENTER);
+        panel.add(searchRow, BorderLayout.NORTH);
+
+        JScrollPane scroll = new JScrollPane(userTree);
+        scroll.setBorder(BorderFactory.createLineBorder(Theme.BORDER));
+        scroll.getViewport().setBackground(Theme.CARD);
+        panel.add(scroll, BorderLayout.CENTER);
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        buttons.setOpaque(false);
+        buttons.add(SkinButton.primary("发起私聊", e -> openPrivateChatWithSelected()));
+        buttons.add(SkinButton.normal("发送文件", e -> openFileTransferWithSelected()));
+        buttons.add(SkinButton.normal("刷新列表", e -> client.requestUserList()));
         panel.add(buttons, BorderLayout.SOUTH);
-        panel.setPreferredSize(new Dimension(430, 480));
+        panel.setPreferredSize(new Dimension(450, 480));
         return panel;
     }
 
@@ -179,42 +244,39 @@ public class ClientUI extends BaseUI implements ChatListener {
      * @return 面板
      */
     private JPanel buildFunctionPanel() {
-        JPanel panel = new JPanel(new java.awt.GridLayout(0, 1, 6, 6));
-        panel.setBorder(javax.swing.BorderFactory.createTitledBorder("功能"));
+        JPanel panel = new JPanel(new GridLayout(0, 1, 6, 6));
+        panel.setBackground(Theme.BG);
+        panel.setBorder(BorderFactory.createEmptyBorder(8, 2, 8, 8));
 
-        panel.add(button("进入群聊大厅", e -> openGroupWindow(true)));
-        panel.add(button("发送文件…", e -> chooseAndSendFile()));
-        panel.add(button("查询聊天记录…", e -> showHistoryDialog()));
-        panel.add(button("导出我的聊天记录", e -> exportHistory()));
-        panel.add(button("修改昵称…", e -> changeNickname()));
-        panel.add(button("修改密码…", e -> showPasswordHint()));
-        panel.add(button("删除用户（管理员）…", e -> deleteUser()));
+        panel.add(SkinButton.menu("进入群聊大厅", Glyphs.group(18, Theme.PRIMARY),
+                e -> openGroupWindow(true)));
+        panel.add(SkinButton.menu("发送文件…", Glyphs.file(18, Theme.PRIMARY),
+                e -> chooseAndSendFile()));
+        panel.add(SkinButton.menu("查询聊天记录…", Glyphs.history(18, Theme.PRIMARY),
+                e -> showHistoryDialog()));
+        panel.add(SkinButton.menu("导出我的聊天记录", Glyphs.export(18, Theme.PRIMARY),
+                e -> exportHistory()));
+        panel.add(SkinButton.menu("修改昵称…", Glyphs.user(18, Theme.PRIMARY),
+                e -> changeNickname()));
+        panel.add(SkinButton.menu("修改密码…", Glyphs.lock(18, Theme.PRIMARY),
+                e -> showPasswordHint()));
+        panel.add(SkinButton.menu("删除用户（管理员）…", Glyphs.trash(18, Theme.DANGER),
+                SkinButton.Kind.DANGER, e -> deleteUser()));
 
         JTextArea tips = new JTextArea();
         tips.setEditable(false);
         tips.setLineWrap(true);
         tips.setWrapStyleWord(true);
-        tips.setFont(FONT_NORMAL);
+        tips.setFont(Theme.fontSmall());
+        tips.setForeground(Theme.TEXT_WEAK);
+        tips.setBackground(Theme.BG);
         tips.setText("使用提示：\n"
                 + "1. 在线用户列表由服务器实时推送，用户上线/下线会自动刷新。\n"
-                + "2. 双击某个用户即可开始私聊。\n"
+                + "2. 双击某个用户即可开始私聊；离线的用户会被置灰并归入“离线”分组。\n"
                 + "3. 文件传输支持进度显示，接收到的文件保存在 data/received 目录。\n"
                 + "4. 聊天记录按天保存在 data/history 目录，可按时间范围查询与导出。");
         panel.add(new JScrollPane(tips));
         return panel;
-    }
-
-    /**
-     * 创建按钮并绑定事件。
-     *
-     * @param text   按钮文本
-     * @param action 事件处理器
-     * @return 按钮对象
-     */
-    private JButton button(String text, java.awt.event.ActionListener action) {
-        JButton button = new JButton(text);
-        button.addActionListener(action);
-        return button;
     }
 
     /**
@@ -224,26 +286,58 @@ public class ClientUI extends BaseUI implements ChatListener {
      */
     private JPanel buildStatusBar() {
         JPanel panel = new JPanel(new BorderLayout());
+        panel.setBackground(Theme.BG);
+        panel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 10));
+        statusLabel.setForeground(Theme.TEXT);
         panel.add(statusLabel, BorderLayout.WEST);
         JLabel hint = new JLabel("服务器: 已连接    用户: " + client.getUsername() + "    ");
+        hint.setForeground(Theme.TEXT_WEAK);
         panel.add(hint, BorderLayout.EAST);
         return panel;
     }
 
     /**
+     * 获取当前用户的显示名。
+     *
+     * @return 昵称；昵称为空时返回用户名
+     */
+    private String displayName() {
+        String nickname = client.getNickname();
+        return nickname == null || nickname.trim().isEmpty() ? client.getUsername() : nickname;
+    }
+
+    /**
+     * 判断当前登录用户是否为管理员。
+     *
+     * <p>角色信息来自服务器推送的用户列表；列表尚未到达时按普通用户处理。</p>
+     *
+     * @return 管理员返回 true
+     */
+    private boolean isAdmin() {
+        User self = userTree.onlineUsers().get(client.getUsername());
+        return self != null && self.isAdmin();
+    }
+
+    /**
      * 打开当前选中用户的私聊窗口。
+     *
+     * <p>离线的用户同样允许打开窗口：服务器会以错误消息回执说明对方不在线，
+     * 这比在界面层静默拦下更容易让使用者理解发生了什么。</p>
      */
     private void openPrivateChatWithSelected() {
-        String username = selectedUsername();
-        if (username == null) {
+        User target = userTree.selectedUser();
+        if (target == null) {
             showInfo("请先在左侧列表中选择一个用户");
             return;
         }
-        if (username.equals(client.getUsername())) {
+        if (target.getUsername().equals(client.getUsername())) {
             showInfo("不能与自己私聊，请使用群聊大厅");
             return;
         }
-        openPrivateWindow(username);
+        if (!userTree.selectedIsOnline()) {
+            statusLabel.setText("提示：" + target.getUsername() + " 已离线，消息可能无法送达");
+        }
+        openPrivateWindow(target.getUsername());
     }
 
     /**
@@ -264,16 +358,13 @@ public class ClientUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 获取当前选中行的用户名。
+     * 获取当前选中的用户名。
      *
-     * @return 用户名；未选中时返回 null
+     * @return 用户名；未选中用户节点时返回 null
      */
     private String selectedUsername() {
-        int row = userTable.getSelectedRow();
-        if (row < 0) {
-            return null;
-        }
-        return String.valueOf(userTableModel.getValueAt(row, 0));
+        User user = userTree.selectedUser();
+        return user == null ? null : user.getUsername();
     }
 
     /**
@@ -283,11 +374,10 @@ public class ClientUI extends BaseUI implements ChatListener {
      * @return 私聊窗口
      */
     public PrivateChatUI openPrivateWindow(String username) {
-        PrivateChatUI window = privateWindows.computeIfAbsent(username, key -> {
-            PrivateChatUI created = new PrivateChatUI(client, key);
-            client.addListener(created.getPanel());
-            return created;
-        });
+        // 面板不再单独注册为客户端监听器：消息统一由本窗口分发，
+        // 否则同一条消息会被“面板自监听”与“本窗口转发”各渲染一次
+        PrivateChatUI window = privateWindows.computeIfAbsent(username,
+                key -> new PrivateChatUI(client, key));
         if (!window.isVisible()) {
             window.setVisible(true);
         }
@@ -304,7 +394,6 @@ public class ClientUI extends BaseUI implements ChatListener {
     public GroupChatUI openGroupWindow(boolean toFront) {
         if (groupWindow == null) {
             groupWindow = new GroupChatUI(client, client.getNickname());
-            client.addListener(groupWindow.getPanel());
         }
         if (!groupWindow.isVisible()) {
             groupWindow.setVisible(true);
@@ -424,21 +513,21 @@ public class ClientUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 依据在线用户列表刷新表格。
+     * 依据在线用户列表刷新用户树与头部信息。
      *
      * @param text 用户列表编码文本
      */
-    private void refreshUserTable(String text) {
+    private void refreshUserList(String text) {
         List<User> users = UserListCodec.decode(text);
         onEdt(() -> {
-            userTableModel.setRowCount(0);
-            onlineUsers.clear();
-            for (User user : users) {
-                onlineUsers.put(user.getUsername(), user);
-                userTableModel.addRow(new Object[]{user.getUsername(), user.getNickname(),
-                        user.isAdmin() ? "管理员" : "普通用户"});
-            }
-            statusLabel.setText("在线用户 " + users.size() + " 人（含自己）");
+            int count = userTree.update(users);
+            boolean admin = isAdmin();
+            headerAvatar.setIcon(AvatarFactory.avatar(displayName(), true, admin, 48));
+            headerMeta.setText((admin ? "管理员" : "普通用户")
+                    + " · 在线用户 " + count + " 人"
+                    + (userTree.offlineCount() > 0 ? "，离线 " + userTree.offlineCount() + " 人" : "")
+                    + " · 双击用户开始私聊");
+            statusLabel.setText("在线用户 " + count + " 人（含自己）");
         });
     }
 
@@ -451,7 +540,7 @@ public class ClientUI extends BaseUI implements ChatListener {
     public void onMessage(Message message) {
         switch (message.getType()) {
             case USER_LIST:
-                refreshUserTable(message instanceof TextMessage
+                refreshUserList(message instanceof TextMessage
                         ? ((TextMessage) message).getContent() : "");
                 break;
             case LOGIN_RESULT:
@@ -461,12 +550,14 @@ public class ClientUI extends BaseUI implements ChatListener {
                 handlePrivateMessage((TextMessage) message);
                 break;
             case TEXT_GROUP:
-                openGroupWindow(false).getPanel().onMessage(message);
+                onEdt(() -> openGroupWindow(false).getPanel().onMessage(message));
                 break;
             case SYSTEM:
             case ERROR:
-                openGroupWindow(false).getPanel().onMessage(message);
-                statusLabel.setText(message.getSummary());
+                onEdt(() -> {
+                    openGroupWindow(false).getPanel().onMessage(message);
+                    statusLabel.setText(message.getSummary());
+                });
                 break;
             case FILE_REQUEST:
             case FILE_ACCEPT:
@@ -478,10 +569,10 @@ public class ClientUI extends BaseUI implements ChatListener {
                 routeProgress((FileMessage) message);
                 break;
             case HISTORY_RESULT:
-                showHistoryResult((TextMessage) message);
+                onEdt(() -> showHistoryResult((TextMessage) message));
                 break;
             default:
-                statusLabel.setText("收到消息: " + message.getType().getDescription());
+                onEdt(() -> statusLabel.setText("收到消息: " + message.getType().getDescription()));
                 break;
         }
     }
@@ -489,39 +580,55 @@ public class ClientUI extends BaseUI implements ChatListener {
     /**
      * 处理私聊消息：打开对应窗口并投递。
      *
+     * <p>本方法由网络接收线程回调，窗口的创建与内容追加必须整体切到事件分发线程。
+     * 若在网络线程创建窗口，会与该线程中正在排版的 {@code JTextPane} 形成
+     * “事件线程持有文档写锁等待 AWT 树锁、网络线程持有 AWT 树锁等待文档读锁”的
+     * 死锁，界面会彻底卡死。</p>
+     *
      * @param message 私聊文本消息
      */
     private void handlePrivateMessage(TextMessage message) {
-        String peer = client.getUsername().equals(message.getSender())
+        String self = client.getUsername();
+        // 服务器在私聊投递成功后会给发送方回一条“送达回执”，其发送者与接收者都是发送者本人。
+        // 本地发送时已经回显消息，若把回执也走一遍分发，发送方会弹出一个“与自己私聊”的窗口，
+        // 因此这里直接忽略；回执的价值在于协议层确认送达（集成用例 IT-03 依赖它）。
+        if (self != null && self.equals(message.getSender()) && self.equals(message.getReceiver())) {
+            return;
+        }
+        String peer = self != null && self.equals(message.getSender())
                 ? message.getReceiver() : message.getSender();
         if (peer == null || peer.isEmpty()) {
             return;
         }
-        PrivateChatUI window = openPrivateWindow(peer);
-        onEdt(() -> window.getPanel().onMessage(message));
+        onEdt(() -> openPrivateWindow(peer).getPanel().onMessage(message));
     }
 
     /**
      * 路由文件类消息到对应窗口。
      *
-     * @param message 文件消息
+     * <p>同 {@link #handlePrivateMessage(TextMessage)}：窗口的创建、显示与日志追加
+     * 一律在事件分发线程执行，网络线程只负责解码协议内容。</p>
+     *
+     * @param raw 文件消息（可能由文本消息承载元信息）
      */
     private void routeFileMessage(Message raw) {
         // FILE_REQUEST 可能以文本消息承载元信息，统一在这里还原成文件消息
         FileMessage message = raw instanceof FileMessage ? (FileMessage) raw
                 : ChatClient.decodeRequest((TextMessage) raw);
         if (message == null) {
-            statusLabel.setText("收到无法解析的文件消息");
+            onEdt(() -> statusLabel.setText("收到无法解析的文件消息"));
             return;
         }
-        boolean incoming = message.getType() == MessageType.FILE_REQUEST;
-        String peer = incoming ? message.getSender() : counterpartOf(message);
-        FileTransferUI window = FileTransferUI.ownerOf(message.getTransferId());
-        if (window == null) {
-            window = FileTransferUI.windowFor(client, peer == null ? "未知用户" : peer);
-        }
-        window.setVisible(true);
-        window.handleFileMessage(message);
+        onEdt(() -> {
+            boolean incoming = message.getType() == MessageType.FILE_REQUEST;
+            String peer = incoming ? message.getSender() : counterpartOf(message);
+            FileTransferUI window = FileTransferUI.ownerOf(message.getTransferId());
+            if (window == null) {
+                window = FileTransferUI.windowFor(client, peer == null ? "未知用户" : peer);
+            }
+            window.setVisible(true);
+            window.handleFileMessage(message);
+        });
     }
 
     /**
@@ -530,16 +637,16 @@ public class ClientUI extends BaseUI implements ChatListener {
      * @param message 进度消息
      */
     private void routeProgress(FileMessage message) {
-        FileTransferUI window = FileTransferUI.ownerOf(message.getTransferId());
-        if (window != null) {
+        onEdt(() -> {
+            FileTransferUI window = FileTransferUI.ownerOf(message.getTransferId());
+            if (window == null) {
+                // 接收场景下进度窗口由请求消息提前注册；若未注册则创建与发送者同名的窗口
+                window = FileTransferUI.windowFor(client, message.getSender());
+                window.setVisible(true);
+                window.registerTransfer(message.getTransferId());
+            }
             window.handleFileMessage(message);
-            return;
-        }
-        // 接收场景下进度窗口由请求消息提前注册；若未注册则创建与发送者同名的窗口
-        FileTransferUI created = FileTransferUI.windowFor(client, message.getSender());
-        created.setVisible(true);
-        created.registerTransfer(message.getTransferId());
-        created.handleFileMessage(message);
+        });
     }
 
     /**
@@ -594,6 +701,14 @@ public class ClientUI extends BaseUI implements ChatListener {
     public void onConnectionChanged(boolean connected, String reason) {
         onEdt(() -> {
             statusLabel.setText(reason);
+            // 聊天面板不再单独监听客户端，连接状态由本窗口统一转发，
+            // 保证子窗口上的“连接已断开”提示与本窗口一致
+            for (PrivateChatUI window : privateWindows.values()) {
+                window.getPanel().onConnectionChanged(connected, reason);
+            }
+            if (groupWindow != null) {
+                groupWindow.getPanel().onConnectionChanged(connected, reason);
+            }
             if (!connected) {
                 // 断开是终态：先注销监听再关闭连接，否则 close() 会再次回调本方法，
                 // 用“已断开与服务器的连接”覆盖真实原因并弹出第二个对话框
@@ -639,6 +754,6 @@ public class ClientUI extends BaseUI implements ChatListener {
      * @return 用户名到用户对象的映射
      */
     public Map<String, User> getOnlineUsers() {
-        return onlineUsers;
+        return userTree.onlineUsers();
     }
 }

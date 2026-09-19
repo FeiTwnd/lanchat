@@ -86,9 +86,12 @@ public class GroupChatPanel extends BaseChatPanel {
         }
         if (message.getType() == MessageType.TEXT_GROUP && message instanceof TextMessage) {
             String sender = message.getSender();
-            boolean self = sender != null && sender.equals(client.getUsername());
-            appendMessage(self ? "我" : sender, ((TextMessage) message).getContent(),
-                    self ? COLOR_SELF : COLOR_OTHER);
+            if (sender != null && sender.equals(client.getUsername())) {
+                // 自己在发送时已经本地回显（见 doSend），而服务器会把群聊广播回发送者，
+                // 这里忽略自己的回显，否则同一条消息会显示两遍
+                return;
+            }
+            appendMessage(sender, ((TextMessage) message).getContent(), COLOR_OTHER);
             return;
         }
         String content = message instanceof SystemMessage

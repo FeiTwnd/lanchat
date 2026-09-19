@@ -1,5 +1,8 @@
 package com.chat.client.ui;
 
+import com.chat.client.ui.theme.SkinTitleBar;
+import com.chat.client.ui.theme.Theme;
+import com.chat.client.ui.theme.WindowResizer;
 import com.chat.common.Constants;
 
 import javax.swing.BorderFactory;
@@ -8,8 +11,6 @@ import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
-import javax.swing.UIManager;
-import javax.swing.UnsupportedLookAndFeelException;
 import javax.swing.border.Border;
 import java.awt.Color;
 import java.awt.Component;
@@ -38,10 +39,10 @@ public abstract class BaseUI extends JFrame {
     private static final long serialVersionUID = 20250110L;
 
     /** 界面统一字体，避免依赖系统默认字体导致中文显示异常 */
-    protected static final Font FONT_NORMAL = new Font("Microsoft YaHei", Font.PLAIN, 13);
+    protected static final Font FONT_NORMAL = Theme.fontBase();
 
     /** 标题字体 */
-    protected static final Font FONT_BOLD = new Font("Microsoft YaHei", Font.BOLD, 14);
+    protected static final Font FONT_BOLD = Theme.fontTitle();
 
     /** 聊天气泡中“本人”消息的颜色 */
     protected static final Color COLOR_SELF = new Color(0x1E88E5);
@@ -55,45 +56,64 @@ public abstract class BaseUI extends JFrame {
     /** 错误提示颜色 */
     protected static final Color COLOR_ERROR = new Color(0xC62828);
 
-    /** 全局外观是否已初始化 */
-    private static boolean lookAndFeelReady;
+    /** 内容承载面板：子类统一在它之上布局，而不是直接挂到窗口上 */
+    private final JPanel body = new JPanel(new java.awt.BorderLayout());
+
+    /** 自定义标题栏 */
+    private transient SkinTitleBar titleBar;
 
     /**
      * 构造窗口并完成通用初始化。
+     *
+     * <p>窗口采用无边框外观：由 {@link SkinTitleBar} 提供标题、拖动、最大化与关闭，
+     * 内容区通过 {@link #body()} 承载。这样做的代价是失去系统原生装饰，
+     * 因此关闭按钮必须分发标准窗口事件，保证各窗口既有的关闭逻辑不被绕过。</p>
      *
      * @param title 窗口标题
      */
     protected BaseUI(String title) {
         super(title);
-        initLookAndFeel();
+        Theme.installDefaults();
+        setUndecorated(true);
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        body.setBackground(Theme.BG);
+
+        JPanel root = new JPanel(new java.awt.BorderLayout());
+        root.setBackground(Theme.CARD);
+        root.setBorder(BorderFactory.createLineBorder(Theme.BORDER));
+        titleBar = new SkinTitleBar(this, title);
+        root.add(titleBar, java.awt.BorderLayout.NORTH);
+        root.add(body, java.awt.BorderLayout.CENTER);
+        setContentPane(root);
+
         setMinimumSize(new Dimension(480, 360));
-        applyFont(this);
+        applyFont(body);
+        WindowResizer.install(this);
         getRootPane().putClientProperty("window.title", title);
     }
 
     /**
-     * 初始化窗口外观。
+     * 获取内容承载面板。
      *
-     * <p>优先使用系统外观，使界面与操作系统一致；跨平台失败时回退 Swing 默认外观，
-     * 保证在任何 JDK 上都能显示。</p>
+     * <p>子类应使用 {@code body().setLayout(...)} 与 {@code body().add(...)} 组装界面。</p>
+     *
+     * @return 内容面板
      */
-    private static void initLookAndFeel() {
-        if (lookAndFeelReady) {
-            return;
+    protected JPanel body() {
+        return body;
+    }
+
+    /**
+     * 设置窗口标题，同时更新自定义标题栏文本。
+     *
+     * @param title 标题
+     */
+    @Override
+    public void setTitle(String title) {
+        super.setTitle(title);
+        if (titleBar != null) {
+            titleBar.setTitleText(title);
         }
-        try {
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            UIManager.put("OptionPane.messageFont", FONT_NORMAL);
-            UIManager.put("OptionPane.buttonFont", FONT_NORMAL);
-            UIManager.put("Table.font", FONT_NORMAL);
-            UIManager.put("TableHeader.font", FONT_BOLD);
-        } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
-                 | UnsupportedLookAndFeelException e) {
-            // 外观设置属于“锦上添花”，失败时使用默认外观即可，不应中断启动
-            System.err.println("系统外观设置失败，使用默认外观: " + e.getMessage());
-        }
-        lookAndFeelReady = true;
     }
 
     /**
@@ -108,6 +128,18 @@ public abstract class BaseUI extends JFrame {
                 applyFont(child);
             }
         }
+    }
+
+    /**
+     * 创建统一的白底卡片面板。
+     *
+     * @return 带内边距的卡片面板
+     */
+    protected JPanel card() {
+        JPanel panel = new JPanel(new java.awt.BorderLayout());
+        panel.setBackground(Theme.CARD);
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12));
+        return panel;
     }
 
     /**

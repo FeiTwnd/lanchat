@@ -34,8 +34,8 @@ public class GroupChatUI extends BaseUI {
     public GroupChatUI(ChatClient client, String nickname) {
         super(Constants.APP_NAME + " - 群聊大厅");
         this.panel = new GroupChatPanel(client);
-        setLayout(new BorderLayout());
-        add(panel, BorderLayout.CENTER);
+        body().setLayout(new BorderLayout());
+        body().add(panel, BorderLayout.CENTER);
         panel.appendLine("[系统] 已进入群聊大厅（当前用户: " + nickname + "），发言对所有在线用户可见",
                 COLOR_SYSTEM);
         setSize(700, 520);

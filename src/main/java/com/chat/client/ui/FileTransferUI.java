@@ -1,12 +1,13 @@
 package com.chat.client.ui;
 
 import com.chat.client.ChatClient;
+import com.chat.client.ui.theme.SkinButton;
+import com.chat.client.ui.theme.Theme;
 import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.MessageType;
 import com.chat.util.FileUtil;
 
-import javax.swing.JButton;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -111,32 +112,26 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 关闭并移除某对端的窗口（窗口注销时调用）。
-     *
-     * @param peer 对端用户名
-     */
-    public static void forget(String peer) {
-        WINDOWS.remove(peer);
-    }
-
-    /**
      * 组装界面组件。
      */
     private void initComponents() {
-        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 8));
+        top.setBackground(Theme.BG);
         top.add(new JLabel("接收方:"));
         top.add(receiverField);
-        JButton chooseButton = new JButton("选择文件");
+        SkinButton chooseButton = new SkinButton("选择文件", SkinButton.Kind.NORMAL);
         chooseButton.addActionListener(e -> chooseFile());
         top.add(chooseButton);
-        JButton sendButton = new JButton("发送");
+        SkinButton sendButton = new SkinButton("发送", SkinButton.Kind.PRIMARY);
         sendButton.addActionListener(e -> startSend());
         top.add(sendButton);
 
         JPanel center = new JPanel(new BorderLayout(4, 4));
+        center.setBackground(Theme.BG);
         center.add(fileLabel, BorderLayout.NORTH);
         JPanel progressPanel = new JPanel(new BorderLayout(4, 4));
-        progressBar.setStringPainted(true);
+        progressPanel.setBackground(Theme.BG);
+        Theme.styleProgressBar(progressBar);
         progressPanel.add(progressBar, BorderLayout.CENTER);
         progressPanel.add(progressLabel, BorderLayout.SOUTH);
         center.add(progressPanel, BorderLayout.CENTER);
@@ -144,10 +139,10 @@ public class FileTransferUI extends BaseUI {
         logArea.setEditable(false);
         logArea.setFont(FONT_NORMAL);
 
-        setLayout(new BorderLayout(4, 4));
-        add(top, BorderLayout.NORTH);
-        add(center, BorderLayout.CENTER);
-        add(new JScrollPane(logArea), BorderLayout.SOUTH);
+        body().setLayout(new BorderLayout(4, 4));
+        body().add(top, BorderLayout.NORTH);
+        body().add(center, BorderLayout.CENTER);
+        body().add(new JScrollPane(logArea), BorderLayout.SOUTH);
         appendLog("文件传输窗口已就绪。接收到的文件默认保存到 " + client.getReceiveDir());
         appendLog("单个文件大小上限为 " + Constants.MAX_FILE_SIZE_TEXT + "，传输过程显示实时进度");
     }

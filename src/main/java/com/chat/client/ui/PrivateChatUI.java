@@ -35,8 +35,8 @@ public class PrivateChatUI extends BaseUI {
     public PrivateChatUI(ChatClient client, String peer) {
         super("与 " + peer + " 私聊 - " + Constants.APP_NAME);
         this.panel = new PrivateChatPanel(client, peer);
-        setLayout(new BorderLayout());
-        add(panel, BorderLayout.CENTER);
+        body().setLayout(new BorderLayout());
+        body().add(panel, BorderLayout.CENTER);
         panel.appendLine("[系统] 这是与 " + peer + " 的私聊窗口，消息仅双方可见", COLOR_SYSTEM);
         setSize(620, 480);
         centerOnScreen();
