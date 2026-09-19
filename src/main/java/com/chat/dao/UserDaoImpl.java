@@ -87,10 +87,14 @@ public class UserDaoImpl implements UserDao {
             int lineNo = 0;
             while ((line = reader.readLine()) != null) {
                 lineNo++;
+                // 头部注释与空行不是数据行，静默跳过，否则正常文件也会被误报为损坏
+                if (line.trim().isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
                 User user = parseLine(line);
                 if (user != null) {
                     cache.put(user.getUsername(), user);
-                } else if (!line.trim().isEmpty()) {
+                } else {
                     LOGGER.warning("用户文件第 " + lineNo + " 行格式非法，已跳过");
                 }
             }
@@ -103,11 +107,13 @@ public class UserDaoImpl implements UserDao {
     /**
      * 解析一行用户记录。
      *
+     * <p>调用方已过滤空行与注释行，此处只负责字段切分与合法性判断。</p>
+     *
      * @param line 制表符分隔的文本行
      * @return 用户对象；字段不足或格式非法时返回 null
      */
     private User parseLine(String line) {
-        if (line == null || line.trim().isEmpty() || line.startsWith("#")) {
+        if (line == null) {
             return null;
         }
         String[] parts = line.split(Constants.FIELD_SEPARATOR, -1);
