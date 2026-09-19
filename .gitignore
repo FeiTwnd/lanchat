@@ -1,0 +1,7 @@
+build/
+data/users.txt
+data/history/
+data/export/
+data/received/
+*.class
+*.log
