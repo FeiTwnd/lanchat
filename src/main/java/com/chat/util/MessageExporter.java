@@ -1,6 +1,7 @@
 package com.chat.util;
 
 import com.chat.common.Constants;
+import com.chat.common.FileMessage;
 import com.chat.common.Message;
 import com.chat.common.SystemMessage;
 import com.chat.common.TextMessage;
@@ -51,10 +52,30 @@ public final class MessageExporter {
             text = ((TextMessage) message).getContent();
         } else if (message instanceof SystemMessage) {
             text = ((SystemMessage) message).getContent();
+        } else if (message instanceof FileMessage) {
+            text = fileText((FileMessage) message);
         } else {
             text = message.getSummary();
         }
         return text == null ? "" : text.replace('\n', ' ').replace('\r', ' ');
+    }
+
+    /**
+     * 拼接文件消息的展示文本：文件名与大小之后补上传输结果描述。
+     *
+     * <p>{@link FileMessage#getSummary()} 只有“文件名 (大小)”，
+     * 不带结果的话，历史记录里被拒绝或传输失败的文件会与成功传输的看起来一模一样。</p>
+     *
+     * @param file 文件消息
+     * @return 形如 {@code 报告.pdf (1.20 MB) - 文件传输完成} 的文本
+     */
+    private static String fileText(FileMessage file) {
+        String summary = file.getSummary();
+        String detail = file.getMessage();
+        if (detail == null || detail.trim().isEmpty()) {
+            return summary;
+        }
+        return summary + " - " + detail.trim();
     }
 
     /**

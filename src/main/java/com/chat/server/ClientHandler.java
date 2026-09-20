@@ -293,6 +293,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             case FILE_RESULT:
                 TRANSFER_REGISTRY.remove(fileMessage.getTransferId());
                 relay(fileMessage, receiver);
+                saveTransferRecord(fileMessage);
                 break;
             case FILE_CHUNK:
             case FILE_END:
@@ -344,6 +345,43 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         relay(original, receiver);
         server.notify(ServerObserver.EventType.FILE_TRANSFER,
                 username + " 请求向 " + receiver + " 发送 " + request.getSummary());
+    }
+
+    /**
+     * 把一次已结束的文件传输写入聊天记录。
+     *
+     * <p>为什么记在"结果"而不是"请求"上：请求发出时还不知道对方接不接受，
+     * 记下来会让被拒绝的文件在历史记录里显示成一条正常记录；结果消息是整个传输
+     * 唯一的终态，成功、失败、被拒绝各只会出现一次，一次传输正好落一行。</p>
+     *
+     * <p>方向必须反过来写：结果与拒绝消息都由**文件接收方**发出，此刻连接的
+     * {@code username} 是接收方，消息里的 receiver 才是文件的发送方；
+     * 照抄字段会让历史记录的方向整个颠倒。</p>
+     *
+     * <p>入库的只有文件名、大小、校验和与结果描述，文件内容本身不落库——
+     * 服务器只中继数据块，不承担文件存储。</p>
+     *
+     * @param result 结果消息（{@code FILE_RESULT} 或 {@code FILE_REJECT}）
+     */
+    private void saveTransferRecord(FileMessage result) {
+        String fileSender = result.getReceiver();
+        if (fileSender == null || fileSender.isEmpty()) {
+            return;
+        }
+        FileMessage record = ChatMessageFactory.file(fileSender, username, MessageType.FILE_RESULT);
+        record.setFileName(result.getFileName());
+        record.setFileSize(result.getFileSize());
+        record.setSha256(result.getSha256());
+        // 成功回执的正文是"文件已保存到 <接收方机器上的路径>"，写进双方共有的聊天记录没有意义；
+        // 失败与被拒绝的原因则对使用者有用，保留下来
+        String detail = result.getMessage() == null ? "" : result.getMessage().trim();
+        if (result.isAccepted()) {
+            record.setMessage("文件传输完成");
+        } else {
+            record.setMessage(detail.isEmpty() ? "文件传输未完成" : "文件传输未完成：" + detail);
+        }
+        // 保存失败的提示给到发起回执的连接（即文件接收方），日志里带上文件发送方以便对照
+        saveOrWarn(record, fileSender);
     }
 
     /**

@@ -452,7 +452,11 @@ public class ChatClient {
     private void finishFailedTransfer(FileMessage source, String reason) {
         receivingSessions.remove(source.getTransferId());
         fileService.cancelReceive(source.getTransferId());
-        notifyMessage(resultMessage(source, source.getSender(), false, "文件接收失败: " + reason));
+        FileMessage failure = resultMessage(source, source.getSender(), false, "文件接收失败: " + reason);
+        notifyMessage(failure);
+        // 回执同样要发给发送方：与结束帧失败的处理保持一致。
+        // 只通知本端界面会让发送方一直停在"传输中"，服务器也无从记录这次失败的传输
+        send(failure);
     }
 
     /**
