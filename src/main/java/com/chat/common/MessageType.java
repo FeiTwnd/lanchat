@@ -56,6 +56,10 @@ public enum MessageType {
     HISTORY_REQUEST("历史记录查询"),
     /** 历史消息查询结果 */
     HISTORY_RESULT("历史记录结果"),
+    /** 聊天记录导出请求（服务端查库并渲染，回传文本由客户端落盘） */
+    EXPORT_REQUEST("聊天记录导出请求"),
+    /** 聊天记录导出结果 */
+    EXPORT_RESULT("聊天记录导出结果"),
     /** 心跳包 */
     HEARTBEAT("心跳包"),
     /** 心跳应答 */

@@ -8,15 +8,11 @@ import com.chat.common.MessageType;
 import com.chat.common.SystemMessage;
 import com.chat.common.TextMessage;
 import com.chat.exception.ChatException;
-import com.chat.util.DateUtil;
-import com.chat.util.FileUtil;
 import com.chat.util.MessageCipher;
+import com.chat.util.MessageExporter;
 
-import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -410,7 +406,9 @@ public class JdbcMessageDao implements MessageDao {
     /**
      * 把消息列表导出为文本文件。
      *
-     * <p>导出结果仍然是磁盘文本文件：数据库负责"存"，导出是给使用者留存与打印用的副本。</p>
+     * <p>导出结果仍然是磁盘文本文件：数据库负责"存"，导出是给使用者留存与打印用的副本。
+     * 文本的渲染与落盘统一委托给 {@link MessageExporter}——客户端的导出走
+     * "服务端查库渲染、客户端存文件"的链路，两处必须产出同一种文本，因此格式只保留一份实现。</p>
      *
      * @param messages 待导出消息
      * @param target   目标文件
@@ -420,33 +418,7 @@ public class JdbcMessageDao implements MessageDao {
      */
     @Override
     public int exportTo(List<Message> messages, File target) throws IOException, ChatException {
-        if (target == null) {
-            throw new ChatException("导出目标文件不能为空");
-        }
-        if (messages == null) {
-            throw new ChatException("导出内容不能为空");
-        }
-        FileUtil.ensureDir(target.getParent());
-        int count = 0;
-        try (BufferedWriter writer = Files.newBufferedWriter(target.toPath(), Constants.CHARSET,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-            writer.write("聊天记录导出文件，生成时间: " + DateUtil.now());
-            writer.newLine();
-            writer.write("共 " + messages.size() + " 条记录");
-            writer.newLine();
-            writer.write("========================================");
-            writer.newLine();
-            for (Message message : messages) {
-                writer.write("[" + DateUtil.format(message.getTimestamp()) + "] "
-                        + message.getType().getDescription() + " "
-                        + message.getSender() + " -> "
-                        + (message.isBroadcast() ? Constants.BROADCAST_TAG : message.getReceiver())
-                        + " : " + message.getSummary());
-                writer.newLine();
-                count++;
-            }
-        }
-        return count;
+        return MessageExporter.write(messages, target);
     }
 
     /**

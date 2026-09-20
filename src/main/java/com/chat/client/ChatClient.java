@@ -660,6 +660,19 @@ public class ChatClient {
     }
 
     /**
+     * 请求导出本人的全部聊天记录。
+     *
+     * <p>导出内容由服务端查库并渲染后回传，客户端只负责把文本写到自己的磁盘上。
+     * 客户端刻意不持有数据库连接：换一台机器登录，同样能导出自己的记录。</p>
+     *
+     * @return 发送成功返回 true
+     */
+    public boolean requestExport() {
+        return send(ChatMessageFactory.control(username, Constants.SYSTEM_SENDER,
+                MessageType.EXPORT_REQUEST));
+    }
+
+    /**
      * 发送退出登录请求。
      *
      * <p>刻意使用同步发送：退出后马上就要关闭连接，若走异步发送队列，

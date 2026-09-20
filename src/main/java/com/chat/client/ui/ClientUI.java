@@ -7,14 +7,14 @@ import com.chat.client.ui.theme.Glyphs;
 import com.chat.client.ui.theme.SkinButton;
 import com.chat.client.ui.theme.Theme;
 import com.chat.common.Constants;
+import com.chat.common.Config;
 import com.chat.common.FileMessage;
 import com.chat.common.Message;
 import com.chat.common.MessageType;
-import com.chat.common.Result;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
 import com.chat.common.UserListCodec;
-import com.chat.service.MessageService;
+import com.chat.util.MessageExporter;
 
 import javax.swing.BorderFactory;
 import javax.swing.JLabel;
@@ -32,6 +32,7 @@ import java.awt.GridLayout;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
+import java.io.IOException;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
@@ -50,7 +51,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>{@code TEXT_GROUP} / {@code SYSTEM} / {@code ERROR} -> 投递群聊窗口；</li>
  *   <li>{@code TEXT_PRIVATE} -> 按对方用户名投递私聊窗口（窗口不存在则自动创建）；</li>
  *   <li>文件类消息 -> 投递文件传输窗口；</li>
- *   <li>{@code HISTORY_RESULT} -> 弹出历史记录对话框。</li>
+ *   <li>{@code HISTORY_RESULT} -> 弹出历史记录对话框；</li>
+ *   <li>{@code EXPORT_RESULT} -> 把服务端渲染好的导出文本写入本机文件。</li>
  * </ul>
  *
  * <p>线程安全：所有网络回调都可能发生在非界面线程，因此本类所有界面更新
@@ -102,9 +104,6 @@ public class ClientUI extends BaseUI implements ChatListener {
 
     /** 头部头像：用户列表到达后按真实角色重绘（管理员带橙色描边） */
     private final JLabel headerAvatar = new JLabel();
-
-    /** 消息业务服务，仅用于本地导出聊天记录 */
-    private final transient MessageService messageService = new MessageService();
 
     /**
      * 构造客户端主窗口。
@@ -508,13 +507,47 @@ public class ClientUI extends BaseUI implements ChatListener {
 
     /**
      * 导出当前用户的聊天记录。
+     *
+     * <p>导出不能让客户端自己去连数据库：数据库只对服务端开放，客户端直连的结果是
+     * 与数据库同机的那台能导出、其余机器查出 0 条。因此这里只发一个请求，
+     * 由服务端查库渲染后回传，本机负责落盘（见 {@link #saveExportResult(TextMessage)}）。</p>
      */
     private void exportHistory() {
-        Result<File> result = messageService.exportHistory(client.getUsername());
-        if (result.isSuccess()) {
-            showInfo("导出成功: " + result.getData().getAbsolutePath());
+        if (client.requestExport()) {
+            statusLabel.setText("正在导出聊天记录……");
         } else {
-            showError("导出失败: " + result.getMessage());
+            showError("导出请求发送失败，请检查与服务端的连接");
+        }
+    }
+
+    /**
+     * 把服务端回传的导出内容写入本机文件。
+     *
+     * <p>文件固定落在本机的 {@code data/export} 目录：导出是给使用者留存副本用的，
+     * 必须写在发起导出的那台机器上，而不是服务器上。</p>
+     *
+     * @param message 导出结果消息
+     */
+    private void saveExportResult(TextMessage message) {
+        String[] lines = message.getContent().split("\n", -1);
+        String[] head = lines.length > 0 ? lines[0].split("\\|", -1) : new String[]{"0", "无数据"};
+        if (head.length < 2 || !"1".equals(head[0])) {
+            statusLabel.setText("导出失败");
+            showError("导出失败: " + (head.length > 1 ? head[1] : "未知原因"));
+            return;
+        }
+        // 首行是"1|条数"，其后是服务端渲染好的正文；用换行拼回去即可保持原样的行结构
+        String text = String.join("\n", java.util.Arrays.copyOfRange(lines, 1, lines.length));
+        File target = new File(Config.exportDir(), "chat-" + client.getUsername() + "-"
+                + System.currentTimeMillis() + ".txt");
+        try {
+            MessageExporter.writeText(text, target);
+            statusLabel.setText("聊天记录已导出，共 " + head[1] + " 条");
+            showInfo("导出成功: " + target.getAbsolutePath());
+        } catch (IOException e) {
+            LOGGER.log(java.util.logging.Level.WARNING, "导出文件写入失败", e);
+            statusLabel.setText("导出失败");
+            showError("导出失败: " + e.getMessage());
         }
     }
 
@@ -633,6 +666,9 @@ public class ClientUI extends BaseUI implements ChatListener {
                 break;
             case HISTORY_RESULT:
                 onEdt(() -> showHistoryResult((TextMessage) message));
+                break;
+            case EXPORT_RESULT:
+                onEdt(() -> saveExportResult((TextMessage) message));
                 break;
             default:
                 onEdt(() -> statusLabel.setText("收到消息: " + message.getType().getDescription()));

@@ -150,24 +150,11 @@ public class MessageService {
     }
 
     /**
-     * 导出指定用户的聊天记录到 {@code data/export} 目录。
-     *
-     * @param username 用户名，null 表示导出全部
-     * @return 成功时携带导出文件路径
-     */
-    public Result<File> exportHistory(String username) {
-        Result<List<Message>> queryResult = queryHistory(username, (LocalDateTime) null, null);
-        if (!queryResult.isSuccess()) {
-            return Result.fail(queryResult.getMessage());
-        }
-        String owner = (username == null || username.trim().isEmpty()) ? "all" : username.trim();
-        String fileName = "chat-" + owner + "-" + System.currentTimeMillis() + ".txt";
-        File target = new File(com.chat.common.Config.exportDir(), fileName);
-        return exportMessages(queryResult.getData(), target);
-    }
-
-    /**
      * 把消息列表导出到指定文件。
+     *
+     * <p>只负责"渲染 + 落盘"，不含"查哪条记录"的决策：界面上的导出由服务端查库、
+     * 客户端落盘（见 {@code ClientHandler.handleExportRequest}），本方法则是服务端本地
+     * 导出文件这一能力的入口。</p>
      *
      * @param messages 待导出消息
      * @param target   目标文件

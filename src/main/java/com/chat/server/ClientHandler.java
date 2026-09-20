@@ -14,6 +14,7 @@ import com.chat.common.UserListCodec;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
 import com.chat.util.DateUtil;
+import com.chat.util.MessageExporter;
 
 import java.io.Closeable;
 import java.io.EOFException;
@@ -392,6 +393,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             case HISTORY_REQUEST:
                 handleHistoryRequest((TextMessage) message);
                 break;
+            case EXPORT_REQUEST:
+                handleExportRequest();
+                break;
             default:
                 LOGGER.fine(() -> "收到未处理的控制消息: " + message.getType());
                 break;
@@ -627,12 +631,41 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                         .append(DateUtil.format(item.getTimestamp())).append('|')
                         .append(item.getSender()).append('|')
                         .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver()).append('|')
-                        .append(historyText(item));
+                        .append(MessageExporter.contentOf(item));
             }
         }
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
                 builder.toString(), MessageType.TEXT_PRIVATE);
         response.setType(MessageType.HISTORY_RESULT);
+        send(response);
+    }
+
+    /**
+     * 处理聊天记录导出请求。
+     *
+     * <p>正文为空：导出对象恒为发起者本人，不需要参数。之所以由服务端查库、客户端落盘，
+     * 是因为客户端没有数据库连接——若让客户端直连数据库，就只有与数据库同机的那台客户端
+     * 能导出成功，其余机器要么报连接失败，要么在本地空库里查出 0 条。</p>
+     *
+     * <p>响应正文格式：成功为 {@code 1|条数} 换行后接渲染好的导出文本；失败为 {@code 0|原因}。</p>
+     */
+    private void handleExportRequest() {
+        if (!requireLogin()) {
+            return;
+        }
+        Result<List<Message>> result = server.getMessageService()
+                .queryHistory(username, (LocalDateTime) null, null);
+        String content;
+        if (!result.isSuccess()) {
+            content = "0|" + result.getMessage();
+        } else if (result.getData().isEmpty()) {
+            content = "0|没有可导出的记录";
+        } else {
+            content = "1|" + result.getData().size() + "\n" + MessageExporter.render(result.getData());
+        }
+        TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
+                content, MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.EXPORT_RESULT);
         send(response);
     }
 
@@ -661,28 +694,6 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             }
         }
         return filtered;
-    }
-
-    /**
-     * 取历史记录条目用于展示的正文。
-     *
-     * <p>刻意不用 {@code getSummary()}：文本消息的摘要会截断到 30 个字符，
-     * 用它补拉聊天窗口会让历史记录缺一半内容。</p>
-     *
-     * @param item 消息
-     * @return 可安全放入"竖线分隔的单行文本"的正文
-     */
-    private String historyText(Message item) {
-        String text;
-        if (item instanceof TextMessage) {
-            text = ((TextMessage) item).getContent();
-        } else if (item instanceof SystemMessage) {
-            text = ((SystemMessage) item).getContent();
-        } else {
-            text = item.getSummary();
-        }
-        // 换行会破坏"一行一条记录"的格式，统一压成空格
-        return text == null ? "" : text.replace('\n', ' ').replace('\r', ' ');
     }
 
     /**
