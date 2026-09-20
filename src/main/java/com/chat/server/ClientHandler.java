@@ -361,6 +361,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * <p>入库的只有文件名、大小、校验和与结果描述，文件内容本身不落库——
      * 服务器只中继数据块，不承担文件存储。</p>
      *
+     * <p>同时写两张表：{@code chat_message} 供聊天历史与导出展示，
+     * {@code chat_file_log} 供按结果统计与追溯（见 {@code FileLogService}）。</p>
+     *
      * @param result 结果消息（{@code FILE_RESULT} 或 {@code FILE_REJECT}）
      */
     private void saveTransferRecord(FileMessage result) {
@@ -382,6 +385,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         }
         // 保存失败的提示给到发起回执的连接（即文件接收方），日志里带上文件发送方以便对照
         saveOrWarn(record, fileSender);
+        // 审计表另记一行：传输编号与 SUCCESS/REJECTED/FAILED 结果在这里保留，便于统计与追溯
+        server.getFileLogService().record(result, fileSender, username);
     }
 
     /**

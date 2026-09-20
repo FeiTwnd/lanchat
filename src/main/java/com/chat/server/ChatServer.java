@@ -2,6 +2,7 @@ package com.chat.server;
 
 import com.chat.common.Config;
 import com.chat.common.Constants;
+import com.chat.service.FileLogService;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
 
@@ -89,6 +90,9 @@ public final class ChatServer {
     /** 消息业务服务（延迟初始化，原因同上） */
     private MessageService messageService;
 
+    /** 文件传输日志服务（延迟初始化，原因同上） */
+    private FileLogService fileLogService;
+
     /** 已建立的连接处理器，用于停止服务器时统一关闭 */
     private final List<ClientHandler> handlers = new ArrayList<>();
 
@@ -135,6 +139,11 @@ public final class ChatServer {
                 notify(ServerObserver.EventType.ERROR, "数据库不可用，服务器拒绝启动: " + reason);
                 rollback();
                 return false;
+            }
+            if (!fileLogService.isStorageAvailable()) {
+                // 传输日志属于旁路审计：不可用时给出提示即可，不应阻止服务器启动
+                LOGGER.warning("文件传输日志表不可用，文件传输将不会写入 chat_file_log: "
+                        + fileLogService.storageFailureReason());
             }
             userService.initAdminIfAbsent();
             serverSocket = new ServerSocket(port);
@@ -435,6 +444,7 @@ public final class ChatServer {
     private void initServices() {
         this.userService = new UserService();
         this.messageService = new MessageService();
+        this.fileLogService = new FileLogService();
     }
 
     /**
@@ -453,6 +463,15 @@ public final class ChatServer {
      */
     public MessageService getMessageService() {
         return messageService;
+    }
+
+    /**
+     * 获取文件传输日志服务。
+     *
+     * @return 文件传输日志服务；服务器尚未启动时返回 null
+     */
+    public FileLogService getFileLogService() {
+        return fileLogService;
     }
 
     /**

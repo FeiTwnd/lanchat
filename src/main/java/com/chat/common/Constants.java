@@ -97,9 +97,16 @@ public final class Constants {
     /** 数据库驱动类名默认值 */
     public static final String DB_DRIVER = "com.mysql.cj.jdbc.Driver";
 
-    /** 数据库连接地址默认值：本机 lanchat 库 */
+    /**
+     * 数据库连接地址默认值：本机 lanchat 库。
+     *
+     * <p>时区必须填数据库所在机器的真实时区（此处为东八区）。驱动会把 JDBC 时间在
+     * “连接时区”与 JVM 时区之间换算：若连接时区填 UTC 而数据库实际在东八区，
+     * 程序里写入的 09:21 会被换算成 01:21 存进 DATETIME 列——程序自己读写一致（显示正常），
+     * 但用 mysql 命令行或图形工具直接看库时会整整差 8 小时。</p>
+     */
     public static final String DB_URL = "jdbc:mysql://localhost:3306/lanchat?useSSL=false"
-            + "&serverTimezone=UTC&allowPublicKeyRetrieval=true&characterEncoding=utf8";
+            + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8";
 
     /** 数据库用户名默认值 */
     public static final String DB_USER = "root";
