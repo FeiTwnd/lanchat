@@ -437,7 +437,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 handleHistoryRequest((TextMessage) message);
                 break;
             case EXPORT_REQUEST:
-                handleExportRequest();
+                handleExportRequest(socket);
                 break;
             default:
                 LOGGER.fine(() -> "收到未处理的控制消息: " + message.getType());
@@ -686,13 +686,16 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /**
      * 处理聊天记录导出请求。
      *
-     * <p>正文为空：导出对象恒为发起者本人，不需要参数。之所以由服务端查库、客户端落盘，
-     * 是因为客户端没有数据库连接——若让客户端直连数据库，就只有与数据库同机的那台客户端
-     * 能导出成功，其余机器要么报连接失败，要么在本地空库里查出 0 条。</p>
+     * <p>正文为空：导出对象恒为发起者本人，不需要参数。导出必须由服务端查库、客户端落盘——
+     * 客户端没有数据库连接，只有与数据库同机的那台能直连，其余机器要么报连接失败，
+     * 要么在本机空库里查出 0 条（本项目正是踩过这个坑才改成现在这条链路）。</p>
      *
-     * <p>响应正文格式：成功为 {@code 1|条数} 换行后接渲染好的导出文本；失败为 {@code 0|原因}。</p>
+     * <p>响应正文格式：成功为 {@code 1|条数} 换行后接渲染好的导出文本；失败为 {@code 0|原因}。
+     * 导出文本里的"数据来源"取连接的本端地址，即客户端实际连上的那台服务器。</p>
+     *
+     * @param socket 发起导出的连接，用于取本端地址作为数据来源
      */
-    private void handleExportRequest() {
+    private void handleExportRequest(Socket socket) {
         if (!requireLogin()) {
             return;
         }
@@ -704,12 +707,26 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         } else if (result.getData().isEmpty()) {
             content = "0|没有可导出的记录";
         } else {
-            content = "1|" + result.getData().size() + "\n" + MessageExporter.render(result.getData());
+            content = "1|" + result.getData().size() + "\n"
+                    + MessageExporter.render(result.getData(), localAddressOf(socket));
         }
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
                 content, MessageType.TEXT_PRIVATE);
         response.setType(MessageType.EXPORT_RESULT);
         send(response);
+    }
+
+    /**
+     * 取连接的本端地址，形如 {@code 192.168.1.5:9527}。
+     *
+     * @param socket 连接
+     * @return 地址描述；无法获取时返回空字符串
+     */
+    private String localAddressOf(Socket socket) {
+        if (socket == null || socket.getLocalAddress() == null) {
+            return "";
+        }
+        return socket.getLocalAddress().getHostAddress() + ":" + socket.getLocalPort();
     }
 
     /**

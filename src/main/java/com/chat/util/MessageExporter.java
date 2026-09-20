@@ -85,9 +85,27 @@ public final class MessageExporter {
      * @return 导出文本，每行以 {@code \n} 结尾
      */
     public static String render(List<Message> messages) {
+        return render(messages, null);
+    }
+
+    /**
+     * 把消息列表渲染为完整的导出文本，并标注数据来源。
+     *
+     * <p>标注来源是为了自证清白：客户端只负责把服务端回传的文本落盘，
+     * 出现"导出内容不对"时，文件里写着是哪台服务器给的数据，一眼就能看出是不是连错了服务器
+     * （本项目确实出现过"客户端连着自己的服务端、导出的是本机数据"的排查事故）。</p>
+     *
+     * @param messages 待导出消息
+     * @param source   数据来源描述（形如 {@code 192.168.1.5:9527}），为空时不写该行
+     * @return 导出文本，每行以 {@code \n} 结尾
+     */
+    public static String render(List<Message> messages, String source) {
         StringBuilder builder = new StringBuilder();
         builder.append("聊天记录导出文件，生成时间: ").append(DateUtil.now()).append('\n');
         builder.append("共 ").append(messages.size()).append(" 条记录").append('\n');
+        if (source != null && !source.trim().isEmpty()) {
+            builder.append("数据来源: 服务器 ").append(source.trim()).append('\n');
+        }
         builder.append(SEPARATOR).append('\n');
         for (Message message : messages) {
             builder.append('[').append(DateUtil.format(message.getTimestamp())).append("] ")

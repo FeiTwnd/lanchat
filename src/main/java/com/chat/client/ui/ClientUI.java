@@ -24,6 +24,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -70,8 +71,14 @@ public class ClientUI extends BaseUI implements ChatListener {
     private static final java.util.logging.Logger LOGGER =
             java.util.logging.Logger.getLogger(Constants.LOGGER_NAME + ".ClientUI");
 
+    /** 等待服务端返回导出内容的超时时间（毫秒） */
+    private static final int EXPORT_TIMEOUT_MS = 10000;
+
     /** 客户端实例 */
     private final transient ChatClient client;
+
+    /** 导出等待计时器：收到导出结果或超时后停止，避免重复提示 */
+    private transient Timer exportTimer;
 
     /** 私聊窗口表：对方用户名 -> 窗口 */
     private final transient Map<String, PrivateChatUI> privateWindows = new ConcurrentHashMap<>();
@@ -508,16 +515,29 @@ public class ClientUI extends BaseUI implements ChatListener {
     /**
      * 导出当前用户的聊天记录。
      *
-     * <p>导出不能让客户端自己去连数据库：数据库只对服务端开放，客户端直连的结果是
-     * 与数据库同机的那台能导出、其余机器查出 0 条。因此这里只发一个请求，
-     * 由服务端查库渲染后回传，本机负责落盘（见 {@link #saveExportResult(TextMessage)}）。</p>
+     * <p>导出完全走服务端：客户端只发一个请求，由服务端查库渲染后回传，本机负责落盘
+     * （见 {@link #saveExportResult(TextMessage)}）。客户端没有任何数据库代码，
+     * 因此换一台机器登录同样能导出自己的记录。</p>
      */
     private void exportHistory() {
-        if (client.requestExport()) {
-            statusLabel.setText("正在导出聊天记录……");
-        } else {
+        if (!client.requestExport()) {
             showError("导出请求发送失败，请检查与服务端的连接");
+            return;
         }
+        statusLabel.setText("正在导出聊天记录……");
+        // 旧版服务端不认识导出请求，会当作未处理的控制消息直接丢掉；
+        // 有超时提示才能让"点了没反应"变成一句能看懂的原因
+        if (exportTimer != null) {
+            exportTimer.stop();
+        }
+        exportTimer = new Timer(EXPORT_TIMEOUT_MS, event -> {
+            exportTimer.stop();
+            statusLabel.setText("导出超时");
+            showError("导出超时：服务端在 " + (EXPORT_TIMEOUT_MS / 1000)
+                    + " 秒内没有响应。请确认服务端已重启到最新版本（旧版服务端不支持导出请求）。");
+        });
+        exportTimer.setRepeats(false);
+        exportTimer.start();
     }
 
     /**
@@ -529,6 +549,9 @@ public class ClientUI extends BaseUI implements ChatListener {
      * @param message 导出结果消息
      */
     private void saveExportResult(TextMessage message) {
+        if (exportTimer != null) {
+            exportTimer.stop();
+        }
         String[] lines = message.getContent().split("\n", -1);
         String[] head = lines.length > 0 ? lines[0].split("\\|", -1) : new String[]{"0", "无数据"};
         if (head.length < 2 || !"1".equals(head[0])) {
