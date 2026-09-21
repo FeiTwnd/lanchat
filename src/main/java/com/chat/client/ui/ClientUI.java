@@ -26,6 +26,7 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.Timer;
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -51,9 +52,17 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>{@code USER_LIST} -> 刷新在线用户表格；</li>
  *   <li>{@code TEXT_GROUP} / {@code SYSTEM} / {@code ERROR} -> 投递群聊窗口；</li>
  *   <li>{@code TEXT_PRIVATE} -> 按对方用户名投递私聊窗口（窗口不存在则自动创建）；</li>
+ *   <li>{@code OFFLINE_MESSAGE} -> 同样投递私聊窗口，并标注为离线补投，外观与普通私聊一致；</li>
  *   <li>文件类消息 -> 投递文件传输窗口；</li>
  *   <li>{@code HISTORY_RESULT} -> 弹出历史记录对话框；</li>
  *   <li>{@code EXPORT_RESULT} -> 把服务端渲染好的导出文本写入本机文件。</li>
+ * </ul>
+ *
+ * <p>可靠性相关展示：</p>
+ * <ul>
+ *   <li>底部状态栏展示连接状态（连接中/已连接/重连中第 n 次/已恢复）与消息发送状态；</li>
+ *   <li>断线后进入自动重连，界面只提示一次断线，重连进度在状态栏持续更新；</li>
+ *   <li>"对方离线""发送失败"这类需要用户关注的状态会同时写一行到对应聊天窗口。</li>
  * </ul>
  *
  * <p>线程安全：所有网络回调都可能发生在非界面线程，因此本类所有界面更新
@@ -62,7 +71,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * @author Java 课程设计
  * @version 1.0
  */
-public class ClientUI extends BaseUI implements ChatListener {
+public class ClientUI extends BaseUI implements ChatListener, ChatClient.MessageStateListener {
 
     /** 序列化版本号 */
     private static final long serialVersionUID = 20250119L;
@@ -73,6 +82,14 @@ public class ClientUI extends BaseUI implements ChatListener {
 
     /** 等待服务端返回导出内容的超时时间（毫秒） */
     private static final int EXPORT_TIMEOUT_MS = 10000;
+
+    /**
+     * 发送状态提示行的颜色。
+     *
+     * <p>与聊天面板中的系统通知色保持一致，但面板里的常量是受保护成员，
+     * 主窗口无法直接引用；此处独立定义可避免为了取色而把面板的继承关系暴露给主窗口。</p>
+     */
+    private static final Color STATUS_COLOR = new Color(0x9E9E9E);
 
     /** 客户端实例 */
     private final transient ChatClient client;
@@ -100,11 +117,22 @@ public class ClientUI extends BaseUI implements ChatListener {
      */
     private transient volatile boolean loggingOut;
 
+    /**
+     * 各聊天面板是否已经收到过本次断线的提示。
+     *
+     * <p>重连会按退避序列反复上报"正在重连（第 n 次）"，若每次都转发给聊天面板，
+     * 断线时间稍长就会把聊天记录刷满状态行；本标志保证一次断线只在面板里留下一行提示。</p>
+     */
+    private transient boolean panelsNotifiedDisconnect;
+
     /** 在线用户树（按角色分组、头像区分在线离线、支持关键字过滤） */
     private final OnlineUserTree userTree = new OnlineUserTree();
 
     /** 状态栏 */
     private final JLabel statusLabel = new JLabel("已连接");
+
+    /** 状态栏右侧的服务器与用户信息，连接状态变化时同步刷新 */
+    private final JLabel serverHint = new JLabel();
 
     /** 头部信息行：角色与在线人数 */
     private final JLabel headerMeta = new JLabel();
@@ -122,6 +150,7 @@ public class ClientUI extends BaseUI implements ChatListener {
         this.client = client;
         initComponents();
         client.addListener(this);
+        client.addMessageStateListener(this);
         client.requestUserList();
         setSize(880, 600);
         centerOnScreen();
@@ -316,10 +345,21 @@ public class ClientUI extends BaseUI implements ChatListener {
         panel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 10));
         statusLabel.setForeground(Theme.TEXT);
         panel.add(statusLabel, BorderLayout.WEST);
-        JLabel hint = new JLabel("服务器: 已连接    用户: " + client.getUsername() + "    ");
-        hint.setForeground(Theme.TEXT_WEAK);
-        panel.add(hint, BorderLayout.EAST);
+        serverHint.setForeground(Theme.TEXT_WEAK);
+        serverHint.setText(serverHintText(true));
+        panel.add(serverHint, BorderLayout.EAST);
         return panel;
+    }
+
+    /**
+     * 生成状态栏右侧的服务器与用户信息文本。
+     *
+     * @param connected 当前是否已连接
+     * @return 提示文本
+     */
+    private String serverHintText(boolean connected) {
+        return "服务器: " + (connected ? "已连接" : "未连接")
+                + "    用户: " + client.getUsername() + "    ";
     }
 
     /**
@@ -659,6 +699,9 @@ public class ClientUI extends BaseUI implements ChatListener {
             case TEXT_PRIVATE:
                 handlePrivateMessage((TextMessage) message);
                 break;
+            case OFFLINE_MESSAGE:
+                handleOfflineMessage((TextMessage) message);
+                break;
             case TEXT_GROUP:
                 // 群聊窗口未打开时消息先入面板并计未读，不主动弹出窗口打扰使用者
                 onEdt(() -> groupPanel().onMessage(message));
@@ -858,24 +901,57 @@ public class ClientUI extends BaseUI implements ChatListener {
     }
 
     /**
+     * 处理服务端补投的离线消息。
+     *
+     * <p>离线消息与普通私聊消息的唯一区别是来源：它是接收方离线期间积压、上线后补发的。
+     * 之所以不直接复用 {@link #handlePrivateMessage(TextMessage)}：那条路径会按普通消息渲染，
+     * 使用者无法分辨"刚刚发来的"和"离线期间积压的"；这里在发送者后面加一个离线标记，
+     * 渲染颜色与普通私聊保持一致。网络层已负责回确认与去重，本方法只做展示。</p>
+     *
+     * @param message 离线消息
+     */
+    private void handleOfflineMessage(TextMessage message) {
+        String sender = message.getSender();
+        if (sender == null || sender.isEmpty()) {
+            return;
+        }
+        String content = message.getContent() == null ? "" : message.getContent();
+        onEdt(() -> openPrivateWindow(sender).getPanel()
+                .appendMessage(sender + "（离线消息）", content, STATUS_COLOR));
+    }
+
+    /**
      * 处理连接状态变化。
+     *
+     * <p>重连标记必须在网络线程上同步读取：本方法回调后要切到事件分发线程执行，
+     * 而重连可能在这段间隙内已经结束，届时再读 {@code isReconnecting()} 会得到 false，
+     * 界面就会把"刚刚重连成功"误判成"彻底断开"而退出程序。</p>
      *
      * @param connected 是否连接
      * @param reason    原因
      */
     @Override
     public void onConnectionChanged(boolean connected, String reason) {
+        boolean reconnecting = client.isReconnecting();
         onEdt(() -> {
             statusLabel.setText(reason);
-            // 聊天面板不再单独监听客户端，连接状态由本窗口统一转发，
-            // 保证子窗口上的“连接已断开”提示与本窗口一致
-            for (PrivateChatUI window : privateWindows.values()) {
-                window.getPanel().onConnectionChanged(connected, reason);
+            serverHint.setText(serverHintText(connected));
+            if (connected) {
+                panelsNotifiedDisconnect = false;
             }
-            if (groupWindow != null) {
-                groupWindow.getPanel().onConnectionChanged(connected, reason);
+            // 断线期间只在首次通知时向聊天面板写入一行，避免每次重连尝试都刷屏
+            if (connected || !panelsNotifiedDisconnect || !reconnecting) {
+                for (PrivateChatUI window : privateWindows.values()) {
+                    window.getPanel().onConnectionChanged(connected, reason);
+                }
+                if (groupWindow != null) {
+                    groupWindow.getPanel().onConnectionChanged(connected, reason);
+                }
+                if (!connected) {
+                    panelsNotifiedDisconnect = true;
+                }
             }
-            if (!connected && !loggingOut) {
+            if (!connected && !loggingOut && !reconnecting) {
                 // 断开是终态：先注销监听再关闭连接，否则 close() 会再次回调本方法，
                 // 用“已断开与服务器的连接”覆盖真实原因并弹出第二个对话框
                 client.removeListener(this);
@@ -888,11 +964,65 @@ public class ClientUI extends BaseUI implements ChatListener {
     }
 
     /**
+     * 处理消息发送状态变化。
+     *
+     * <p>状态一律写入底部状态栏；"对方离线""发送失败"这类需要使用者关注的状态，
+     * 额外在对应私聊窗口留下一条系统提示行。发送中与已送达不写行，
+     * 否则每发一条消息都会多出一行状态，聊天记录会被状态信息挤满。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param state     新状态
+     * @param detail    补充说明
+     */
+    @Override
+    public void onMessageState(String messageId, ChatClient.SendState state, String detail) {
+        // 与连接状态同理：对端用户名要在网络线程上取，切到事件分发线程后记录可能已被清理
+        String peer = client.getMessageReceiver(messageId);
+        String text = sendStateText(state, detail);
+        onEdt(() -> {
+            statusLabel.setText(text);
+            boolean noteworthy = state == ChatClient.SendState.OFFLINE
+                    || state == ChatClient.SendState.FAILED;
+            if (!noteworthy || peer == null) {
+                return;
+            }
+            PrivateChatUI window = privateWindows.get(peer);
+            if (window != null) {
+                window.getPanel().appendLine("[系统] " + text, STATUS_COLOR);
+            }
+        });
+    }
+
+    /**
+     * 把发送状态转换为界面提示文本。
+     *
+     * @param state  发送状态
+     * @param detail 服务端给出的补充说明，可为空
+     * @return 中文提示文本
+     */
+    private String sendStateText(ChatClient.SendState state, String detail) {
+        String extra = detail == null ? "" : detail.trim();
+        switch (state) {
+            case SENDING:
+                return extra.isEmpty() ? "消息发送中……" : "消息发送中……（" + extra + "）";
+            case DELIVERED:
+                return "消息已送达";
+            case OFFLINE:
+                return extra.isEmpty() ? "对方离线，消息将在其上线后送达" : "对方离线：" + extra;
+            case FAILED:
+                return extra.isEmpty() ? "消息发送失败" : "消息发送失败：" + extra;
+            default:
+                return state.getDescription();
+        }
+    }
+
+    /**
      * 窗口关闭时断开连接并退出程序。
      */
     @Override
     public void dispose() {
         client.removeListener(this);
+        client.removeMessageStateListener(this);
         for (PrivateChatUI window : privateWindows.values()) {
             window.dispose();
         }

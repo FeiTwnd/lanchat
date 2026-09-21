@@ -170,6 +170,17 @@ public final class Constants {
     /** 日志统一前缀，便于在控制台与文件中检索 */
     public static final String LOGGER_NAME = "com.chat";
 
+    /**
+     * 已撤回消息的占位正文。
+     *
+     * <p>撤回后正文不再回传给任何一方（包括发送者本人）：数据库里的原文无法被"部分删除"，
+     * 只能在读出时用占位文本替代，这样历史查询、关键字检索与导出都不会再泄露已撤回内容。</p>
+     */
+    public static final String RECALLED_PLACEHOLDER = "[该消息已撤回]";
+
+    /** 允许撤回的时间窗口（分钟）：与主流即时通讯软件一致，超过则只能保留记录 */
+    public static final int RECALL_WINDOW_MINUTES = 2;
+
     // ==================== 界面文本 ====================
 
     /** 程序名称 */

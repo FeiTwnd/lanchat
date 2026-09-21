@@ -13,6 +13,9 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -51,6 +54,12 @@ public final class ChatServer {
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".ChatServer");
 
+    /** 会话令牌有效期（毫秒）：30 分钟，每次使用后从当次使用时刻重新计算 */
+    private static final long SESSION_TOKEN_TTL_MILLIS = 30 * 60 * 1000L;
+
+    /** 会话令牌记录内的字段分隔符；用户名本身受字符集约束，不会包含该字符，因此可安全拼接 */
+    private static final String TOKEN_SEPARATOR = "|";
+
     /** 单例持有者：利用类加载机制保证线程安全的懒加载 */
     private static final class Holder {
         /** 唯一实例 */
@@ -77,6 +86,17 @@ public final class ChatServer {
 
     /** 在线用户管理器 */
     private final UserManager userManager = new UserManager();
+
+    /**
+     * 会话令牌表：令牌 -> “用户名|过期时刻毫秒”。
+     *
+     * <p>值刻意用竖线拼接的字符串承载，而不是新建一个令牌模型类：这个二元组只在签发、
+     * 校验、续期、清理四处出现，为一个瞬时结构引入类型反而增加跳转成本。</p>
+     *
+     * <p>线程安全：连接线程会并发地签发与校验令牌，因此使用 {@link ConcurrentHashMap}；
+     * 令牌只存在于内存中，服务器重启即全部失效。</p>
+     */
+    private final Map<String, String> sessionTokens = new ConcurrentHashMap<>();
 
     /**
      * 用户业务服务（延迟初始化）。
@@ -212,6 +232,8 @@ public final class ChatServer {
         }
         handlers.clear();
         userManager.clear();
+        // 会话令牌等同于短期登录凭据，服务器停止后必须一并作废，不能留到下次启动继续可用
+        sessionTokens.clear();
         shutdownPool(connectionPool);
         connectionPool = null;
         shutdownPool(heartbeatScanner);
@@ -444,6 +466,98 @@ public final class ChatServer {
      */
     public UserManager getUserManager() {
         return userManager;
+    }
+
+    /**
+     * 签发会话令牌，供客户端断线重连时恢复登录态。
+     *
+     * <p>为什么令牌不落库：它的唯一用途是让客户端不必在内存中长期保留明文口令，
+     * 属于短期凭据；写入数据库只会把一次性凭据变成可长期利用的资产。
+     * 服务器重启后令牌全部失效，客户端退回重新登录即可。</p>
+     *
+     * @param username 用户名
+     * @return 新签发的令牌（UUID）；用户名为空时返回空字符串
+     */
+    public String issueSessionToken(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return "";
+        }
+        // 借签发时机顺带清理过期项：令牌数量与在线用户同量级，不值得为此单独养一个调度线程
+        purgeExpiredSessionTokens();
+        String token = UUID.randomUUID().toString();
+        String name = username.trim();
+        sessionTokens.put(token, name + TOKEN_SEPARATOR + (System.currentTimeMillis() + SESSION_TOKEN_TTL_MILLIS));
+        LOGGER.info(() -> "已签发会话令牌: " + name);
+        return token;
+    }
+
+    /**
+     * 校验会话令牌并顺延其有效期。
+     *
+     * <p>续期采用“写回原键”的方式：客户端始终持有同一个令牌，无需在每次重连后更换，
+     * 也就不会出现“新令牌尚未送达、旧令牌已失效”的空窗。</p>
+     *
+     * @param token 客户端提交的令牌
+     * @return 令牌有效时返回对应用户名；令牌为空、不存在、已过期或记录损坏时返回 null
+     */
+    public String touchSessionToken(String token) {
+        if (token == null || token.trim().isEmpty()) {
+            return null;
+        }
+        String key = token.trim();
+        String value = sessionTokens.get(key);
+        if (value == null) {
+            return null;
+        }
+        int separator = value.lastIndexOf(TOKEN_SEPARATOR);
+        long expiresAt;
+        if (separator <= 0) {
+            sessionTokens.remove(key);
+            LOGGER.warning("会话令牌记录格式非法，已丢弃");
+            return null;
+        }
+        try {
+            expiresAt = Long.parseLong(value.substring(separator + 1));
+        } catch (NumberFormatException e) {
+            sessionTokens.remove(key);
+            LOGGER.warning("会话令牌记录格式非法，已丢弃");
+            return null;
+        }
+        if (System.currentTimeMillis() > expiresAt) {
+            // 过期项立即移除：留在表中既占用内存，也会让后续校验重复走一遍解析
+            sessionTokens.remove(key);
+            return null;
+        }
+        String name = value.substring(0, separator);
+        sessionTokens.put(key, name + TOKEN_SEPARATOR + (System.currentTimeMillis() + SESSION_TOKEN_TTL_MILLIS));
+        return name;
+    }
+
+    /**
+     * 清理已过期的会话令牌。
+     *
+     * @return 本次清理掉的令牌条数
+     */
+    public int purgeExpiredSessionTokens() {
+        long now = System.currentTimeMillis();
+        int before = sessionTokens.size();
+        sessionTokens.values().removeIf(value -> {
+            int separator = value.lastIndexOf(TOKEN_SEPARATOR);
+            if (separator <= 0) {
+                return true;
+            }
+            try {
+                return Long.parseLong(value.substring(separator + 1)) < now;
+            } catch (NumberFormatException e) {
+                return true;
+            }
+        });
+        int removed = before - sessionTokens.size();
+        if (removed > 0) {
+            int count = removed;
+            LOGGER.info(() -> "已清理过期会话令牌 " + count + " 条");
+        }
+        return removed;
     }
 
     /**

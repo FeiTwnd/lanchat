@@ -134,21 +134,52 @@ public class MessageService {
     }
 
     /**
-     * 按关键字检索全部聊天记录。
+     * 在本人可见范围内按关键字检索聊天记录。
      *
-     * @param keyword 关键字
-     * @return 成功时携带命中列表
+     * <p>为什么必须带请求者参数：底层 DAO 的检索是"全库逐行解密后匹配"，若把全库结果
+     * 直接回给客户端，任何登录用户都能搜到别人的私聊内容——这与历史查询曾经存在的越权问题同源。
+     * 因此服务层只暴露这个"带可见范围"的版本，全库检索能力留在 DAO 内部，
+     * 不给网络层留下误用的入口。</p>
+     *
+     * @param requester 请求者用户名（由服务端从登录态取得，不信任客户端提交值）
+     * @param keyword   关键字
+     * @return 成功时携带命中列表（仅本人可见部分）
      */
-    public Result<List<Message>> search(String keyword) {
+    public Result<List<Message>> search(String requester, String keyword) {
         if (keyword == null || keyword.trim().isEmpty()) {
             return Result.fail("关键字不能为空");
         }
+        if (requester == null || requester.trim().isEmpty()) {
+            return Result.fail("未登录，无法检索聊天记录");
+        }
+        String self = requester.trim();
         try {
-            List<Message> messages = messageDao.search(keyword.trim());
-            return Result.ok("命中 " + messages.size() + " 条记录", messages);
+            List<Message> visible = new ArrayList<>();
+            for (Message message : messageDao.search(keyword.trim())) {
+                if (visibleTo(message, self)) {
+                    visible.add(message);
+                }
+            }
+            return Result.ok("命中 " + visible.size() + " 条记录", visible);
         } catch (ChatException e) {
             return Result.fail("检索失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 判断一条记录是否对该用户可见。
+     *
+     * <p>可见范围与历史查询、导出保持同一口径：本人发送的、发给本人的，以及广播（接收者为空的群聊与系统通知）。
+     * 三者之外的一律不可见，避免"检索"成为绕过历史查询权限的旁路。</p>
+     *
+     * @param message  被判断的消息
+     * @param username 使用者用户名
+     * @return 可见返回 true
+     */
+    private static boolean visibleTo(Message message, String username) {
+        return username.equals(message.getSender())
+                || username.equals(message.getReceiver())
+                || message.isBroadcast();
     }
 
     /**
@@ -225,6 +256,73 @@ public class MessageService {
             return 0;
         }
         return messageDao.markDelivered(messageIds);
+    }
+
+    /**
+     * 按稳定消息标识查询单条消息。
+     *
+     * <p>撤回成功后需要通知会话对端，而"对端是谁"只能从原始记录里得到，
+     * 因此网络层需要这个查询入口；放在服务层是为了让网络层继续只依赖服务接口，
+     * 不必直接持有 DAO。</p>
+     *
+     * @param messageId 稳定消息标识；为 null 或空白时返回 null
+     * @return 命中返回消息对象，未命中返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    public Message findByMessageId(String messageId) throws ChatException {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return null;
+        }
+        return messageDao.findByMessageId(messageId.trim());
+    }
+
+    /**
+     * 撤回一条由本人发送且未超时的消息。
+     *
+     * <p>业务规则集中在这里而不是散落到网络层，原因是三条规则互相关联，分开实现容易出现
+     * "只校验了身份却忘了时限"这类漏洞：</p>
+     * <ol>
+     *   <li>消息必须存在（按稳定标识查询）；</li>
+     *   <li>只有发送者本人可以撤回，禁止撤回他人消息；</li>
+     *   <li>距发送时间不超过 {@link Constants#RECALL_WINDOW_MINUTES} 分钟；</li>
+     *   <li>已经撤回过的消息按幂等处理，返回成功而不是报错（客户端可能重发撤回请求）。</li>
+     * </ol>
+     *
+     * @param messageId 稳定消息标识
+     * @param requester 发起撤回的用户名（由服务端从登录态取得，不信任客户端提交值）
+     * @return 成功时返回 ok；失败时携带中文原因
+     * @throws ChatException 读取或更新失败时抛出
+     */
+    public Result<Boolean> recall(String messageId, String requester) throws ChatException {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return Result.fail("缺少消息标识，无法撤回");
+        }
+        if (requester == null || requester.trim().isEmpty()) {
+            return Result.fail("未登录，无法撤回");
+        }
+        Message message = messageDao.findByMessageId(messageId.trim());
+        if (message == null) {
+            return Result.fail("消息不存在或已过期，无法撤回");
+        }
+        if (!requester.trim().equals(message.getSender())) {
+            // 明确提示"只能撤回自己的消息"，而不是含糊的"操作失败"，便于使用者理解规则
+            return Result.fail("只能撤回自己发送的消息");
+        }
+        if (Constants.RECALLED_PLACEHOLDER.equals(message.getSummary())) {
+            return Result.ok("该消息已撤回", Boolean.TRUE);
+        }
+        LocalDateTime sentAt = message.getTimestamp();
+        if (sentAt != null
+                && java.time.Duration.between(sentAt, LocalDateTime.now()).toMinutes()
+                >= Constants.RECALL_WINDOW_MINUTES) {
+            return Result.fail("超过撤回时限（" + Constants.RECALL_WINDOW_MINUTES + " 分钟），无法撤回");
+        }
+        boolean updated = messageDao.markRecalled(messageId.trim(), requester.trim());
+        if (!updated) {
+            // 更新 0 行有两种可能：并发下已被撤回，或消息标识与发送者不匹配
+            LOGGER.info(() -> "撤回未更新任何行（可能已被并发撤回）: " + messageId);
+        }
+        return Result.ok("已撤回", Boolean.TRUE);
     }
 
     /**

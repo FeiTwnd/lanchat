@@ -81,6 +81,31 @@ public interface MessageDao extends BaseDao<Message, Long> {
     int markDelivered(java.util.Collection<String> messageIds) throws ChatException;
 
     /**
+     * 按稳定消息标识查询单条消息。
+     *
+     * <p>供撤回等需要"先确认消息归属与时间"的业务使用：只有拿到原始记录，
+     * 才能把"消息不存在""不是本人发送""超过撤回时限"区分开并给出准确提示。</p>
+     *
+     * @param messageId 稳定消息标识；为 null 或空白时返回 null
+     * @return 命中返回消息对象，未命中返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    Message findByMessageId(String messageId) throws ChatException;
+
+    /**
+     * 把指定消息标记为已撤回。
+     *
+     * <p>身份条件（发送者）必须一并写进 SQL：撤回只允许发送者本人发起，
+     * 若先查后改，两次操作之间插入的其它请求可能造成越权撤回。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param sender    发起撤回的用户名
+     * @return 实际更新的行数；已撤回或不属于该发送者时返回 0
+     * @throws ChatException 更新失败时抛出
+     */
+    boolean markRecalled(String messageId, String sender) throws ChatException;
+
+    /**
      * 键集分页查询聊天记录，供界面向上翻页（加载更早的历史消息）。
      *
      * <p>语义为“取不晚于 beforeId 的最近 limit 条”，返回结果按时间升序，便于界面直接追加。</p>

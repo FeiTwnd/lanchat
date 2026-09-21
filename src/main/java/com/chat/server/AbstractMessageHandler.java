@@ -87,6 +87,10 @@ public abstract class AbstractMessageHandler implements MessageHandler {
             case MSG_ACK:
             case OFFLINE_MESSAGE:
             case SESSION_RESUME:
+            case MSG_RECALL:
+            case SEARCH_REQUEST:
+            case SEARCH_RESULT:
+            case READ_RECEIPT:
             case SYSTEM:
             case ERROR:
                 handleSystemMessage(message, socket);

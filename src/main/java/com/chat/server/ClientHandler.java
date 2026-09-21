@@ -11,6 +11,7 @@ import com.chat.common.SystemMessage;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
 import com.chat.common.UserListCodec;
+import com.chat.exception.ChatException;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
 import com.chat.util.DateUtil;
@@ -65,6 +66,34 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
 
     /** 传输编号长度上限：正常编号是 36 位 UUID，留出余量即可，过长的键只会白白占用内存 */
     private static final int MAX_TRANSFER_ID_LENGTH = 64;
+
+    /** 消息确认状态：接收方在线且已转发成功 */
+    private static final String ACK_DELIVERED = "DELIVERED";
+
+    /** 消息确认状态：接收方离线，消息已入库等待补投 */
+    private static final String ACK_OFFLINE = "OFFLINE";
+
+    /** 消息确认状态：该稳定消息标识此前已处理过，本次为幂等重发 */
+    private static final String ACK_DUPLICATE = "DUPLICATE";
+
+    /** 消息确认状态：既未送达也未入库 */
+    private static final String ACK_FAILED = "FAILED";
+
+    /**
+     * 单次登录补投的离线消息条数上限。
+     *
+     * <p>取 200 与数据访问层的单次查询上限保持一致：补投是登录路径上的同步动作，
+     * 积压过多时宁可分批（下次登录继续），也不能让登录本身长时间卡住。</p>
+     */
+    private static final int OFFLINE_PUSH_LIMIT = 200;
+
+    /**
+     * 本连接已下发、等待客户端确认的离线消息标识。
+     *
+     * <p>只有确实由本连接补投出去的消息才允许被标记为已送达：否则任何登录用户都能拿别人的
+     * 标识把他人积压的离线消息“确认”掉，造成静默丢消息。</p>
+     */
+    private final Set<String> pendingOfflineAcks = ConcurrentHashMap.newKeySet();
 
     /** 服务器全局传输登记表：传输编号 -> 本次传输的收发双方与阶段状态，用于校验文件消息的合法性 */
     private static final Map<String, TransferSession> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
@@ -246,21 +275,93 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "私聊消息缺少接收者"));
             return;
         }
-        boolean delivered = server.getUserManager().sendTo(receiver, text);
-        if (!delivered) {
-            // 接收者不在线时明确回执失败，而不是静默丢弃；
-            // 同时在服务器日志留痕：这条消息没有入库，事后排查"对方没收到"时可直接对照
-            LOGGER.warning(() -> "私聊消息未送达（接收者不在线）: " + username + " -> " + receiver);
-            send(ChatMessageFactory.error(username, "用户 " + receiver + " 不在线，消息未送达"));
+        // 判重必须排在投递与落库之前：网络重发会把同一条消息再次送到这里，
+        // 命中后既不能再转发（接收方会重复看到一条），也不能再落库（message_id 唯一索引会插入失败）
+        String messageId = text.ensureMessageId();
+        try {
+            if (server.getMessageService().existsByMessageId(messageId)) {
+                LOGGER.info(() -> "私聊消息重复，按幂等回执处理: " + username + " -> " + receiver
+                        + " - " + messageId);
+                sendAck(text, ACK_DUPLICATE, "该消息此前已处理过");
+                return;
+            }
+        } catch (ChatException e) {
+            // 判重失败意味着本次无法保证幂等，落库同样可能失败；此时给不出确定结论，
+            // 只能回 FAILED 交由客户端重试，而不是硬着头皮转发造成重复
+            LOGGER.warning(() -> "私聊消息判重失败: " + username + " -> " + receiver
+                    + " - " + e.getMessage());
+            sendAck(text, ACK_FAILED, "服务器无法校验消息标识：" + e.getMessage());
             return;
         }
-        saveOrWarn(text, receiver);
+        boolean delivered = server.getUserManager().sendTo(receiver, text);
+        // 入库不再以“送达成功”为前提：接收方离线时这条记录正是补投的唯一依据
+        Result<Boolean> saved = server.getMessageService().saveMessage(text);
+        if (!saved.isSuccess()) {
+            // 送达与入库必须同时成立才算成功。只送达而未入库时，接收方事后补拉历史会看不到这条，
+            // 因此按契约回 FAILED（即便消息实际已被转发出去），由客户端重试
+            LOGGER.warning(() -> "私聊消息入库失败: " + username + " -> " + receiver
+                    + "，实际已送达=" + delivered + " - " + saved.getMessage());
+            sendAck(text, ACK_FAILED, "服务器未能写入聊天记录：" + saved.getMessage());
+            return;
+        }
+        if (!delivered) {
+            LOGGER.info(() -> "私聊消息接收方离线，已入库待补投: " + username + " -> " + receiver);
+            sendAck(text, ACK_OFFLINE, "接收方不在线，消息将在其上线后补投");
+            // 保留这条可见错误提示：旧版客户端不认识 MSG_ACK，只能靠它得知消息没有立即送达；
+            // 文案同步改为“已存入离线队列”，否则会与 OFFLINE 回执的语义自相矛盾
+            send(ChatMessageFactory.error(username,
+                    "用户 " + receiver + " 不在线，消息已存入离线队列，将在其上线后送达"));
+            return;
+        }
+        markDeliveredQuietly(messageId, receiver);
+        sendAck(text, ACK_DELIVERED, "");
         // 回执给发送方，使其界面确认消息已发出
         TextMessage echo = ChatMessageFactory.text(username, username, text.getSummary(),
                 MessageType.TEXT_PRIVATE);
         send(echo);
         server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
                 username + " -> " + receiver + ": " + text.getSummary());
+    }
+
+    /**
+     * 向发送方回执一条消息的处理结果。
+     *
+     * <p>正文格式为 {@code messageId|state|detail}，三字段固定：客户端据此把本地待确认项
+     * 映射为“已送达 / 对方离线 / 发送失败”，并停止重试。</p>
+     *
+     * @param target 原消息，用于取稳定消息标识
+     * @param state  状态值，取 {@link #ACK_DELIVERED}、{@link #ACK_OFFLINE}、
+     *               {@link #ACK_DUPLICATE} 或 {@link #ACK_FAILED}
+     * @param detail 中文补充说明，可为空
+     */
+    private void sendAck(Message target, String state, String detail) {
+        String messageId = target.ensureMessageId();
+        String body = messageId + '|' + state + '|' + (detail == null ? "" : detail);
+        TextMessage ack = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username, body,
+                MessageType.TEXT_PRIVATE);
+        ack.setType(MessageType.MSG_ACK);
+        // 回执自身也分配一个独立标识，避免与原消息共用同一个 messageId 造成“两条报文同标识”
+        ack.ensureMessageId();
+        send(ack);
+    }
+
+    /**
+     * 把在线投递成功的消息标记为已送达。
+     *
+     * <p>标记失败只记录 warning，不改变已回给发送方的 DELIVERED 结论：消息确实已经到达接收方，
+     * 若因此改判失败，客户端重试后接收方会重复收到。代价是这条记录仍处于未投递状态，
+     * 接收方下次登录会被再补投一次，由客户端的标识去重兜底。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param receiver  接收方用户名，仅用于日志
+     */
+    private void markDeliveredQuietly(String messageId, String receiver) {
+        try {
+            server.getMessageService().markDelivered(List.of(messageId));
+        } catch (ChatException e) {
+            LOGGER.warning(() -> "消息已送达但送达标记更新失败: " + receiver + " - " + messageId
+                    + " - " + e.getMessage());
+        }
     }
 
     /**
@@ -617,6 +718,16 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 send(ChatMessageFactory.control(Constants.SYSTEM_SENDER, username,
                         MessageType.HEARTBEAT_ACK));
                 break;
+            case MSG_ACK:
+                handleDeliveryAck(message);
+                break;
+            case SESSION_RESUME:
+                if (message instanceof TextMessage text) {
+                    handleSessionResume(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
+                break;
             case USER_LIST_REQUEST:
                 sendUserList();
                 break;
@@ -703,6 +814,169 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         this.username = user.getUsername();
         sendLoginResult(true, "登录成功，欢迎 " + user.getNickname(), user);
         onUserOnline(user.getUsername(), socket);
+        // 令牌先于离线补投下发：补投条数可能较多，先给令牌可避免客户端在这段时间里无法断线重连
+        sendSessionResumeResult(server.issueSessionToken(user.getUsername()));
+        pushOfflineMessages();
+    }
+
+    /**
+     * 补投当前用户积压的离线私聊消息。
+     *
+     * <p>为什么要“补投 + 客户端逐条确认”而不是直接标记已送达：TCP 写入成功只代表数据交到了
+     * 对端操作系统的缓冲区，客户端进程崩溃时消息仍会丢失。逐条确认后，未确认的记录保持
+     * 未投递状态，下次登录重新补投，配合客户端按标识去重即实现“至少一次投递”。</p>
+     *
+     * <p>补投失败不得影响登录本身：无论查库还是发送出错都只记录 warning，
+     * 用户照常进入聊天界面，剩余记录留待下次登录再试。</p>
+     */
+    private void pushOfflineMessages() {
+        if (username == null) {
+            return;
+        }
+        List<Message> pending;
+        try {
+            pending = server.getMessageService().findUndelivered(username, OFFLINE_PUSH_LIMIT);
+        } catch (ChatException e) {
+            LOGGER.warning(() -> "离线消息查询失败，本次跳过补投: " + username + " - " + e.getMessage());
+            return;
+        }
+        int pushed = 0;
+        for (Message item : pending) {
+            // 只补投私聊文本：文件传输结果同样以 delivered=0 落库，但它承载的是文件名与校验和，
+            // 按离线文本重发只会凭空多出一条无意义的聊天记录
+            if (!(item instanceof TextMessage) || item.getType() != MessageType.TEXT_PRIVATE) {
+                continue;
+            }
+            String messageId = item.getMessageId();
+            if (messageId == null || messageId.trim().isEmpty()) {
+                // 没有稳定标识就无法匹配客户端的确认回执，跳过以免每次登录都重复补投同一条
+                continue;
+            }
+            // 复用从库里读出的对象、只改类型：正文、发送者、接收者、标识与时间戳因此与原消息完全一致
+            item.setType(MessageType.OFFLINE_MESSAGE);
+            if (!send(item)) {
+                LOGGER.warning(() -> "离线消息补投中断，剩余记录将在下次登录重试: " + username);
+                return;
+            }
+            pendingOfflineAcks.add(messageId);
+            pushed++;
+        }
+        if (pushed > 0) {
+            int count = pushed;
+            LOGGER.info(() -> "已补投离线消息 " + count + " 条: " + username);
+        }
+    }
+
+    /**
+     * 处理客户端回执的消息确认（当前仅离线补投需要落库）。
+     *
+     * <p>正文格式：{@code messageId|state|detail}。只有本连接确实补投出去的消息才允许标记为
+     * 已送达，否则任何登录用户都能拿别人的标识把他人积压的离线消息确认掉，造成静默丢消息。</p>
+     *
+     * @param message 客户端回执
+     */
+    private void handleDeliveryAck(Message message) {
+        if (username == null) {
+            LOGGER.warning("未登录连接发来消息回执，已忽略");
+            return;
+        }
+        if (!(message instanceof TextMessage text)) {
+            rejectTextRequirement(message);
+            return;
+        }
+        String[] parts = ChatMessageFactory.splitFields(text.getContent());
+        if (parts == null || parts.length < 2) {
+            LOGGER.warning(() -> "消息回执格式错误，已忽略: " + username);
+            return;
+        }
+        String messageId = parts[0].trim();
+        String state = parts[1].trim();
+        if (!ACK_DELIVERED.equals(state)) {
+            // 服务端回给发送方的 DELIVERED/OFFLINE 回执由客户端处理，不会回流到这里；
+            // 其余状态与补投落库无关，记录后忽略即可
+            LOGGER.fine(() -> "收到非送达确认的消息回执，已忽略: " + username + " - " + state);
+            return;
+        }
+        if (!pendingOfflineAcks.remove(messageId)) {
+            LOGGER.warning(() -> "消息回执没有对应的离线补投记录，已忽略: " + username + " - " + messageId);
+            return;
+        }
+        try {
+            int updated = server.getMessageService().markDelivered(List.of(messageId));
+            LOGGER.info(() -> "离线消息送达已确认 " + updated + " 条: " + username);
+        } catch (ChatException e) {
+            // 放回待确认集合：客户端重发回执时再试一次；标记始终失败也不会丢消息，
+            // 因为记录仍是未投递状态，下次登录会重新补投
+            pendingOfflineAcks.add(messageId);
+            LOGGER.warning(() -> "离线消息送达标记失败: " + username + " - " + messageId
+                    + " - " + e.getMessage());
+        }
+    }
+
+    /**
+     * 处理会话恢复请求：用令牌换取登录态，不需要口令。
+     *
+     * <p>为什么不校验口令：客户端在内存中长期保留明文口令只为断线重连，风险远高于一次性令牌；
+     * 令牌由服务端内存表签发，有效期 30 分钟且每次使用后顺延。</p>
+     *
+     * <p>令牌无效时回 {@code EXPIRED|<中文原因>} 并关闭连接：客户端据此停止重连并提示重新登录，
+     * 若只是静默断开，客户端会陷入无意义的指数退避重试。</p>
+     *
+     * @param message 携带令牌的文本消息
+     */
+    private void handleSessionResume(TextMessage message) {
+        if (username != null) {
+            send(ChatMessageFactory.error(username, "当前连接已登录，无需恢复会话"));
+            return;
+        }
+        String token = message.getContent() == null ? "" : message.getContent().trim();
+        String name = server.touchSessionToken(token);
+        if (name == null) {
+            LOGGER.warning(() -> "会话令牌无效或已过期，拒绝恢复: " + getRemoteAddress());
+            sendSessionResumeResult("EXPIRED|会话令牌无效或已过期，请重新登录");
+            close();
+            return;
+        }
+        Result<User> found = server.getUserService().findByUsername(name);
+        if (!found.isSuccess()) {
+            LOGGER.warning(() -> "会话恢复失败，用户已不存在: " + name + " - " + found.getMessage());
+            sendSessionResumeResult("EXPIRED|用户不存在或已被删除，请重新登录");
+            close();
+            return;
+        }
+        // 必须先清掉同一用户名的旧连接：重连时旧连接往往只是心跳失联而未被服务端判定超时，
+        // 若直接注册，在线表里会同时存在两条会话，后续消息可能被投给那条已经死掉的连接
+        ClientHandler previous = server.getUserManager().get(name);
+        if (previous != null && previous != this) {
+            previous.close();
+        }
+        User user = found.getData();
+        if (!server.getUserManager().register(user, this)) {
+            LOGGER.warning(() -> "会话恢复时注册失败: " + name);
+            sendSessionResumeResult("EXPIRED|该账号已在其它位置登录，请重新登录");
+            close();
+            return;
+        }
+        this.username = name;
+        sendSessionResumeResult("OK");
+        LOGGER.info(() -> "会话已恢复: " + name);
+        onUserOnline(name, socket);
+        pushOfflineMessages();
+    }
+
+    /**
+     * 下发会话恢复相关的回执。
+     *
+     * <p>成功时正文为 {@code OK}，失败时正文为 {@code EXPIRED|<中文原因>}；
+     * 同一类型承载两种结果，客户端只按正文前缀分流。</p>
+     *
+     * @param content 回执正文
+     */
+    private void sendSessionResumeResult(String content) {
+        TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER,
+                username == null ? "" : username, content, MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.SESSION_RESUME);
+        send(response);
     }
 
     /**

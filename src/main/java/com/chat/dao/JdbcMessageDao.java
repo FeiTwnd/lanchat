@@ -60,9 +60,9 @@ public class JdbcMessageDao implements MessageDao {
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".JdbcMessageDao");
 
-    /** 查询语句中使用的列清单，避免 SELECT * 带来的列顺序耦合；delivered/read_flag/recalled 仅作查询条件，不映射到模型 */
+    /** 查询语句中使用的列清单，避免 SELECT * 带来的列顺序耦合；delivered/read_flag 仅作查询条件，不映射到模型 */
     private static final String COLUMNS =
-            "id, message_id, msg_type, sender, receiver, content, file_name, file_size, sha256, create_time";
+            "id, message_id, msg_type, sender, receiver, content, file_name, file_size, sha256, recalled, create_time";
 
     /** 分页与补投的默认条数：调用方未指定或传入非法 limit 时使用 */
     private static final int DEFAULT_LIMIT = 50;
@@ -465,6 +465,57 @@ public class JdbcMessageDao implements MessageDao {
     }
 
     /**
+     * 按稳定消息标识查询单条消息。
+     *
+     * <p>撤回需要先确认"这条消息是否存在、是谁发的、什么时候发的"，
+     * 因此必须先按标识取回原始记录再判断；只靠 UPDATE 的 WHERE 条件无法区分
+     * "消息不存在"与"不是本人发的"这两种失败原因，也就给不出准确提示。</p>
+     *
+     * @param messageId 稳定消息标识；为 null 或空白时返回 null
+     * @return 命中返回消息对象，未命中返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    @Override
+    public Message findByMessageId(String messageId) throws ChatException {
+        requireAvailable();
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return null;
+        }
+        String sql = "SELECT " + COLUMNS + " FROM chat_message WHERE message_id = ? LIMIT 1";
+        List<Message> found = executeQuery(sql, List.of(messageId.trim()));
+        return found.isEmpty() ? null : found.get(0);
+    }
+
+    /**
+     * 把指定消息标记为已撤回。
+     *
+     * <p>{@code sender = ?} 是必须项：撤回只能由发送者本人发起，把身份条件写进 SQL
+     * 可以避免"先查再改"之间被插入其它请求造成越权撤回。重复撤回返回 0 行，
+     * 由上层按幂等处理。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param sender    发起撤回的用户名
+     * @return 实际更新的行数；已撤回或不属于该发送者时返回 0
+     * @throws ChatException 更新失败时抛出
+     */
+    @Override
+    public boolean markRecalled(String messageId, String sender) throws ChatException {
+        requireAvailable();
+        if (messageId == null || messageId.trim().isEmpty() || sender == null || sender.trim().isEmpty()) {
+            return false;
+        }
+        String sql = "UPDATE chat_message SET recalled = 1 WHERE message_id = ? AND sender = ? AND recalled = 0";
+        try (Connection connection = openConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, messageId.trim());
+            ps.setString(2, sender.trim());
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new ChatException("消息撤回失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * 归一化分页条数：非法值回落到默认值，超限值截断到上限。
      *
      * @param limit 调用方传入的条数
@@ -571,6 +622,11 @@ public class JdbcMessageDao implements MessageDao {
         String receiver = nullToEmpty(rs.getString("receiver"));
         // 正文以密文入库，读出后立即解密，保证上层拿到的始终是明文
         String content = MessageCipher.decrypt(rs.getString("content"));
+        if (rs.getInt("recalled") == 1) {
+            // 已撤回的消息在读出时就用占位文本替换正文：数据库无法"部分删除"原文，
+            // 只有在这一层统一替换，历史查询、关键字检索与导出才不会泄露已撤回内容
+            content = Constants.RECALLED_PLACEHOLDER;
+        }
         String fileName = rs.getString("file_name");
         Message message;
         if (fileName != null || type == MessageType.FILE_REQUEST || type == MessageType.FILE_RESULT) {
