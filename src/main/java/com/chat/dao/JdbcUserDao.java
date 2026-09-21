@@ -105,10 +105,17 @@ public class JdbcUserDao implements UserDao {
                 + "username VARCHAR(32) PRIMARY KEY,"
                 + "nickname VARCHAR(64) NOT NULL,"
                 + "salt CHAR(32) NOT NULL,"
-                + "password_hash CHAR(64) NOT NULL,"
+                // 必须与 sql/schema.sql 一致：PBKDF2 散列形如 pbkdf2$120000$<64 位十六进制>，
+                // 约 78 字符，沿用历史 CHAR(64) 会在写入时被数据库拒绝（Data too long）
+                + "password_hash VARCHAR(128) NOT NULL,"
                 + "role VARCHAR(16) NOT NULL DEFAULT 'USER',"
                 + "create_time DATETIME NULL,"
-                + "last_login_time DATETIME NULL)";
+                + "last_login_time DATETIME NULL,"
+                // 与 sql/schema.sql 保持逐项一致：运行期建表若漏建索引，
+                // 会出现"脚本建库查询快、程序自动建库查询慢"的隐蔽差异，
+                // 而 CREATE TABLE IF NOT EXISTS 不会为已存在的表补建索引
+                + "KEY idx_chat_user_nickname (nickname),"
+                + "KEY idx_chat_user_role (role))";
         try (Connection connection = openConnection();
              Statement statement = connection.createStatement()) {
             statement.execute(sql);

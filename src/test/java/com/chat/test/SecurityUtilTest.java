@@ -33,7 +33,10 @@ public class SecurityUtilTest {
         String salt2 = SecurityUtil.generateSalt();
         String hash1 = SecurityUtil.hashPassword("123456", salt1);
         String hash2 = SecurityUtil.hashPassword("123456", salt2);
-        TestRunner.assertEquals(64, hash1.length(), "SHA-256 散列应为 64 个十六进制字符");
+        TestRunner.assertTrue(hash1.startsWith("pbkdf2$120000$"),
+                "散列应为 pbkdf2$迭代数$十六进制 格式，且迭代数为 120000");
+        TestRunner.assertEquals(78, hash1.length(),
+                "PBKDF2 散列应为 pbkdf2$120000$ 前缀加 64 位十六进制，共 78 字符");
         TestRunner.assertNotEquals(hash1, hash2, "加盐后相同密码的散列必须不同");
     }
 

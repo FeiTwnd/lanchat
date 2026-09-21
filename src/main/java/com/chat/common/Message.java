@@ -32,6 +32,20 @@ public abstract class Message implements Serializable {
     /** 消息唯一编号，由发送方本地递增生成，用于日志追踪与去重 */
     private long id;
 
+    /**
+     * 跨端唯一的稳定消息标识（UUID 字符串）。
+     *
+     * <p>用途：服务端 ACK 确认、消息去重、离线补投、撤回与已读回执都依赖一个两端一致的标识。
+     * 与 {@link #id} 的区别在于：{@code id} 只是发送方本地递增序号，落库后还会被服务端自增主键覆盖，
+     * 两端编号互不相关，因此无法用来定位同一条消息。</p>
+     *
+     * <p>关于序列化版本号：新增本字段不修改 {@code serialVersionUID}，
+     * 因为 Java 原生序列化对新增字段是向后兼容的——未升级的对端读到的是 {@code null}，
+     * 由服务端落库前调用 {@link #ensureMessageId()} 补生成即可；
+     * 反过来，若为此上调版本号，旧客户端会因版本号不匹配直接反序列化失败，反而破坏兼容。</p>
+     */
+    private String messageId;
+
     /** 消息类型，决定接收方的处理策略 */
     private MessageType type;
 
@@ -72,6 +86,42 @@ public abstract class Message implements Serializable {
      */
     public void setId(long id) {
         this.id = id;
+    }
+
+    /**
+     * 获取稳定消息标识。
+     *
+     * @return 跨端唯一标识；旧版对端发来的消息或尚未赋值时可能为 null
+     */
+    public String getMessageId() {
+        return messageId;
+    }
+
+    /**
+     * 设置稳定消息标识。
+     *
+     * <p>由发送方在构造消息时生成，或由服务端读取旧版客户端的消息后补写。</p>
+     *
+     * @param messageId 跨端唯一标识
+     */
+    public void setMessageId(String messageId) {
+        this.messageId = messageId;
+    }
+
+    /**
+     * 确保稳定消息标识非空，必要时生成并保存。
+     *
+     * <p>服务端在落库前统一调用本方法：这样即使旧版客户端不带该字段，
+     * 数据库中也不会出现空标识，去重与 ACK 逻辑无需再判空。
+     * 已存在的值不会被覆盖，保证同一条消息在重发、补投等多次落库路径中标识稳定。</p>
+     *
+     * @return 已有的或新生成的稳定消息标识，必定非空
+     */
+    public String ensureMessageId() {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            messageId = java.util.UUID.randomUUID().toString();
+        }
+        return messageId;
     }
 
     /**
@@ -170,12 +220,12 @@ public abstract class Message implements Serializable {
     /**
      * 返回对象的简要描述，刻意不包含消息正文，避免日志被大文本或文件字节撑爆。
      *
-     * @return 形如 {@code TextMessage{id=1, type=TEXT_PRIVATE, sender=alice -> bob}} 的字符串
+     * @return 形如 {@code TextMessage{id=1, messageId=..., type=TEXT_PRIVATE, sender=alice -> bob}} 的字符串
      */
     @Override
     public String toString() {
         String receiverText = isBroadcast() ? Constants.BROADCAST_TAG : receiver;
-        return getClass().getSimpleName() + "{id=" + id + ", type=" + type
+        return getClass().getSimpleName() + "{id=" + id + ", messageId=" + messageId + ", type=" + type
                 + ", sender=" + sender + " -> " + receiverText
                 + ", time=" + timestamp + "}";
     }

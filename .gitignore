@@ -5,11 +5,8 @@ out/
 *.class
 
 # 运行期数据（保留目录骨架，忽略内容）
-data/users.txt
-data/history/*
 data/export/*
 data/received/*
-!data/history/.gitkeep
 !data/export/.gitkeep
 !data/received/.gitkeep
 

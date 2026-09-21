@@ -44,7 +44,10 @@ public class UserDaoTest {
         TestRunner.assertNotNull(loaded, "应能按用户名查询到用户");
         TestRunner.assertEquals("张三", loaded.getNickname(), "昵称应被正确保存");
         TestRunner.assertEquals(Constants.ROLE_USER, loaded.getRole(), "默认角色应为普通用户");
-        TestRunner.assertEquals(64, loaded.getPasswordHash().length(), "密码散列应被完整回读");
+        // 口令散列自本轮起为 PBKDF2（pbkdf2$迭代数$hex，约 78 字符），
+        // 断言格式而不是固定长度，避免将来调整迭代数位数时再次失效
+        TestRunner.assertTrue(loaded.getPasswordHash().startsWith("pbkdf2$"),
+                "密码散列应为 PBKDF2 格式并被完整回读");
         TestRunner.assertEquals(1L, dao.count(), "用户总数应为 1");
     }
 

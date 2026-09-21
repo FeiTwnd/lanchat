@@ -4,6 +4,7 @@ import com.chat.client.ChatClient;
 import com.chat.common.Message;
 import com.chat.common.MessageType;
 import com.chat.common.TextMessage;
+import com.chat.util.DateUtil;
 
 /**
  * 私聊面板：仅处理与指定好友之间的私聊消息。
@@ -36,7 +37,6 @@ public class PrivateChatPanel extends BaseChatPanel {
     public PrivateChatPanel(ChatClient client, String peer) {
         super(client);
         this.peer = peer;
-        getInputField().setToolTipText(placeholder());
     }
 
     /**
@@ -85,30 +85,76 @@ public class PrivateChatPanel extends BaseChatPanel {
      * <p>只在窗口刚创建时调用一次，用于补齐"关闭窗口再打开"或"重启客户端"之后
      * 看不到此前对话的问题。已经由实时通道渲染过的消息会被跳过，避免同一条消息出现两次。</p>
      *
-     * @param records 历史记录，每项为 {@code {时间, 发送者用户名, 正文}}
+     * <p>解析出的时间交给基类按"今天/昨天/本年/跨年"规则显示：历史记录可能来自昨天甚至去年，
+     * 只显示时分会让使用者误以为是很久以前的当天消息。</p>
+     *
+     * @param records 历史记录，按时间升序，每项为 {@code {时间, 发送者用户名, 正文}}
      * @return 实际渲染的条数
      */
     public int fillHistory(java.util.List<String[]> records) {
-        int rendered = 0;
-        // 从后往前插入到文档开头，插入完成后自然恢复为时间升序
-        for (int i = records.size() - 1; i >= 0; i--) {
-            String[] record = records.get(i);
+        if (records == null || records.isEmpty()) {
+            return 0;
+        }
+        java.util.List<HistoryEntry> history = new java.util.ArrayList<>(records.size());
+        for (String[] record : records) {
             if (record.length < 3) {
                 continue;
             }
             boolean fromPeer = peer.equals(record[1]);
-            String who = fromPeer ? peer : "我";
-            if (historyPane.getText().contains(who + ": " + record[2])) {
-                continue;
-            }
-            prependLine("[" + record[0] + "] " + who + ": " + record[2],
-                    fromPeer ? COLOR_OTHER : COLOR_SELF);
-            rendered++;
+            history.add(new HistoryEntry(fromPeer ? peer : "我", record[2], !fromPeer,
+                    DateUtil.parse(record[0])));
         }
+        // 基类按时间升序插到列表最前面，并负责跳过已经渲染过的消息
+        int rendered = prependHistory(history);
         if (rendered > 0) {
             prependLine("[系统] 以上为最近 " + rendered + " 条历史记录", COLOR_SYSTEM);
         }
         return rendered;
+    }
+
+    /**
+     * 私聊支持引用发送。
+     *
+     * <p>先前因 {@code ChatClient} 没有带引用的私聊发送重载而暂时关闭该入口：
+     * 绕过重载自行发送会丢掉 ACK 登记、超时重发与"发送中/已送达"状态。
+     * 客户端补齐 {@code sendPrivateText(receiver, content, quoteId, quoteSummary)} 后，
+     * 引用消息与普通私聊走同一条受跟踪的发送路径，因此这里恢复为支持。</p>
+     *
+     * @return 固定返回 true
+     */
+    @Override
+    protected boolean isQuoteSupported() {
+        return true;
+    }
+
+    /**
+     * 发送带引用的私聊消息。
+     *
+     * <p>校验与 {@link #doSend(String)} 保持一致，并且必须调用带引用的重载而不是
+     * {@code client.send(...)}，否则这条消息不会有发送状态与超时重发。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识
+     * @param quoteSummary 被引用消息的摘要
+     * @return 发送成功返回 true
+     */
+    @Override
+    protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
+        if (content == null || content.trim().isEmpty()) {
+            return false;
+        }
+        if (content.length() > com.chat.common.Constants.MESSAGE_MAX_LENGTH) {
+            appendLine("[系统] 消息过长，最多 " + com.chat.common.Constants.MESSAGE_MAX_LENGTH + " 个字符",
+                    COLOR_ERROR);
+            return false;
+        }
+        boolean sent = client.sendPrivateText(peer, content, quoteId, quoteSummary);
+        if (sent) {
+            appendMessage("我", content, COLOR_SELF);
+        } else {
+            appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
+        }
+        return sent;
     }
 
     /**
@@ -148,6 +194,8 @@ public class PrivateChatPanel extends BaseChatPanel {
         String content = message instanceof TextMessage
                 ? ((TextMessage) message).getContent() : message.getSummary();
         boolean fromPeer = peer.equals(message.getSender());
-        appendMessage(fromPeer ? peer : "我", content, fromPeer ? COLOR_OTHER : COLOR_SELF);
+        // 交给基类渲染：对端若带引用信息，气泡里会显示引用块
+        appendIncoming(fromPeer ? peer : "我", content,
+                fromPeer ? COLOR_OTHER : COLOR_SELF, message, false);
     }
 }

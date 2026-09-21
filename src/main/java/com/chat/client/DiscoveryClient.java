@@ -37,6 +37,10 @@ import java.util.logging.Logger;
  *   <li>发现失败返回空列表而非抛异常——自动发现只是便捷入口，用户仍可手动输入 IP。</li>
  * </ul>
  *
+ * <p>健壮性：接收窗口内收到的任何报文都可能是伪造/畸形的，因此解析失败一律忽略，
+ * 既不中断接收循环也不放入结果集；结果规模另设上限，防止同一网段内的异常主机
+ * 用海量伪造应答把内存和界面撑爆。</p>
+ *
  * @author Java 课程设计
  * @version 1.0
  */
@@ -44,6 +48,12 @@ public class DiscoveryClient {
 
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".DiscoveryClient");
+
+    /** 接收缓冲区大小（字节），与应答长度上限保持同一量级 */
+    private static final int RECEIVE_BUFFER_SIZE = 256;
+
+    /** 单次发现接受的最大服务器条目数，超出后不再收录新条目 */
+    private static final int MAX_SERVER_ENTRIES = 64;
 
     /** 发现结果条目：服务器地址与在线人数 */
     public static final class ServerInfo {
@@ -192,7 +202,7 @@ public class DiscoveryClient {
             socket.send(new DatagramPacket(payload, payload.length, loopback, port));
             // 本机应答几乎瞬时到达，单独收一次并设置短超时，避免拖慢整体发现过程
             socket.setSoTimeout(300);
-            byte[] buffer = new byte[256];
+            byte[] buffer = new byte[RECEIVE_BUFFER_SIZE];
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             socket.receive(packet);
             String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
@@ -212,7 +222,9 @@ public class DiscoveryClient {
     /**
      * 在超时窗口内持续收集应答。
      *
-     * <p>使用“剩余时间”递减的方式收敛等待，避免最后一个超时窗口无谓等待。</p>
+     * <p>使用“剩余时间”递减的方式收敛等待，避免最后一个超时窗口无谓等待。
+     * 循环内对每个报文单独判错：解析失败只是忽略该包，接收循环继续等待下一个应答，
+     * 否则一台异常主机就能让本次发现提前结束。</p>
      *
      * @param socket        套接字
      * @param servers       结果集合
@@ -220,7 +232,7 @@ public class DiscoveryClient {
      */
     private void collectResponses(DatagramSocket socket, Set<ServerInfo> servers, int timeoutMillis) {
         long deadline = System.currentTimeMillis() + timeoutMillis;
-        byte[] buffer = new byte[256];
+        byte[] buffer = new byte[RECEIVE_BUFFER_SIZE];
         while (System.currentTimeMillis() < deadline) {
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             try {
@@ -229,9 +241,14 @@ public class DiscoveryClient {
                 String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
                         StandardCharsets.UTF_8);
                 ServerInfo info = parse(text);
-                if (info != null) {
-                    servers.add(info);
+                if (info == null) {
+                    continue;
                 }
+                if (servers.size() >= MAX_SERVER_ENTRIES) {
+                    LOGGER.warning("发现结果已达上限 " + MAX_SERVER_ENTRIES + " 条，忽略后续应答");
+                    return;
+                }
+                servers.add(info);
             } catch (SocketTimeoutException e) {
                 return;
             } catch (IOException e) {
@@ -244,20 +261,25 @@ public class DiscoveryClient {
     /**
      * 解析应答报文。
      *
+     * <p>长度与各字段范围由 {@link DiscoveryResponder#parseAnnouncement(String)} 统一校验，
+     * 这里只负责把结果包装为条目；任何解析异常都不得向上传播，否则会打断接收线程的收集循环。</p>
+     *
      * @param text 报文文本
      * @return 服务器信息；格式非法时返回 null
      */
     private ServerInfo parse(String text) {
-        String[] parts = DiscoveryResponder.parseAnnouncement(text);
+        String[] parts;
+        try {
+            parts = DiscoveryResponder.parseAnnouncement(text);
+        } catch (RuntimeException e) {
+            // 防御性兜底：解析路径已做格式校验，此处仅保证异常不会终止发现流程
+            LOGGER.log(Level.FINE, "解析发现应答失败: " + e.getMessage(), e);
+            return null;
+        }
         if (parts == null) {
             return null;
         }
-        try {
-            return new ServerInfo(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
-        } catch (NumberFormatException e) {
-            LOGGER.fine(() -> "发现应答数值非法: " + text);
-            return null;
-        }
+        return new ServerInfo(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
     }
 
     /**

@@ -53,6 +53,11 @@ public class FileTransferUI extends BaseUI {
     /** 发送成功后的自动关闭延时（毫秒）：留一点时间让使用者看到"传输完成" */
     private static final int AUTO_CLOSE_DELAY_MS = 2000;
 
+    /** 日志记录器：文件会话释放失败等清理问题需要留痕，但不应打扰使用者 */
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(com.chat.common.Constants.LOGGER_NAME
+                    + ".client.ui.FileTransferUI");
+
     /** 客户端实例 */
     private final transient ChatClient client;
 
@@ -293,12 +298,33 @@ public class FileTransferUI extends BaseUI {
         });
         appendLog((success ? "[成功] " : "[失败] ") + result.getMessage());
         if (!success) {
+            // 失败时同样必须释放发送会话：否则 SendingFile 会一直持有文件句柄，
+            // 使用者既删不掉源文件，进程也会持续占用文件描述符
+            releaseSendSession(result.getTransferId());
             showError(result.getMessage());
             return;
         }
         if (senderSide) {
             appendLog("传输已完成，本窗口将在 " + (AUTO_CLOSE_DELAY_MS / 1000) + " 秒后自动关闭");
             scheduleAutoClose();
+        }
+    }
+
+    /**
+     * 释放发送会话及其持有的文件句柄。
+     *
+     * <p>为什么由界面负责收尾：发送线程只有在对端同意后才会启动，被拒绝或提前失败时
+     * 根本不存在那个线程，也就没有它的 {@code finally} 来释放会话；会话不释放，
+     * {@code SendingFile} 会一直占着文件句柄。释放是幂等的，因此多条结束路径都可以放心调用。</p>
+     *
+     * @param transferId 传输编号
+     */
+    private void releaseSendSession(String transferId) {
+        try {
+            client.getFileService().closeSend(transferId);
+        } catch (RuntimeException e) {
+            // 清理失败只留日志，不能因此打断界面提示，否则使用者看到的是"清理异常"而不是传输结果
+            LOGGER.log(java.util.logging.Level.FINE, "释放文件发送会话失败: " + transferId, e);
         }
     }
 
@@ -341,6 +367,9 @@ public class FileTransferUI extends BaseUI {
                 appendLog("对方拒绝接收文件: " + message.getMessage());
                 onEdt(() -> progressLabel.setText("对方拒绝接收"));
                 TRANSFER_OWNERS.remove(message.getTransferId());
+                // 被拒绝时发送线程从未启动，不存在它的 finally 来收尾，
+                // 必须在这里主动释放发送会话与文件句柄，否则句柄会一直挂到退出程序
+                releaseSendSession(message.getTransferId());
                 break;
             case FILE_ACCEPT:
                 appendLog("对方已同意接收，开始发送数据……");

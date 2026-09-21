@@ -1,5 +1,6 @@
 package com.chat.service;
 
+import com.chat.common.Config;
 import com.chat.common.Constants;
 import com.chat.common.Result;
 import com.chat.common.User;
@@ -11,6 +12,7 @@ import com.chat.util.SecurityUtil;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
@@ -23,7 +25,9 @@ import java.util.regex.Pattern;
  * <p>为什么 Service 不设接口：全系统只有这一种用户业务实现，
  * 额外定义 {@code UserServiceInterface} 只会增加跳转成本而无任何替换收益。</p>
  *
- * <p>线程安全：本类自身无可变状态，线程安全由 {@link UserDao} 实现保证。</p>
+ * <p>线程安全：持久化的线程安全由 {@link UserDao} 实现保证；本类额外持有的登录失败计数
+ * 使用 {@link java.util.concurrent.ConcurrentHashMap}，可被多个连接线程并发读写，
+ * 计数只用于限流，个别并发下的偏差不影响安全结论。</p>
  *
  * @author Java 课程设计
  * @version 1.0
@@ -36,8 +40,34 @@ public class UserService {
     /** 用户名格式校验器 */
     private static final Pattern USERNAME_PATTERN = Pattern.compile(Constants.USERNAME_PATTERN);
 
+    /** 同一账号连续登录失败的最大次数，超过后开始锁定 */
+    private static final int MAX_LOGIN_FAILURES = 5;
+
+    /** 登录失败锁定时长（分钟） */
+    private static final int LOGIN_LOCK_MINUTES = 5;
+
+    /** 登录失败锁定时长（毫秒），由分钟数换算，避免在判断中重复写算式 */
+    private static final long LOGIN_LOCK_MILLIS = LOGIN_LOCK_MINUTES * 60_000L;
+
+    /** 账号或口令错误的统一提示：用户不存在与密码错误必须完全一致，防止账号枚举 */
+    private static final String LOGIN_FAILED_MESSAGE = "用户名或密码错误";
+
+    /** 限流生效时的提示，明确告知等待时长，避免用户反复重试 */
+    private static final String LOGIN_LOCKED_MESSAGE = "登录失败次数过多，请 " + LOGIN_LOCK_MINUTES + " 分钟后再试";
+
     /** 用户持久化实现 */
     private final UserDao userDao;
+
+    /**
+     * 登录失败计数器：键为「用户名小写@来源」，值为累计失败次数。
+     *
+     * <p>只放在内存中：限流是抵御在线暴破的实时防线，进程重启后清零可以接受；
+     * 落库反而会给每次失败增加一次数据库写入，把限流本身变成放大攻击的入口。</p>
+     */
+    private final ConcurrentHashMap<String, Integer> loginFailureCounts = new ConcurrentHashMap<>();
+
+    /** 登录锁定起始时间：键与 {@link #loginFailureCounts} 相同，值为锁定开始时的毫秒时间戳 */
+    private final ConcurrentHashMap<String, Long> loginLockStartTimes = new ConcurrentHashMap<>();
 
     /**
      * 默认构造：使用数据库存储（本项目唯一的存储方式）。
@@ -121,8 +151,9 @@ public class UserService {
     /**
      * 初始化管理员账号（幂等）。
      *
-     * <p>仅在账号不存在时创建，密码取配置项 {@code admin.password}，
-     * 缺省值见 {@link Constants#ADMIN_DEFAULT_PASSWORD}。首次启动后应立刻修改。</p>
+     * <p>仅在账号不存在时创建，口令取配置项 {@code admin.password}。刻意不提供内置默认口令：
+     * 内置口令会让“忘记配置”退化成“所有人共用一个公开口令”。未配置或长度不合法时
+     * 只记录告警并跳过创建，由部署者自行补齐配置后重启。</p>
      *
      * @return 本次调用是否新建了管理员
      */
@@ -131,7 +162,19 @@ public class UserService {
             if (userDao.exists(Constants.ADMIN_USERNAME)) {
                 return false;
             }
-            String password = com.chat.common.Config.get("admin.password", Constants.ADMIN_DEFAULT_PASSWORD);
+            String password = Config.get("admin.password", "");
+            if (password.isEmpty()) {
+                LOGGER.warning("未配置 admin.password，跳过创建管理员账号，"
+                        + "请在 config/chat.properties 中配置后重启");
+                return false;
+            }
+            if (password.length() < Constants.PASSWORD_MIN_LENGTH
+                    || password.length() > Constants.PASSWORD_MAX_LENGTH) {
+                LOGGER.warning("admin.password 长度需为 " + Constants.PASSWORD_MIN_LENGTH + "-"
+                        + Constants.PASSWORD_MAX_LENGTH + " 位，跳过创建管理员账号，"
+                        + "请在 config/chat.properties 中修正后重启");
+                return false;
+            }
             User admin = new User(Constants.ADMIN_USERNAME, Constants.ADMIN_NICKNAME);
             admin.setSalt(SecurityUtil.generateSalt());
             admin.setPasswordHash(SecurityUtil.hashPassword(password, admin.getSalt()));
@@ -139,7 +182,7 @@ public class UserService {
             admin.setCreateTime(LocalDateTime.now());
             boolean created = userDao.save(admin);
             if (created) {
-                LOGGER.info("已创建默认管理员账号 admin，请登录后立即修改密码");
+                LOGGER.info("已按 admin.password 配置创建管理员账号 " + Constants.ADMIN_USERNAME);
             }
             return created;
         } catch (ChatException e) {
@@ -149,36 +192,125 @@ public class UserService {
     }
 
     /**
-     * 用户登录校验。
+     * 用户登录校验（来源未知）。
+     *
+     * <p>保留该重载是为了兼容既有调用方，实际逻辑委托给
+     * {@link #login(String, String, String)}，来源按 "unknown" 统计。</p>
      *
      * @param username 用户名
      * @param password 明文密码
      * @return 成功时携带脱敏用户对象及最近登录时间更新结果
      */
     public Result<User> login(String username, String password) {
+        return login(username, password, "unknown");
+    }
+
+    /**
+     * 用户登录校验（带来源标识）。
+     *
+     * <p>安全规则：</p>
+     * <ul>
+     *   <li>限流：同一「用户名 + 来源」连续失败达到 {@link #MAX_LOGIN_FAILURES} 次后锁定
+     *       {@link #LOGIN_LOCK_MINUTES} 分钟，抵御在线暴力破解；</li>
+     *   <li>防账号枚举：用户不存在与密码错误返回完全相同的提示文案，
+     *       避免攻击者据此判断某个用户名是否已注册；日志中仍区分记录以便排障；</li>
+     *   <li>透明升级：登录成功时若发现历史单轮散列，立即改用 PBKDF2 重新散列，
+     *       并与最近登录时间合并为同一次写库，不额外增加一次数据库往返。</li>
+     * </ul>
+     *
+     * @param username 用户名
+     * @param password 明文密码
+     * @param source   登录来源标识（如客户端 IP），可为 null，为 null 时按 "unknown" 统计
+     * @return 成功时携带脱敏用户对象及最近登录时间更新结果
+     */
+    public Result<User> login(String username, String password, String source) {
         if (username == null || username.trim().isEmpty()) {
             return Result.fail("用户名不能为空");
         }
         if (password == null || password.isEmpty()) {
             return Result.fail("密码不能为空");
         }
+        String name = username.trim();
+        // 用户名不区分大小写地统计失败次数，避免通过变换大小写绕过限流
+        String failureKey = name.toLowerCase() + "@"
+                + (source == null || source.trim().isEmpty() ? "unknown" : source.trim());
+        if (isLocked(failureKey)) {
+            LOGGER.warning(() -> "登录被限流拒绝: " + name);
+            return Result.fail(LOGIN_LOCKED_MESSAGE);
+        }
         try {
-            User user = userDao.findByUsername(username.trim());
+            User user = userDao.findByUsername(name);
             if (user == null) {
-                return Result.fail("用户不存在: " + username);
+                LOGGER.warning(() -> "登录失败（用户不存在）: " + name);
+                recordFailure(failureKey);
+                return Result.fail(LOGIN_FAILED_MESSAGE);
             }
             if (!SecurityUtil.verifyPassword(password, user.getSalt(), user.getPasswordHash())) {
-                LOGGER.warning(() -> "登录失败（密码错误）: " + username);
-                return Result.fail("密码错误");
+                LOGGER.warning(() -> "登录失败（密码错误）: " + name);
+                recordFailure(failureKey);
+                return Result.fail(LOGIN_FAILED_MESSAGE);
+            }
+            clearFailures(failureKey);
+            boolean upgraded = SecurityUtil.isLegacyHash(user.getPasswordHash());
+            if (upgraded) {
+                user.setSalt(SecurityUtil.generateSalt());
+                user.setPasswordHash(SecurityUtil.hashPassword(password, user.getSalt()));
             }
             user.setLastLoginTime(LocalDateTime.now());
             userDao.update(user);
-            LOGGER.info(() -> "用户登录成功: " + username);
+            if (upgraded) {
+                LOGGER.info(() -> "已将历史口令散列升级为 PBKDF2: " + name);
+            }
+            LOGGER.info(() -> "用户登录成功: " + name);
             return Result.ok("登录成功", copyForTransfer(user));
         } catch (ChatException e) {
             LOGGER.warning("登录异常: " + e.getMessage());
             return Result.fail("登录失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 判断指定计数键是否处于锁定期。
+     *
+     * <p>锁定到期后直接清除计数，使账号在等待期满后自动恢复可用，
+     * 不需要管理员手工解锁。</p>
+     *
+     * @param key 计数键（用户名小写@来源）
+     * @return 处于锁定期返回 true
+     */
+    private boolean isLocked(String key) {
+        Long lockStart = loginLockStartTimes.get(key);
+        if (lockStart == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - lockStart < LOGIN_LOCK_MILLIS) {
+            return true;
+        }
+        clearFailures(key);
+        return false;
+    }
+
+    /**
+     * 记录一次登录失败，达到上限时开始计时锁定。
+     *
+     * @param key 计数键（用户名小写@来源）
+     */
+    private void recordFailure(String key) {
+        int failures = loginFailureCounts.merge(key, 1, Integer::sum);
+        if (failures >= MAX_LOGIN_FAILURES) {
+            loginLockStartTimes.put(key, System.currentTimeMillis());
+            LOGGER.warning(() -> "登录失败次数达到上限，已锁定 " + LOGIN_LOCK_MINUTES + " 分钟: " + key);
+        }
+    }
+
+    /**
+     * 清除指定计数键的失败次数与锁定状态。
+     *
+     * @param key 计数键（用户名小写@来源）
+     */
+    private void clearFailures(String key) {
+        loginFailureCounts.remove(key);
+        loginLockStartTimes.remove(key);
     }
 
     /**

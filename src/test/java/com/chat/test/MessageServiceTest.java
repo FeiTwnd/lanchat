@@ -163,11 +163,16 @@ public class MessageServiceTest {
                 "课程设计需要写测试报告", MessageType.TEXT_PRIVATE));
         service.saveMessage(ChatMessageFactory.text("alice", "bob",
                 "今天天气不错", MessageType.TEXT_PRIVATE));
-        TestRunner.assertEquals(1, service.search("测试报告").getData().size(),
+        TestRunner.assertEquals(1, service.search("alice", "测试报告").getData().size(),
                 "应命中包含关键字的记录");
-        TestRunner.assertEquals(0, service.search("不存在的关键字").getData().size(),
+        TestRunner.assertEquals(0, service.search("alice", "不存在的关键字").getData().size(),
                 "不应命中无关记录");
-        TestRunner.assertFalse(service.search("").isSuccess(), "空关键字应返回失败");
+        TestRunner.assertFalse(service.search("alice", "").isSuccess(), "空关键字应返回失败");
+        // 可见范围：carol 不是这些私聊的收发方，即使关键字命中也不应看到
+        TestRunner.assertEquals(0, service.search("carol", "测试报告").getData().size(),
+                "无关用户不应对他人私聊的命中结果可见");
+        TestRunner.assertFalse(service.search("", "测试报告").isSuccess(),
+                "缺少请求者时应拒绝而不是退化成全库检索");
     }
 
     /**
