@@ -113,19 +113,48 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 私聊当前不支持引用发送，因此不提供"引用"右键菜单。
+     * 私聊支持引用发送。
      *
-     * <p>引用信息必须随消息一起上线才能被对端识别为结构化引用。私聊的发送入口
-     * {@code ChatClient.sendPrivateText(String, String)} 目前不接受引用参数，
-     * 而私聊消息依赖客户端内部的重发与状态登记，绕过它自行发送会让"发送中/已送达"
-     * 状态与超时重发全部失效，因此这里选择不支持，而不是偷偷降级成纯文本。
-     * 收到对端带引用的消息仍然可以正常渲染引用块（见 {@link #onMessage(Message)}）。</p>
+     * <p>先前因 {@code ChatClient} 没有带引用的私聊发送重载而暂时关闭该入口：
+     * 绕过重载自行发送会丢掉 ACK 登记、超时重发与"发送中/已送达"状态。
+     * 客户端补齐 {@code sendPrivateText(receiver, content, quoteId, quoteSummary)} 后，
+     * 引用消息与普通私聊走同一条受跟踪的发送路径，因此这里恢复为支持。</p>
      *
-     * @return 固定返回 false
+     * @return 固定返回 true
      */
     @Override
     protected boolean isQuoteSupported() {
-        return false;
+        return true;
+    }
+
+    /**
+     * 发送带引用的私聊消息。
+     *
+     * <p>校验与 {@link #doSend(String)} 保持一致，并且必须调用带引用的重载而不是
+     * {@code client.send(...)}，否则这条消息不会有发送状态与超时重发。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识
+     * @param quoteSummary 被引用消息的摘要
+     * @return 发送成功返回 true
+     */
+    @Override
+    protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
+        if (content == null || content.trim().isEmpty()) {
+            return false;
+        }
+        if (content.length() > com.chat.common.Constants.MESSAGE_MAX_LENGTH) {
+            appendLine("[系统] 消息过长，最多 " + com.chat.common.Constants.MESSAGE_MAX_LENGTH + " 个字符",
+                    COLOR_ERROR);
+            return false;
+        }
+        boolean sent = client.sendPrivateText(peer, content, quoteId, quoteSummary);
+        if (sent) {
+            appendMessage("我", content, COLOR_SELF);
+        } else {
+            appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
+        }
+        return sent;
     }
 
     /**
