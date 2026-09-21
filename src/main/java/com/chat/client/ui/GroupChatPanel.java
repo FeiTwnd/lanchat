@@ -1,11 +1,13 @@
 package com.chat.client.ui;
 
 import com.chat.client.ChatClient;
+import com.chat.common.Constants;
 import com.chat.common.Message;
 import com.chat.common.MessageType;
 import com.chat.common.SystemMessage;
 import com.chat.common.TextMessage;
 
+import java.awt.Toolkit;
 import java.io.File;
 import java.util.List;
 import java.util.function.Supplier;
@@ -90,6 +92,102 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
+     * @ 补全候选：当前在线的其他用户。
+     *
+     * <p>排除自己：给自己 @ 提醒没有意义，留在候选里只会增加误选概率。</p>
+     *
+     * @return 在线用户名列表
+     */
+    @Override
+    protected List<String> mentionCandidates() {
+        return onlineUsers.get().stream()
+                .filter(name -> name != null && !name.isEmpty())
+                .filter(name -> !name.equals(client.getUsername()))
+                .toList();
+    }
+
+    /**
+     * 群聊支持引用发送。
+     *
+     * @return 固定返回 true
+     */
+    @Override
+    protected boolean isQuoteSupported() {
+        return true;
+    }
+
+    /**
+     * 发送带引用的群聊消息。
+     *
+     * <p>群聊本来就不做发送确认（见 {@code ChatClient.sendGroupText}），
+     * 因此这里直接用带引用参数的文本消息走同一条广播通道，不需要绕开任何重发机制。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识
+     * @param quoteSummary 被引用消息的摘要
+     * @return 发送成功返回 true
+     */
+    @Override
+    protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
+        if (content == null || content.trim().isEmpty()) {
+            return false;
+        }
+        if (content.length() > Constants.MESSAGE_MAX_LENGTH) {
+            appendLine("[系统] 消息过长，最多 " + Constants.MESSAGE_MAX_LENGTH + " 个字符", COLOR_ERROR);
+            return false;
+        }
+        TextMessage message = new TextMessage(client.getUsername(), "", content, quoteId, quoteSummary);
+        message.setType(MessageType.TEXT_GROUP);
+        message.ensureMessageId();
+        boolean sent = client.send(message);
+        if (sent) {
+            appendMessage("我", content, COLOR_SELF);
+        } else {
+            appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
+        }
+        return sent;
+    }
+
+    /**
+     * 判断正文是否 @ 了指定用户。
+     *
+     * <p>纯函数。必须要求名字后面是边界：否则 {@code @alice} 会在 {@code @alice2} 中被误判成提醒，
+     * 把提示音发给一个根本没被点名的人。</p>
+     *
+     * @param username 被判断的用户名
+     * @param content  消息正文
+     * @return 被提及返回 true
+     */
+    static boolean mentions(String username, String content) {
+        if (username == null || username.isEmpty() || content == null) {
+            return false;
+        }
+        String token = "@" + username;
+        int from = 0;
+        while (true) {
+            int index = content.indexOf(token, from);
+            if (index < 0) {
+                return false;
+            }
+            int end = index + token.length();
+            if (end >= content.length() || !isNameChar(content.charAt(end))) {
+                return true;
+            }
+            from = end;
+        }
+    }
+
+    /**
+     * 判断字符是否可作为用户名的一部分。
+     *
+     * @param value 字符
+     * @return 是字母、数字或下划线返回 true
+     */
+    private static boolean isNameChar(char value) {
+        return Character.isLetterOrDigit(value) || value == '_';
+    }
+
+    /**
      * 获取聊天对象名称。
      *
      * @return 固定返回“群聊”
@@ -130,7 +228,13 @@ public class GroupChatPanel extends BaseChatPanel {
                 // 这里忽略自己的回显，否则同一条消息会显示两遍
                 return;
             }
-            appendMessage(sender, ((TextMessage) message).getContent(), COLOR_OTHER);
+            String content = ((TextMessage) message).getContent();
+            boolean mention = mentions(client.getUsername(), content);
+            if (mention) {
+                // 被点名的消息用系统提示音提醒：不引入音频素材，只用标准库的蜂鸣
+                Toolkit.getDefaultToolkit().beep();
+            }
+            appendIncoming(sender, content, COLOR_OTHER, message, mention);
             return;
         }
         String content = message instanceof SystemMessage

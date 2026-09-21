@@ -7,8 +7,11 @@ import com.chat.client.ui.theme.SkinButton;
 import com.chat.client.ui.theme.Theme;
 import com.chat.common.Constants;
 import com.chat.common.Message;
+import com.chat.common.TextMessage;
 
+import javax.imageio.ImageIO;
 import javax.swing.AbstractAction;
+import javax.swing.Action;
 import javax.swing.ActionMap;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -17,16 +20,23 @@ import javax.swing.InputMap;
 import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JList;
+import javax.swing.JMenuItem;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.KeyStroke;
+import javax.swing.ListSelectionModel;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.Scrollable;
 import javax.swing.SwingUtilities;
+import javax.swing.TransferHandler;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultEditorKit;
 import java.awt.BorderLayout;
 import java.awt.CardLayout;
 import java.awt.Color;
@@ -34,18 +44,32 @@ import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics2D;
 import java.awt.GridBagLayout;
+import java.awt.GridLayout;
+import java.awt.Image;
 import java.awt.Insets;
 import java.awt.Rectangle;
+import java.awt.Toolkit;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.Transferable;
+import java.awt.datatransfer.UnsupportedFlavorException;
 import java.awt.event.ActionEvent;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.awt.event.InputEvent;
 import java.awt.event.InputMethodEvent;
 import java.awt.event.InputMethodListener;
 import java.awt.event.KeyEvent;
+import java.awt.geom.Rectangle2D;
+import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.IOException;
 import java.text.AttributedCharacterIterator;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -129,6 +153,49 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /** 换行动作名 */
     private static final String ACTION_NEWLINE = "lanchat-newline";
 
+    /** @ 补全上移动作名 */
+    private static final String ACTION_MENTION_UP = "lanchat-mention-up";
+
+    /** @ 补全下移动作名 */
+    private static final String ACTION_MENTION_DOWN = "lanchat-mention-down";
+
+    /** @ 补全接受动作名 */
+    private static final String ACTION_MENTION_TAB = "lanchat-mention-tab";
+
+    /** @ 补全关闭动作名 */
+    private static final String ACTION_MENTION_HIDE = "lanchat-mention-hide";
+
+    /** 引用摘要的最大长度，超出部分截断，避免引用条把输入区挤成一行 */
+    private static final int QUOTE_SUMMARY_LIMIT = 40;
+
+    /** @ 补全候选窗口的宽度 */
+    private static final int MENTION_WIDTH = 150;
+
+    /** @ 补全候选窗口的可见行数 */
+    private static final int MENTION_ROWS = 6;
+
+    /** @ 补全候选的最大条数 */
+    private static final int MENTION_MAX = 12;
+
+    /** 表情面板的列数 */
+    private static final int EMOJI_COLUMNS = 6;
+
+    /** 截图临时文件所在目录名 */
+    private static final String SHOT_DIR = "lanchat-shots";
+
+    /**
+     * 表情面板内容。
+     *
+     * <p>只用 Unicode 字符，不引入任何图片素材：这样既不需要资源文件，
+     * 也不会把第三方表情包带进课程设计。渲染效果取决于系统是否安装了彩色表情字体。</p>
+     */
+    private static final String[] EMOJIS = {
+            "😀", "😄", "😁", "😆", "😅", "😂",
+            "🙂", "😉", "😊", "😍", "😘", "😜",
+            "🤔", "😐", "😴", "😢", "😭", "😡",
+            "👍", "👎", "👌", "🙏", "💪", "👏",
+            "🎉", "🔥", "⭐", "✅", "❌", "❤"};
+
     /** 输入框，多行、自动换行，高度在 1 到 6 行之间自适应 */
     protected final JTextArea inputArea = new JTextArea(1, 20);
 
@@ -140,6 +207,12 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
 
     /** 清空按钮 */
     protected final JButton clearButton = new SkinButton("清空", SkinButton.Kind.NORMAL);
+
+    /** 剪贴板图片发送按钮 */
+    protected final JButton imageButton = new SkinButton("图片", SkinButton.Kind.NORMAL);
+
+    /** 表情按钮 */
+    protected final JButton emojiButton = new SkinButton("表情", SkinButton.Kind.NORMAL);
 
     /** 客户端引用 */
     protected final transient ChatClient client;
@@ -173,6 +246,24 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /** 上一条消息的时间，用于判断是否需要插入时间分隔行 */
     private LocalDateTime lastMessageTime;
 
+    /** 引用条，显示待发送的引用摘要 */
+    private final JPanel quoteBar;
+
+    /** 引用条上的摘要文本 */
+    private final JLabel quoteLabel;
+
+    /** @ 补全候选窗口 */
+    private final JPopupMenu mentionPopup = new JPopupMenu();
+
+    /** @ 补全候选列表 */
+    private final JList<String> mentionList = new JList<>();
+
+    /** 待发送引用的被引用消息标识，为 null 表示当前没有引用 */
+    private String pendingQuoteId;
+
+    /** 待发送引用的摘要 */
+    private String pendingQuoteSummary;
+
     /** 输入法是否正处于候选组合中 */
     private boolean composing;
 
@@ -190,8 +281,11 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         setBackground(Theme.CARD);
         this.historyScroll = buildHistoryScroll();
         add(historyScroll, BorderLayout.CENTER);
+        this.quoteLabel = new JLabel();
+        this.quoteBar = buildQuoteBar(quoteLabel);
         this.inputPanel = buildInputPanel();
         add(inputPanel, BorderLayout.SOUTH);
+        installFileDrop();
         updateEmptyState();
     }
 
@@ -249,9 +343,13 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         inputArea.setToolTipText(placeholder());
         panel.add(new InputScrollPane(inputArea), BorderLayout.CENTER);
 
+        panel.add(quoteBar, BorderLayout.NORTH);
+
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         buttons.setOpaque(false);
+        buttons.add(imageButton);
         buttons.add(fileButton);
+        buttons.add(emojiButton);
         buttons.add(sendButton);
         buttons.add(clearButton);
         panel.add(buttons, BorderLayout.EAST);
@@ -261,9 +359,12 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         fileButton.setIconTextGap(6);
         fileButton.addActionListener(e -> chooseAndSendFile());
         clearButton.addActionListener(e -> clearHistory());
+        imageButton.addActionListener(e -> sendClipboardImage());
+        emojiButton.addActionListener(e -> showEmojiPicker());
 
         installInputBindings();
         installCompositionWatcher();
+        installMentionCompletion();
         // 文本区高度随内容行数变化，内容变了必须让父容器重新布局，
         // 否则输入区会停留在旧高度上把新行挤到看不见的位置
         inputArea.getDocument().addDocumentListener(new DocumentListener() {
@@ -271,11 +372,13 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             @Override
             public void insertUpdate(DocumentEvent e) {
                 inputArea.revalidate();
+                refreshMentionPopup();
             }
 
             @Override
             public void removeUpdate(DocumentEvent e) {
                 inputArea.revalidate();
+                refreshMentionPopup();
             }
 
             @Override
@@ -303,6 +406,11 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             @Override
             public void actionPerformed(ActionEvent e) {
                 if (isComposingInput()) {
+                    return;
+                }
+                // 候选窗打开时回车是"选中候选"而不是"发送"，否则补全根本无法用键盘确认
+                if (mentionPopup.isVisible()) {
+                    acceptMention();
                     return;
                 }
                 sendCurrentInput();
@@ -413,9 +521,77 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         if (text == null || text.trim().isEmpty()) {
             return;
         }
-        if (doSend(text.trim())) {
-            inputArea.setText("");
+        String content = text.trim();
+        boolean sent;
+        if (pendingQuoteId == null) {
+            sent = doSend(content);
+        } else {
+            sent = sendQuoted(content, pendingQuoteId, pendingQuoteSummary);
+            if (!sent) {
+                appendLine("[系统] 当前会话暂不支持引用发送，请先取消引用", COLOR_ERROR);
+                return;
+            }
         }
+        if (sent) {
+            inputArea.setText("");
+            clearPendingQuote();
+        }
+    }
+
+    /**
+     * 发送带引用信息的消息。
+     *
+     * <p>默认返回 false 表示当前会话通道不支持引用：引用信息要随消息一起上线，
+     * 必须由客户端提供带引用参数的发送方法，子类在具备该能力时覆写本方法。
+     * 刻意不在基类里拼接正文，否则收端只能看到一段普通文本，引用就不再是结构化信息。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识
+     * @param quoteSummary 被引用消息的摘要
+     * @return 发送成功返回 true
+     */
+    protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
+        return false;
+    }
+
+    /**
+     * 当前会话是否支持引用发送。
+     *
+     * <p>只有支持时才给消息挂"引用"右键菜单，避免使用者点了却发不出去。</p>
+     *
+     * @return 支持返回 true
+     */
+    protected boolean isQuoteSupported() {
+        return false;
+    }
+
+    /**
+     * 获取待发送引用的被引用消息标识。
+     *
+     * @return 稳定消息标识，没有引用时为 null
+     */
+    protected String getPendingQuoteId() {
+        return pendingQuoteId;
+    }
+
+    /**
+     * 获取待发送引用的摘要。
+     *
+     * @return 摘要文本，没有引用时为 null
+     */
+    protected String getPendingQuoteSummary() {
+        return pendingQuoteSummary;
+    }
+
+    /**
+     * 取消当前引用。
+     */
+    protected void clearPendingQuote() {
+        pendingQuoteId = null;
+        pendingQuoteSummary = null;
+        quoteLabel.setText("");
+        quoteBar.setVisible(false);
+        revalidate();
     }
 
     /**
@@ -455,7 +631,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             return;
         }
         Entry entry = new Entry(null, text, false, true, null,
-                color == null ? COLOR_SYSTEM : color);
+                color == null ? COLOR_SYSTEM : color, null, null, false);
         runOnEdt(() -> {
             boolean stick = isAtBottom();
             entries.add(entry);
@@ -480,13 +656,21 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      */
     public void appendMessage(String prefix, String content, Color color) {
         String text = content == null ? "" : content;
-        boolean self = COLOR_SELF.equals(color);
-        boolean system = COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color);
-        Entry entry = new Entry(prefix, text, self, system, LocalDateTime.now(), color);
-        if (!system) {
+        appendEntry(new Entry(prefix, text, COLOR_SELF.equals(color),
+                COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color),
+                LocalDateTime.now(), color, null, null, false));
+    }
+
+    /**
+     * 把一条消息模型追加到聊天记录并滚动。
+     *
+     * @param entry 消息模型
+     */
+    private void appendEntry(Entry entry) {
+        if (!entry.system()) {
             // 指纹在渲染之前就登记：网络线程先到、历史补拉后到的情况下，
             // 补拉逻辑必须能立刻看出这条消息已经出现过
-            renderedKeys.add(messageKey(prefix, text));
+            renderedKeys.add(messageKey(entry.prefix(), entry.content()));
         }
         runOnEdt(() -> {
             boolean stick = isAtBottom();
@@ -511,7 +695,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             return;
         }
         Entry entry = new Entry(null, text, false, true, null,
-                color == null ? COLOR_SYSTEM : color);
+                color == null ? COLOR_SYSTEM : color, null, null, false);
         entries.add(0, entry);
         renderAll();
     }
@@ -536,7 +720,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
                 continue;
             }
             prepared.add(new Entry(item.who(), item.content(), item.self(), false,
-                    item.time(), COLOR_OTHER));
+                    item.time(), COLOR_OTHER, null, null, false));
         }
         if (prepared.isEmpty()) {
             return 0;
@@ -560,6 +744,480 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             messageList.repaint();
             updateEmptyState();
         });
+    }
+
+    /**
+     * 构建引用条。
+     *
+     * @param label 摘要标签
+     * @return 引用条面板，初始隐藏
+     */
+    private JPanel buildQuoteBar(JLabel label) {
+        label.setFont(Theme.fontSmall());
+        label.setForeground(Theme.TEXT);
+        JButton cancel = new SkinButton("取消引用", SkinButton.Kind.GHOST);
+        cancel.setFont(Theme.fontSmall());
+        cancel.addActionListener(e -> clearPendingQuote());
+        JPanel bar = new JPanel(new BorderLayout(6, 0));
+        bar.setBackground(Theme.PRIMARY_LIGHT);
+        bar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 3, 0, 0, Theme.PRIMARY),
+                BorderFactory.createEmptyBorder(3, 8, 3, 2)));
+        bar.add(label, BorderLayout.CENTER);
+        bar.add(cancel, BorderLayout.EAST);
+        bar.setVisible(false);
+        return bar;
+    }
+
+    /**
+     * 设置待发送的引用并显示引用条。
+     *
+     * @param messageId 被引用消息的稳定标识
+     * @param content   被引用消息的正文
+     */
+    private void setPendingQuote(String messageId, String content) {
+        pendingQuoteId = messageId;
+        pendingQuoteSummary = abbreviate(content);
+        quoteLabel.setText("引用：" + pendingQuoteSummary);
+        quoteBar.setVisible(true);
+        inputArea.requestFocusInWindow();
+        revalidate();
+    }
+
+    /**
+     * 把消息正文压缩成单行摘要。
+     *
+     * @param text 正文
+     * @return 单行摘要
+     */
+    private static String abbreviate(String text) {
+        String value = text == null ? "" : text.replace('\n', ' ').trim();
+        return value.length() <= QUOTE_SUMMARY_LIMIT
+                ? value : value.substring(0, QUOTE_SUMMARY_LIMIT) + "…";
+    }
+
+    /**
+     * 构建消息右键菜单。
+     *
+     * <p>目前只有"引用"一项。引用需要被引用消息的稳定标识，而历史记录响应里不带该标识，
+     * 因此只有实时收到的消息才有右键菜单，历史消息无法引用。</p>
+     *
+     * @param entry 消息模型
+     * @return 右键菜单
+     */
+    private JPopupMenu buildQuoteMenu(Entry entry) {
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem quote = new JMenuItem("引用");
+        quote.addActionListener(e -> setPendingQuote(entry.messageId(), entry.content()));
+        menu.add(quote);
+        return menu;
+    }
+
+    /**
+     * 安装拖拽发送：把文件拖到聊天窗口即按当前会话的接收方发送。
+     *
+     * <p>处理器同时挂在面板与消息列表上：消息列表占据了聊天区的大部分面积，
+     * 只挂在面板上时，鼠标位于列表上方会走"列表面板"的分发路径。</p>
+     */
+    private void installFileDrop() {
+        TransferHandler handler = new FileDropHandler();
+        setTransferHandler(handler);
+        messageList.setTransferHandler(handler);
+    }
+
+    /**
+     * 读取剪贴板图片，落地为临时 PNG 后走既有文件通道发送。
+     *
+     * <p>不新增二进制协议：图片与普通文件共用同一条传输链路，
+     * 服务端与接收端都不需要为图片做任何额外适配。</p>
+     */
+    protected void sendClipboardImage() {
+        try {
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            Transferable contents = clipboard.getContents(null);
+            if (contents == null || !contents.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+                appendLine("[系统] 剪贴板里没有图片，请先截图或复制一张图片", COLOR_SYSTEM);
+                return;
+            }
+            Object data = contents.getTransferData(DataFlavor.imageFlavor);
+            if (!(data instanceof Image)) {
+                appendLine("[系统] 剪贴板内容不是图片", COLOR_SYSTEM);
+                return;
+            }
+            File target = writeImageToTempFile((Image) data);
+            appendLine("[系统] 已把剪贴板图片保存为 " + target.getName() + "，正在通过文件通道发送", COLOR_SYSTEM);
+            sendFileTo(target);
+        } catch (UnsupportedFlavorException | IOException e) {
+            appendLine("[系统] 剪贴板图片发送失败：" + e.getMessage(), COLOR_ERROR);
+        } catch (RuntimeException e) {
+            // 无图形环境（例如无头运行）时取剪贴板会抛运行时异常，这里提示而不是让界面崩掉
+            appendLine("[系统] 当前环境无法读取剪贴板图片", COLOR_ERROR);
+        }
+    }
+
+    /**
+     * 把图片写成临时 PNG 文件。
+     *
+     * <p>文件名带时间戳，避免同一秒内多次截图互相覆盖；文件登记 {@code deleteOnExit} 作为兜底回收：
+     * 传输是异步的，发送方在读盘完成前删文件会让传输失败，因此不能在调用处立即删除。</p>
+     *
+     * @param image 剪贴板图片
+     * @return 临时文件
+     * @throws IOException 写盘失败时抛出
+     */
+    private static File writeImageToTempFile(Image image) throws IOException {
+        BufferedImage buffer = new BufferedImage(
+                Math.max(1, image.getWidth(null)), Math.max(1, image.getHeight(null)),
+                BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = buffer.createGraphics();
+        g.drawImage(image, 0, 0, null);
+        g.dispose();
+        File dir = new File(System.getProperty("java.io.tmpdir"), SHOT_DIR);
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IOException("无法创建临时目录: " + dir);
+        }
+        String stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
+        File target = new File(dir, "截图-" + stamp + ".png");
+        for (int index = 2; target.exists() && index < 100; index++) {
+            target = new File(dir, "截图-" + stamp + "-" + index + ".png");
+        }
+        ImageIO.write(buffer, "png", target);
+        target.deleteOnExit();
+        return target;
+    }
+
+    /**
+     * 弹出表情面板，选中后插入到输入区光标处。
+     */
+    protected void showEmojiPicker() {
+        JPopupMenu menu = new JPopupMenu();
+        JPanel grid = new JPanel(new GridLayout(0, EMOJI_COLUMNS, 2, 2));
+        grid.setBackground(Theme.CARD);
+        grid.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+        for (String emoji : EMOJIS) {
+            JButton button = new JButton(emoji);
+            button.setFont(emojiFont());
+            button.setPreferredSize(new Dimension(36, 32));
+            button.setFocusable(false);
+            button.setBorder(BorderFactory.createEmptyBorder());
+            button.setContentAreaFilled(false);
+            button.addActionListener(e -> {
+                insertEmoji(emoji);
+                menu.setVisible(false);
+                inputArea.requestFocusInWindow();
+            });
+            grid.add(button);
+        }
+        menu.add(grid);
+        Dimension size = menu.getPreferredSize();
+        // 输入区位于窗口底部，向上弹出才不会跑到屏幕外
+        menu.show(emojiButton, 0, -Math.max(0, size.height));
+    }
+
+    /**
+     * 选择能显示表情的字体。
+     *
+     * <p>主题字体是中文正文用字，通常不含彩色表情字形；直接用它画表情只会得到方框。
+     * 这里按平台常见表情字体依次探测，都不可用时退回主题字体：此时表情字符仍能被插入并随消息发出，
+     * 只是本机显示为缺字方框，接收端装了表情字体就能正常显示。</p>
+     *
+     * @return 表情字体
+     */
+    private static Font emojiFont() {
+        String[] candidates = {"Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
+                "Noto Emoji", "Symbola", "Segoe UI Symbol"};
+        try {
+            java.util.Set<String> available = new java.util.HashSet<>(java.util.Arrays.asList(
+                    java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
+                            .getAvailableFontFamilyNames()));
+            for (String candidate : candidates) {
+                if (available.contains(candidate)) {
+                    return new Font(candidate, Font.PLAIN, 18);
+                }
+            }
+        } catch (RuntimeException e) {
+            System.err.println("表情字体探测失败: " + e.getMessage());
+        }
+        return Theme.font(18, Font.PLAIN);
+    }
+
+    /**
+     * 把表情插入到输入区光标处。
+     *
+     * @param emoji 表情字符
+     */
+    protected void insertEmoji(String emoji) {
+        if (emoji == null || emoji.isEmpty()) {
+            return;
+        }
+        inputArea.replaceSelection(emoji);
+    }
+
+    /**
+     * 安装 @ 补全。
+     *
+     * <p>候选窗口不抢焦点，键盘事件仍由输入区处理，这样才能一边打字缩小候选范围、
+     * 一边用上下键与回车/Tab 选中。为此上下键在候选窗打开时改为切换候选，
+     * 关闭时交还给默认的光标移动动作。</p>
+     */
+    private void installMentionCompletion() {
+        mentionList.setFont(Theme.fontBase());
+        mentionList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        mentionList.setFocusable(false);
+        mentionList.setVisibleRowCount(MENTION_ROWS);
+        mentionPopup.setFocusable(false);
+        mentionPopup.setBorder(BorderFactory.createLineBorder(Theme.BORDER));
+        // 候选窗可能被"点击别处"关掉，关闭原因不止 hideMentionPopup 一条路径，
+        // 因此把焦点遍历键的恢复绑在弹出菜单自身的关闭事件上，避免 Tab 永久失效
+        mentionPopup.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
+                // 无需处理：打开时的准备工作在 showMentionPopup 里完成
+            }
+
+            @Override
+            public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {
+                inputArea.setFocusTraversalKeysEnabled(true);
+            }
+
+            @Override
+            public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {
+                inputArea.setFocusTraversalKeysEnabled(true);
+            }
+        });
+        JScrollPane scroll = new JScrollPane(mentionList);
+        scroll.setBorder(BorderFactory.createEmptyBorder());
+        scroll.setPreferredSize(new Dimension(MENTION_WIDTH, MENTION_ROWS * 22));
+        mentionPopup.add(scroll);
+
+        inputArea.addCaretListener(e -> refreshMentionPopup());
+        inputArea.addFocusListener(new FocusAdapter() {
+            @Override
+            public void focusLost(FocusEvent e) {
+                hideMentionPopup();
+            }
+        });
+
+        InputMap keyMap = inputArea.getInputMap(JComponent.WHEN_FOCUSED);
+        ActionMap actionMap = inputArea.getActionMap();
+        Action caretUp = actionMap.get(DefaultEditorKit.upAction);
+        Action caretDown = actionMap.get(DefaultEditorKit.downAction);
+        keyMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_UP, 0), ACTION_MENTION_UP);
+        keyMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, 0), ACTION_MENTION_DOWN);
+        keyMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_TAB, 0), ACTION_MENTION_TAB);
+        keyMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), ACTION_MENTION_HIDE);
+        actionMap.put(ACTION_MENTION_UP, new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (mentionPopup.isVisible()) {
+                    moveMentionSelection(-1);
+                } else if (caretUp != null) {
+                    caretUp.actionPerformed(e);
+                }
+            }
+        });
+        actionMap.put(ACTION_MENTION_DOWN, new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (mentionPopup.isVisible()) {
+                    moveMentionSelection(1);
+                } else if (caretDown != null) {
+                    caretDown.actionPerformed(e);
+                }
+            }
+        });
+        actionMap.put(ACTION_MENTION_TAB, new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (mentionPopup.isVisible()) {
+                    acceptMention();
+                } else {
+                    // 补全没打开时 Tab 仍然承担"跳到下一个控件"的职责
+                    inputArea.transferFocus();
+                }
+            }
+        });
+        actionMap.put(ACTION_MENTION_HIDE, new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                hideMentionPopup();
+            }
+        });
+    }
+
+    /**
+     * 刷新 @ 补全候选窗口。
+     */
+    private void refreshMentionPopup() {
+        if (inputArea.getWidth() <= 0 || composing) {
+            hideMentionPopup();
+            return;
+        }
+        MentionToken token = mentionTokenAt(inputArea.getText(), inputArea.getCaretPosition());
+        List<String> candidates = token == null
+                ? List.of() : matchCandidates(mentionCandidates(), token.prefix());
+        if (candidates.isEmpty()) {
+            hideMentionPopup();
+            return;
+        }
+        mentionList.setListData(candidates.toArray(new String[0]));
+        mentionList.setSelectedIndex(0);
+        showMentionPopup();
+    }
+
+    /**
+     * 弹出候选窗口。
+     */
+    private void showMentionPopup() {
+        if (mentionPopup.isVisible()) {
+            return;
+        }
+        try {
+            Rectangle2D caret = inputArea.modelToView2D(inputArea.getCaretPosition());
+            if (caret == null) {
+                return;
+            }
+            // Tab 默认是焦点切换键，被焦点管理器先截走；补全打开期间临时让出来
+            inputArea.setFocusTraversalKeysEnabled(false);
+            mentionPopup.show(inputArea, (int) caret.getX(), (int) (caret.getY() + caret.getHeight()));
+        } catch (BadLocationException e) {
+            // 光标位置必然落在文本范围内，这里只是防御
+            hideMentionPopup();
+        }
+    }
+
+    /**
+     * 关闭候选窗口。
+     */
+    private void hideMentionPopup() {
+        if (mentionPopup.isVisible()) {
+            mentionPopup.setVisible(false);
+        }
+    }
+
+    /**
+     * 移动候选选中项。
+     *
+     * @param delta 偏移量
+     */
+    private void moveMentionSelection(int delta) {
+        int size = mentionList.getModel().getSize();
+        if (size == 0) {
+            return;
+        }
+        int index = (mentionList.getSelectedIndex() + delta + size) % size;
+        mentionList.setSelectedIndex(index);
+        mentionList.ensureIndexIsVisible(index);
+    }
+
+    /**
+     * 用选中的候选替换光标前的 @ 片段。
+     */
+    private void acceptMention() {
+        String name = mentionList.getSelectedValue();
+        MentionToken token = name == null ? null
+                : mentionTokenAt(inputArea.getText(), inputArea.getCaretPosition());
+        if (token != null) {
+            inputArea.select(token.start(), inputArea.getCaretPosition());
+            inputArea.replaceSelection("@" + name + " ");
+        }
+        hideMentionPopup();
+    }
+
+    /**
+     * @ 补全候选来源，默认没有候选。
+     *
+     * <p>只有群聊有明确的成员名单，因此由子类覆写提供；私聊保持默认的空列表，
+     * 输入 @ 不会弹出任何窗口。</p>
+     *
+     * @return 候选名称列表
+     */
+    protected List<String> mentionCandidates() {
+        return List.of();
+    }
+
+    /**
+     * 在候选列表中按前缀筛选。
+     *
+     * <p>纯函数：不依赖界面状态，便于单独验算前缀匹配与前缀为空的边界。</p>
+     *
+     * @param candidates 全部候选
+     * @param prefix     光标前已经输入的 @ 之后的内容
+     * @return 命中的候选，最多 {@value #MENTION_MAX} 条
+     */
+    static List<String> matchCandidates(List<String> candidates, String prefix) {
+        String needle = prefix == null ? "" : prefix.toLowerCase();
+        List<String> result = new ArrayList<>();
+        if (candidates == null) {
+            return result;
+        }
+        for (String name : candidates) {
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            if (needle.isEmpty() || name.toLowerCase().startsWith(needle)) {
+                result.add(name);
+                if (result.size() >= MENTION_MAX) {
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 取出光标前正在输入的 @ 片段。
+     *
+     * <p>纯函数：只有"@ 位于词首、且中间没有空白"时才认为处于补全语境，
+     * 邮箱地址中间的 @ 不会误触发候选窗口。</p>
+     *
+     * @param text  输入框全文
+     * @param caret 光标位置
+     * @return @ 片段，不在补全语境时返回 null
+     */
+    static MentionToken mentionTokenAt(String text, int caret) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        int end = Math.max(0, Math.min(caret, text.length()));
+        int at = -1;
+        for (int index = end - 1; index >= 0; index--) {
+            char current = text.charAt(index);
+            if (current == '@') {
+                at = index;
+                break;
+            }
+            if (Character.isWhitespace(current)) {
+                return null;
+            }
+        }
+        if (at < 0 || (at > 0 && !Character.isWhitespace(text.charAt(at - 1)))) {
+            return null;
+        }
+        return new MentionToken(at, text.substring(at + 1, end));
+    }
+
+    /**
+     * 追加一条来自网络的真实消息。
+     *
+     * <p>与 {@link #appendMessage(String, String, Color)} 的区别：本方法额外接收原始消息对象，
+     * 因而能拿到稳定标识（用于引用）与引用摘要（用于渲染引用块），
+     * 以及是否被 @ 提及（用于高亮）。</p>
+     *
+     * @param prefix  发送者显示名
+     * @param content 正文
+     * @param color   来源颜色
+     * @param message 原始消息对象，可为 null
+     * @param mention 是否被 @ 提及
+     */
+    protected void appendIncoming(String prefix, String content, Color color, Message message,
+                                  boolean mention) {
+        String text = content == null ? "" : content;
+        String messageId = message == null ? null : message.getMessageId();
+        String quote = message instanceof TextMessage ? ((TextMessage) message).getQuoteSummary() : null;
+        appendEntry(new Entry(prefix, text, COLOR_SELF.equals(color),
+                COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color),
+                LocalDateTime.now(), color, messageId, quote, mention));
     }
 
     /**
@@ -615,6 +1273,15 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             bubble = MessageBubble.self(entry.content(), entry.time());
         } else {
             bubble = MessageBubble.other(entry.prefix(), entry.content(), entry.time());
+        }
+        if (entry.quoteSummary() != null && !entry.quoteSummary().isEmpty()) {
+            bubble.setQuoteText(entry.quoteSummary());
+        }
+        if (entry.highlight()) {
+            bubble.setHighlighted(true);
+        }
+        if (isQuoteSupported() && entry.messageId() != null && !entry.messageId().isEmpty()) {
+            bubble.setComponentPopupMenu(buildQuoteMenu(entry));
         }
         bubble.setAvailableWidth(messageList.getWidth() > 0
                 ? messageList.getWidth() : FALLBACK_LIST_WIDTH);
@@ -764,15 +1431,79 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /**
      * 消息模型条目。
      *
-     * @param prefix  发送者显示名
-     * @param content 正文
-     * @param self    是否本人发送
-     * @param system  是否系统提示
-     * @param time    消息时间，系统提示为 null
-     * @param color   系统提示文字颜色
+     * @param prefix       发送者显示名
+     * @param content      正文
+     * @param self         是否本人发送
+     * @param system       是否系统提示
+     * @param time         消息时间，系统提示为 null
+     * @param color        系统提示文字颜色
+     * @param messageId    跨端稳定消息标识，仅实时收到的消息有，用于引用
+     * @param quoteSummary 被引用消息摘要，无引用时为 null
+     * @param highlight    是否高亮（被 @ 提及）
      */
     private record Entry(String prefix, String content, boolean self, boolean system,
-                         LocalDateTime time, Color color) {
+                         LocalDateTime time, Color color, String messageId,
+                         String quoteSummary, boolean highlight) {
+    }
+
+    /**
+     * 光标前正在输入的 @ 片段。
+     *
+     * @param start  {@code @} 字符所在下标
+     * @param prefix {@code @} 与光标之间的内容
+     */
+    record MentionToken(int start, String prefix) {
+    }
+
+    /**
+     * 文件拖拽处理器：接受文件列表，交给当前会话的接收方策略发送。
+     *
+     * <p>只认 {@code javaFileListFlavor}：文本、图片等其它拖拽内容直接拒绝（返回 false），
+     * 由系统显示"不可放置"光标，不会弹出任何错误提示，也就不会打断正在进行的输入。</p>
+     */
+    private final class FileDropHandler extends TransferHandler {
+
+        /** 序列化版本号 */
+        private static final long serialVersionUID = 20250122L;
+
+        @Override
+        public int getSourceActions(JComponent component) {
+            return COPY;
+        }
+
+        @Override
+        public boolean canImport(TransferSupport support) {
+            return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+        }
+
+        @Override
+        public boolean importData(TransferSupport support) {
+            if (!canImport(support)) {
+                return false;
+            }
+            try {
+                Object data = support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                if (!(data instanceof List)) {
+                    return false;
+                }
+                int count = 0;
+                for (Object item : (List<?>) data) {
+                    if (item instanceof File && ((File) item).isFile()) {
+                        sendFileTo((File) item);
+                        count++;
+                    }
+                }
+                if (count == 0) {
+                    appendLine("[系统] 拖入的内容里没有可发送的文件", COLOR_SYSTEM);
+                    return false;
+                }
+                appendLine("[系统] 已接收拖入的 " + count + " 个文件，正在发起传输", COLOR_SYSTEM);
+                return true;
+            } catch (UnsupportedFlavorException | IOException e) {
+                appendLine("[系统] 拖入的文件读取失败：" + e.getMessage(), COLOR_ERROR);
+                return false;
+            }
+        }
     }
 
     /**

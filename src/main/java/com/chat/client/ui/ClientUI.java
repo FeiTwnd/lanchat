@@ -17,16 +17,18 @@ import com.chat.common.UserListCodec;
 import com.chat.util.MessageExporter;
 
 import javax.swing.BorderFactory;
+import javax.swing.JDialog;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
+import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.Timer;
+import javax.swing.table.DefaultTableModel;
 import java.awt.BorderLayout;
-import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -83,14 +85,6 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
     /** 等待服务端返回导出内容的超时时间（毫秒） */
     private static final int EXPORT_TIMEOUT_MS = 10000;
 
-    /**
-     * 发送状态提示行的颜色。
-     *
-     * <p>与聊天面板中的系统通知色保持一致，但面板里的常量是受保护成员，
-     * 主窗口无法直接引用；此处独立定义可避免为了取色而把面板的继承关系暴露给主窗口。</p>
-     */
-    private static final Color STATUS_COLOR = new Color(0x9E9E9E);
-
     /** 客户端实例 */
     private final transient ChatClient client;
 
@@ -124,6 +118,34 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
      * 断线时间稍长就会把聊天记录刷满状态行；本标志保证一次断线只在面板里留下一行提示。</p>
      */
     private transient boolean panelsNotifiedDisconnect;
+
+    /** 撤回时限（毫秒）：与服务端一致，只有本人 2 分钟内发出的消息可撤回 */
+    private static final long RECALL_WINDOW_MS = 2 * 60 * 1000L;
+
+    /**
+     * 气泡索引的保留时长（毫秒）。
+     *
+     * <p>取得比撤回时限更宽松，是为了容忍客户端与服务端的时钟偏差：
+     * 客户端认为"刚到 2 分钟"而服务端认为"还能撤回"时，索引若已被清理，
+     * 界面就会失去撤回入口，用户只能看到服务端的成功回执却找不到被改的气泡。</p>
+     */
+    private static final long BUBBLE_KEEP_MS = 10 * 60 * 1000L;
+
+    /** 历史分页请求的每页条数，与设计文档一致 */
+    private static final String HISTORY_PAGE_SIZE = "50";
+
+    /** 历史分页游标行的前缀，该行由服务端附在正文中，仅用于翻页、不渲染 */
+    private static final String HISTORY_CURSOR_PREFIX = "#beforeId=";
+
+    /** 气泡索引：messageId -> 气泡信息，用于撤回时定位并替换聊天气泡 */
+    private final transient Map<String, BubbleRef> bubbleIndex = new ConcurrentHashMap<>();
+
+    /** 历史游标：对端用户名 -> 上一页最小主键，用于"加载更早的消息" */
+    private final transient Map<String, String> historyCursors = new ConcurrentHashMap<>();
+
+    /** 已发起"加载更早的消息"的对端集合，用于区分首次加载与向前翻页 */
+    private final transient java.util.Set<String> earlierRequests =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** 在线用户树（按角色分组、头像区分在线离线、支持关键字过滤） */
     private final OnlineUserTree userTree = new OnlineUserTree();
@@ -305,6 +327,10 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         panel.add(groupButton);
         panel.add(SkinButton.menu("查询聊天记录…", Glyphs.history(18, Theme.PRIMARY),
                 e -> showHistoryDialog()));
+        panel.add(SkinButton.menu("搜索聊天记录…", Glyphs.search(18, Theme.PRIMARY),
+                e -> searchHistory()));
+        panel.add(SkinButton.menu("撤回消息…", Glyphs.trash(18, Theme.DANGER),
+                e -> recallMessage()));
         panel.add(SkinButton.menu("导出我的聊天记录", Glyphs.export(18, Theme.PRIMARY),
                 e -> exportHistory()));
         panel.add(SkinButton.menu("修改昵称…", Glyphs.user(18, Theme.PRIMARY),
@@ -429,7 +455,10 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         if (window == null) {
             window = new PrivateChatUI(client, username);
             privateWindows.put(username, window);
-            // 新建窗口时补拉与该用户的最近对话：面板里的内容只存在于内存，
+            // 顶部翻页入口由主窗口装配：聊天面板保持"只负责渲染"的单一职责，
+            // 翻页所需的游标由主窗口在与服务端交互时掌握
+            window.getPanel().add(buildEarlierPanel(username), BorderLayout.NORTH);
+            // 新建窗口时补拉与该用户的最近一页对话：面板里的内容只存在于内存，
             // 关闭窗口或重启客户端后若不补拉，使用者会以为对方的消息丢了
             client.requestHistory(client.getUsername(), "", "", username);
         }
@@ -733,6 +762,13 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             case HISTORY_RESULT:
                 onEdt(() -> showHistoryResult((TextMessage) message));
                 break;
+            case SEARCH_RESULT:
+                onEdt(() -> showSearchResult((TextMessage) message));
+                break;
+            case MSG_RECALL:
+                // 撤回请求可能由本端发起（OK/FAIL），也可能是对端撤回后的通知（PEER）
+                onEdt(() -> handleRecallNotice((TextMessage) message));
+                break;
             case EXPORT_RESULT:
                 onEdt(() -> saveExportResult((TextMessage) message));
                 break;
@@ -774,7 +810,13 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             return;
         }
         // 走到这里发送者必然是对端，会话键直接取它即可
-        onEdt(() -> openPrivateWindow(sender).getPanel().onMessage(message));
+        String content = message.getContent() == null ? "" : message.getContent();
+        onEdt(() -> {
+            PrivateChatPanel panel = openPrivateWindow(sender).getPanel();
+            panel.onMessage(message);
+            // 登记气泡：对端撤回时需要按消息标识找到这一行并替换为撤回提示
+            rememberBubble(message.getMessageId(), sender, content, false);
+        });
     }
 
     /**
@@ -886,8 +928,14 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             return;
         }
         List<String[]> records = new java.util.ArrayList<>();
+        String cursor = null;
         for (int i = 1; i < lines.length; i++) {
             if (lines[i].isEmpty()) {
+                continue;
+            }
+            if (lines[i].startsWith(HISTORY_CURSOR_PREFIX)) {
+                // 游标行只用于翻页，绝不渲染进聊天记录
+                cursor = lines[i].substring(HISTORY_CURSOR_PREFIX.length()).trim();
                 continue;
             }
             // 正文里可能含竖线，限制切分次数可保证它完整落在最后一个字段
@@ -897,7 +945,443 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             }
             records.add(new String[]{fields[0], fields[1], fields[3]});
         }
-        window.getPanel().fillHistory(records);
+        if (cursor != null) {
+            historyCursors.put(peer, cursor);
+        }
+        PrivateChatPanel panel = window.getPanel();
+        boolean paged = earlierRequests.remove(peer);
+        JScrollPane scroll = scrollPaneOf(panel);
+        int oldValue = scroll == null ? 0 : scroll.getVerticalScrollBar().getValue();
+        int oldMax = scroll == null ? 0 : scroll.getVerticalScrollBar().getMaximum();
+        panel.fillHistory(records);
+        if (!paged || scroll == null) {
+            return;
+        }
+        // 向前翻页后把视口同步下移"新增内容的像素高度"，使用者正在看的那一行就不会跳动
+        final JScrollPane target = scroll;
+        final int shift = oldValue + (target.getVerticalScrollBar().getMaximum() - oldMax);
+        // 必须等布局完成，否则新插入的行还没被计入滚动范围，补偿量会偏小
+        javax.swing.SwingUtilities.invokeLater(() -> target.getVerticalScrollBar().setValue(shift));
+    }
+
+    /**
+     * 在容器中查找聊天记录滚动面板。
+     *
+     * @param container 容器（聊天面板）
+     * @return 滚动面板；未找到返回 null
+     */
+    private JScrollPane scrollPaneOf(java.awt.Container container) {
+        for (java.awt.Component component : container.getComponents()) {
+            if (component instanceof JScrollPane) {
+                return (JScrollPane) component;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 构建聊天窗口顶部的"加载更早的消息"入口。
+     *
+     * <p>刻意放在聊天区上方而不是底部：更早的记录会插入到聊天区顶部，
+     * 入口与其作用位置在同一侧，使用者不必先把滚动条拖到顶部再找按钮。</p>
+     *
+     * @param peer 对端用户名
+     * @return 面板
+     */
+    private JPanel buildEarlierPanel(String peer) {
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.CENTER, 6, 2));
+        panel.setOpaque(false);
+        panel.add(SkinButton.normal("加载更早的消息", e -> loadEarlierMessages(peer)));
+        return panel;
+    }
+
+    /**
+     * 按当前游标向前加载一页历史记录。
+     *
+     * @param peer 对端用户名
+     */
+    private void loadEarlierMessages(String peer) {
+        String cursor = historyCursors.get(peer);
+        if (cursor == null || cursor.isEmpty()) {
+            // 没有游标说明服务端已经表示"没有更早的记录"，或首次加载还没回来
+            statusLabel.setText("没有更早的消息了");
+            return;
+        }
+        earlierRequests.add(peer);
+        if (!client.requestHistory(client.getUsername(), "", "", peer, cursor, HISTORY_PAGE_SIZE)) {
+            earlierRequests.remove(peer);
+            showError("加载更早的消息失败，请检查与服务端的连接");
+            return;
+        }
+        statusLabel.setText("正在加载更早的消息……");
+    }
+
+    /**
+     * 弹出关键字输入框并提交搜索请求。
+     */
+    private void searchHistory() {
+        String keyword = JOptionPane.showInputDialog(this, "请输入要搜索的关键字:", "");
+        if (keyword == null || keyword.trim().isEmpty()) {
+            return;
+        }
+        if (!client.requestSearch(keyword.trim())) {
+            showError("搜索请求发送失败，请检查与服务端的连接");
+            return;
+        }
+        statusLabel.setText("正在搜索聊天记录……");
+    }
+
+    /**
+     * 展示搜索结果。
+     *
+     * <p>正文格式：成功为 {@code 1|条数} 加若干行 {@code 时间|发送者|接收者|正文}，
+     * 失败为 {@code 0|中文原因}。</p>
+     *
+     * @param message 搜索结果消息
+     */
+    private void showSearchResult(TextMessage message) {
+        String content = message.getContent() == null ? "" : message.getContent();
+        String[] lines = content.split("\n", -1);
+        String[] head = lines.length > 0 ? lines[0].split("\\|", -1) : new String[]{"0", "无数据"};
+        if (head.length < 2 || !"1".equals(head[0])) {
+            statusLabel.setText("搜索失败");
+            showError("搜索失败: " + (head.length > 1 ? head[1] : "未知原因"));
+            return;
+        }
+        List<String[]> hits = new java.util.ArrayList<>();
+        for (int i = 1; i < lines.length; i++) {
+            if (lines[i].isEmpty()) {
+                continue;
+            }
+            // 正文可能含竖线，限制切分次数可保证它完整落在最后一个字段
+            String[] fields = lines[i].split("\\|", 4);
+            if (fields.length < 4) {
+                continue;
+            }
+            hits.add(fields);
+        }
+        statusLabel.setText("搜索完成，共 " + head[1] + " 条命中");
+        if (hits.isEmpty()) {
+            showInfo("没有找到匹配的聊天记录");
+            return;
+        }
+        showSearchDialog(head[1], hits);
+    }
+
+    /**
+     * 用非模态对话框展示搜索结果表格。
+     *
+     * <p>刻意不用模态对话框：双击结果行要打开对应会话窗口，
+     * 模态对话框会把新窗口压在下面，使用者看不到"跳转"的结果。</p>
+     *
+     * @param count 命中条数（服务端给出，原样展示）
+     * @param hits  命中记录，每项为 {@code {时间, 发送者, 接收者, 正文}}
+     */
+    private void showSearchDialog(String count, List<String[]> hits) {
+        Object[][] rows = new Object[hits.size()][4];
+        for (int i = 0; i < hits.size(); i++) {
+            String[] fields = hits.get(i);
+            rows[i] = new Object[]{fields[0], fields[1], fields[2], fields[3]};
+        }
+        DefaultTableModel model = new DefaultTableModel(rows,
+                new Object[]{"时间", "发送者", "接收者", "内容"}) {
+
+            /** 序列化版本号 */
+            private static final long serialVersionUID = 20260921L;
+
+            /**
+             * 禁止直接编辑单元格。
+             *
+             * @param row    行号
+             * @param column 列号
+             * @return 恒为 false
+             */
+            @Override
+            public boolean isCellEditable(int row, int column) {
+                return false;
+            }
+        };
+        JTable table = new JTable(model);
+        table.setAutoCreateRowSorter(true);
+        table.setFont(FONT_NORMAL);
+        table.setRowHeight(24);
+        table.addMouseListener(new MouseAdapter() {
+
+            /**
+             * 双击结果行跳转到对应会话。
+             *
+             * @param e 鼠标事件
+             */
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() != 2) {
+                    return;
+                }
+                int row = table.rowAtPoint(e.getPoint());
+                if (row < 0) {
+                    return;
+                }
+                // 表格支持排序，必须把视图行号换算成模型行号再取值
+                int modelRow = table.convertRowIndexToModel(row);
+                jumpToSearchHit(String.valueOf(model.getValueAt(modelRow, 1)),
+                        String.valueOf(model.getValueAt(modelRow, 2)));
+            }
+        });
+
+        JLabel tip = new JLabel("共 " + count + " 条命中，双击某行可跳转到对应会话");
+        tip.setFont(Theme.fontSmall());
+        tip.setForeground(Theme.TEXT_WEAK);
+        JPanel content = new JPanel(new BorderLayout(0, 6));
+        content.setBackground(Theme.CARD);
+        content.setBorder(BorderFactory.createEmptyBorder(8, 8, 0, 8));
+        content.add(tip, BorderLayout.NORTH);
+        content.add(new JScrollPane(table), BorderLayout.CENTER);
+
+        JDialog dialog = new JDialog(this, "搜索结果", false);
+        dialog.setLayout(new BorderLayout());
+        dialog.add(content, BorderLayout.CENTER);
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        actions.setBackground(Theme.CARD);
+        actions.add(SkinButton.normal("关闭", event -> dialog.dispose()));
+        dialog.add(actions, BorderLayout.SOUTH);
+        dialog.setSize(780, 460);
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    /**
+     * 从搜索命中记录跳转到对应会话。
+     *
+     * @param sender   记录中的发送者
+     * @param receiver 记录中的接收者
+     */
+    private void jumpToSearchHit(String sender, String receiver) {
+        String self = client.getUsername();
+        String peer;
+        if (self.equals(sender)) {
+            peer = receiver;
+        } else if (self.equals(receiver)) {
+            peer = sender;
+        } else {
+            showInfo("这条记录不属于当前账号的私聊会话，无法跳转");
+            return;
+        }
+        if (peer == null || peer.isEmpty() || Constants.BROADCAST_TAG.equals(peer) || self.equals(peer)) {
+            // 群聊记录没有单一会话对象，打开私聊窗口没有意义
+            showInfo("该消息为群聊消息，无法定位到私聊窗口，请在群聊大厅查看");
+            return;
+        }
+        openPrivateWindow(peer);
+        statusLabel.setText("已打开与 " + peer + " 的会话");
+    }
+
+    /**
+     * 处理撤回相关通知。
+     *
+     * <p>三种正文：{@code OK|messageId} 表示本人撤回成功，
+     * {@code FAIL|messageId|中文原因} 表示服务端拒绝，
+     * {@code PEER|messageId|发送者} 表示对端撤回了某条消息。</p>
+     *
+     * @param message 撤回通知
+     */
+    private void handleRecallNotice(TextMessage message) {
+        String content = message.getContent() == null ? "" : message.getContent();
+        String[] fields = content.split("\\|", 3);
+        if (fields.length < 2 || fields[1].trim().isEmpty()) {
+            LOGGER.warning("撤回通知格式非法，已忽略");
+            return;
+        }
+        String state = fields[0].trim();
+        String messageId = fields[1].trim();
+        BubbleRef known = bubbleIndex.get(messageId);
+        if ("OK".equals(state)) {
+            if (!replaceBubble(messageId, "你撤回了一条消息")) {
+                appendRecallLine(known == null ? null : known.peer, "你撤回了一条消息");
+            }
+            statusLabel.setText("消息已撤回");
+        } else if ("FAIL".equals(state)) {
+            String reason = fields.length > 2 && !fields[2].trim().isEmpty()
+                    ? fields[2].trim() : "未知原因";
+            statusLabel.setText("撤回失败");
+            showError("撤回失败：" + reason);
+        } else if ("PEER".equals(state)) {
+            String sender = fields.length > 2 && !fields[2].trim().isEmpty()
+                    ? fields[2].trim() : (known == null ? "对方" : known.peer);
+            if (!replaceBubble(messageId, "对方撤回了一条消息")) {
+                appendRecallLine(sender, "对方撤回了一条消息");
+            }
+            statusLabel.setText(sender + " 撤回了一条消息");
+        } else {
+            LOGGER.warning(() -> "未知的撤回通知状态: " + state);
+        }
+    }
+
+    /**
+     * 把对应气泡替换为撤回提示。
+     *
+     * <p>气泡由 {@link MessageBubble} 绘制，其正文是一个只读的 {@code JTextArea}。
+     * 这里只通过组件树与公开方法定位并改写它，不访问聊天面板的私有字段：
+     * 面板怎么组织气泡属于它的实现细节，主窗口依赖"气泡正文可被替换"这一最小约定。
+     * 定位失败时返回 false，由调用方降级为追加一行系统提示，保证撤回结果一定可见。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param newText   替换后的文本
+     * @return 完成替换返回 true；找不到气泡返回 false
+     */
+    private boolean replaceBubble(String messageId, String newText) {
+        BubbleRef ref = bubbleIndex.get(messageId);
+        if (ref == null) {
+            return false;
+        }
+        PrivateChatUI window = privateWindows.get(ref.peer);
+        if (window == null) {
+            return false;
+        }
+        MessageBubble bubble = findBubble(window.getPanel(), ref.content, ref.mine);
+        if (bubble == null) {
+            return false;
+        }
+        JTextArea body = findContentArea(bubble);
+        if (body == null) {
+            return false;
+        }
+        body.setText(newText);
+        body.setForeground(BaseChatPanel.COLOR_SYSTEM);
+        bubble.setStatusText("已撤回");
+        bubble.revalidate();
+        bubble.repaint();
+        bubbleIndex.remove(messageId);
+        return true;
+    }
+
+    /**
+     * 在组件树中查找指定正文的气泡。
+     *
+     * @param container 容器
+     * @param content   消息正文
+     * @param mine      是否为本人发送的气泡
+     * @return 匹配的气泡；未找到返回 null
+     */
+    private MessageBubble findBubble(java.awt.Container container, String content, boolean mine) {
+        for (java.awt.Component component : container.getComponents()) {
+            if (component instanceof MessageBubble) {
+                MessageBubble bubble = (MessageBubble) component;
+                boolean self = bubble.getKind() == MessageBubble.Kind.SELF;
+                if (self == mine && content.equals(bubble.getContentText())) {
+                    return bubble;
+                }
+            }
+            if (component instanceof java.awt.Container) {
+                MessageBubble found = findBubble((java.awt.Container) component, content, mine);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 在气泡内部查找承载正文的文本区。
+     *
+     * @param container 气泡组件
+     * @return 正文文本区；未找到返回 null
+     */
+    private JTextArea findContentArea(java.awt.Container container) {
+        for (java.awt.Component component : container.getComponents()) {
+            if (component instanceof JTextArea) {
+                return (JTextArea) component;
+            }
+            if (component instanceof java.awt.Container) {
+                JTextArea found = findContentArea((java.awt.Container) component);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 在对应会话窗口写入一行撤回提示。
+     *
+     * <p>这是气泡替换失败时的降级路径：即使界面结构变化导致找不到目标气泡，
+     * 使用者也一定能看到"已撤回"的结果，而不是点了撤回却毫无反馈。</p>
+     *
+     * @param peer 对端用户名，可为 null
+     * @param text 提示文本
+     */
+    private void appendRecallLine(String peer, String text) {
+        if (peer == null) {
+            return;
+        }
+        PrivateChatUI window = privateWindows.get(peer);
+        if (window != null) {
+            window.getPanel().appendLine("[系统] " + text, BaseChatPanel.COLOR_SYSTEM);
+        }
+    }
+
+    /**
+     * 弹出可撤回消息列表并提交撤回请求。
+     *
+     * <p>撤回入口放在主窗口菜单而不是聊天气泡右键：气泡菜单由聊天面板实现，
+     * 而"哪条消息是本机刚发出、是否还在 2 分钟内"这类信息只有掌握发送状态的
+     * 主窗口知道，放在这里可以避免两处各记一份而互相矛盾。</p>
+     */
+    private void recallMessage() {
+        long now = System.currentTimeMillis();
+        List<Map.Entry<String, BubbleRef>> candidates = new java.util.ArrayList<>();
+        for (Map.Entry<String, BubbleRef> entry : bubbleIndex.entrySet()) {
+            BubbleRef ref = entry.getValue();
+            if (ref.mine && now - ref.createdAt <= RECALL_WINDOW_MS) {
+                candidates.add(entry);
+            }
+        }
+        if (candidates.isEmpty()) {
+            showInfo("最近 2 分钟内没有可撤回的消息");
+            return;
+        }
+        candidates.sort((left, right) ->
+                Long.compare(right.getValue().createdAt, left.getValue().createdAt));
+        String[] options = new String[candidates.size()];
+        for (int i = 0; i < candidates.size(); i++) {
+            BubbleRef ref = candidates.get(i).getValue();
+            options[i] = "发给 " + ref.peer + "：" + ref.content;
+        }
+        Object choice = JOptionPane.showInputDialog(this, "选择要撤回的消息（仅限 2 分钟内发送）:",
+                "撤回消息", JOptionPane.PLAIN_MESSAGE, null, options, options[0]);
+        if (choice == null) {
+            return;
+        }
+        for (int i = 0; i < options.length; i++) {
+            if (options[i].equals(choice)) {
+                if (!client.requestRecall(candidates.get(i).getKey())) {
+                    showError("撤回请求发送失败，请检查与服务端的连接");
+                } else {
+                    statusLabel.setText("撤回请求已发送……");
+                }
+                return;
+            }
+        }
+    }
+
+    /**
+     * 登记一个气泡，供撤回时定位。
+     *
+     * @param messageId 稳定消息标识
+     * @param peer      对端用户名
+     * @param content   消息正文
+     * @param mine      是否本人发送
+     */
+    private void rememberBubble(String messageId, String peer, String content, boolean mine) {
+        if (messageId == null || messageId.isEmpty() || peer == null || content == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long deadline = now - BUBBLE_KEEP_MS;
+        // 索引只在"可能被撤回"的时间窗内有用，过期即清理，避免长会话下无限增长
+        bubbleIndex.entrySet().removeIf(entry -> entry.getValue().createdAt < deadline);
+        bubbleIndex.put(messageId, new BubbleRef(peer, content, mine, now));
     }
 
     /**
@@ -916,8 +1400,12 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             return;
         }
         String content = message.getContent() == null ? "" : message.getContent();
-        onEdt(() -> openPrivateWindow(sender).getPanel()
-                .appendMessage(sender + "（离线消息）", content, STATUS_COLOR));
+        onEdt(() -> {
+            PrivateChatPanel panel = openPrivateWindow(sender).getPanel();
+            panel.appendMessage(sender + "（离线消息）", content, BaseChatPanel.COLOR_OTHER);
+            // 离线消息同样登记气泡：对方撤回时也要能把这一行替换掉
+            rememberBubble(message.getMessageId(), sender, content, false);
+        });
     }
 
     /**
@@ -979,6 +1467,13 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         // 与连接状态同理：对端用户名要在网络线程上取，切到事件分发线程后记录可能已被清理
         String peer = client.getMessageReceiver(messageId);
         String text = sendStateText(state, detail);
+        if (state == ChatClient.SendState.SENDING) {
+            // 本地回显由聊天面板负责渲染，这里只登记索引：撤回时界面需要凭消息标识找到那一行
+            String content = client.getMessageContent(messageId);
+            if (content != null) {
+                rememberBubble(messageId, peer, content, true);
+            }
+        }
         onEdt(() -> {
             statusLabel.setText(text);
             boolean noteworthy = state == ChatClient.SendState.OFFLINE
@@ -988,7 +1483,7 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             }
             PrivateChatUI window = privateWindows.get(peer);
             if (window != null) {
-                window.getPanel().appendLine("[系统] " + text, STATUS_COLOR);
+                window.getPanel().appendLine("[系统] " + text, BaseChatPanel.COLOR_SYSTEM);
             }
         });
     }
@@ -1034,7 +1529,47 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         // 文件传输窗口由静态注册表管理，不在上面两个集合里，需要单独关闭
         FileTransferUI.disposeAll();
         client.close();
+        bubbleIndex.clear();
+        historyCursors.clear();
+        earlierRequests.clear();
         super.dispose();
+    }
+
+    /**
+     * 聊天气泡的索引信息。
+     *
+     * <p>撤回要在界面上精确定位"哪一行是目标消息"，而聊天记录控件只保存纯文本，
+     * 本身不带消息标识；索引把标识与"哪段正文属于哪个会话"对应起来，
+     * 用正文反向定位行比记录行号更稳——补拉历史或插入行都会让行号失效。</p>
+     */
+    private static final class BubbleRef {
+
+        /** 气泡所属会话的对端用户名 */
+        private final String peer;
+
+        /** 消息正文（用于在聊天记录中定位该行） */
+        private final String content;
+
+        /** 是否为本人发出的消息 */
+        private final boolean mine;
+
+        /** 记录时刻（毫秒），用于判断是否还在撤回时限内 */
+        private final long createdAt;
+
+        /**
+         * 构造气泡索引项。
+         *
+         * @param peer      对端用户名
+         * @param content   消息正文
+         * @param mine      是否本人发送
+         * @param createdAt 记录时刻
+         */
+        private BubbleRef(String peer, String content, boolean mine, long createdAt) {
+            this.peer = peer;
+            this.content = content;
+            this.mine = mine;
+            this.createdAt = createdAt;
+        }
     }
 
     /**

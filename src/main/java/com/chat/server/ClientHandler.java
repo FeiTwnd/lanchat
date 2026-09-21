@@ -26,7 +26,6 @@ import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -86,6 +85,21 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * 积压过多时宁可分批（下次登录继续），也不能让登录本身长时间卡住。</p>
      */
     private static final int OFFLINE_PUSH_LIMIT = 200;
+
+    /** 下发最后一帧回执后排空接收队列的等待上限（毫秒），超时即关闭连接 */
+    private static final int REPLY_CLOSE_DRAIN_MILLIS = 300;
+
+    /** 历史记录分页的默认每页条数，与数据访问层的默认值保持一致 */
+    private static final int HISTORY_PAGE_DEFAULT_LIMIT = 50;
+
+    /** 历史记录分页每页条数的下限：至少要能取到一条记录才有意义 */
+    private static final int HISTORY_PAGE_MIN_LIMIT = 1;
+
+    /** 历史记录分页每页条数的上限，与数据访问层的单次查询上限保持一致 */
+    private static final int HISTORY_PAGE_MAX_LIMIT = 200;
+
+    /** 历史查询响应中分页游标行的前缀，客户端据此识别并跳过该行 */
+    private static final String HISTORY_CURSOR_PREFIX = "#beforeId=";
 
     /**
      * 本连接已下发、等待客户端确认的离线消息标识。
@@ -752,6 +766,20 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                     rejectTextRequirement(message);
                 }
                 break;
+            case SEARCH_REQUEST:
+                if (message instanceof TextMessage text) {
+                    handleSearchRequest(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
+                break;
+            case MSG_RECALL:
+                if (message instanceof TextMessage text) {
+                    handleRecallRequest(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
+                break;
             case EXPORT_REQUEST:
                 handleExportRequest(socket);
                 break;
@@ -934,14 +962,14 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (name == null) {
             LOGGER.warning(() -> "会话令牌无效或已过期，拒绝恢复: " + getRemoteAddress());
             sendSessionResumeResult("EXPIRED|会话令牌无效或已过期，请重新登录");
-            close();
+            closeAfterReply();
             return;
         }
         Result<User> found = server.getUserService().findByUsername(name);
         if (!found.isSuccess()) {
             LOGGER.warning(() -> "会话恢复失败，用户已不存在: " + name + " - " + found.getMessage());
             sendSessionResumeResult("EXPIRED|用户不存在或已被删除，请重新登录");
-            close();
+            closeAfterReply();
             return;
         }
         // 必须先清掉同一用户名的旧连接：重连时旧连接往往只是心跳失联而未被服务端判定超时，
@@ -954,7 +982,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (!server.getUserManager().register(user, this)) {
             LOGGER.warning(() -> "会话恢复时注册失败: " + name);
             sendSessionResumeResult("EXPIRED|该账号已在其它位置登录，请重新登录");
-            close();
+            closeAfterReply();
             return;
         }
         this.username = name;
@@ -977,6 +1005,35 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 username == null ? "" : username, content, MessageType.TEXT_PRIVATE);
         response.setType(MessageType.SESSION_RESUME);
         send(response);
+    }
+
+    /**
+     * 回执下发完成后关闭连接。
+     *
+     * <p>为什么不能直接 {@link #close()}：对端刚发来的报文在接收队列里往往还留有未读字节
+     * （对象流每次 {@code reset()} 后会补发一个控制字节），此时关闭套接字会让内核发出 RST，
+     * 而 RST 会把尚未被应用读取的最后一帧一并丢弃——客户端读到的是“连接重置”而不是
+     * EXPIRED 回执，也就无法区分“会话过期”与“网络断开”。因此先 {@code shutdownOutput()}
+     * 让已写入的回执随 FIN 先行，再有界地排空接收队列，最后才真正关闭。</p>
+     */
+    private void closeAfterReply() {
+        try {
+            socket.shutdownOutput();
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "关闭输出通道失败（忽略）", e);
+        }
+        try {
+            // 对端收到 FIN 后通常会立即关闭，此处随即读到流结束；若对端不关闭，
+            // 由读取超时兜底，避免这条已经结束的连接长期占用工作线程
+            socket.setSoTimeout(REPLY_CLOSE_DRAIN_MILLIS);
+            long deadline = System.currentTimeMillis() + REPLY_CLOSE_DRAIN_MILLIS;
+            while (System.currentTimeMillis() < deadline && in.read() != -1) {
+                // 只丢弃残余字节，不再解析：此刻连接即将关闭，任何内容都不再有意义
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "排空接收队列失败（忽略）", e);
+        }
+        close();
     }
 
     /**
@@ -1146,15 +1203,20 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /**
      * 处理历史记录查询请求。
      *
-     * <p>正文格式：{@code 用户名|起始日期|结束日期|会话对象}。
+     * <p>正文格式：{@code 用户名|起始日期|结束日期|会话对象|上一页最小主键|每页条数}。
      * 日期可为空表示不限制；会话对象为空时返回"本人收发的全部记录 + 广播"，
-     * 非空时只返回这两个人之间的私聊记录——私聊窗口在打开时用它补拉最近的对话。</p>
+     * 非空时只返回这两个人之间的私聊记录——私聊窗口在打开时用它补拉最近的对话。
+     * 后两段是本轮新增的分页字段，旧客户端只发四段时按"最新一页 + 默认条数"处理，
+     * 因此字段位置必须向后追加，不能插在中间。</p>
      *
      * <p>安全要点：正文里的第一个字段由客户端自行填写，服务器绝不能信任它——
      * 只要改写这一个字符串，任何登录用户都能读到别人的聊天记录，属于典型的水平越权。
      * 因此查询对象一律取本连接登录成功后保存的用户名，客户端提交的值仅保留字段位置以兼容旧协议，
      * 绝不参与查询；会话对象虽然只在本人记录范围内做二次过滤，也无法绕过越权，
      * 但仍需校验格式并排除本人，避免非法字符串进入后续比较与回显。</p>
+     *
+     * <p>响应正文格式：成功为 {@code 1|条数|会话对象}，随后一行 {@code #beforeId=游标}，
+     * 再跟各记录行；失败为 {@code 0|原因}。游标行以 {@code #} 开头，供客户端翻页时回传。</p>
      *
      * @param message 携带查询条件的文本消息
      */
@@ -1179,6 +1241,29 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             sendHistoryError("会话对象不能是本人");
             return;
         }
+        // 分页字段是本轮新增的，旧客户端只发四段：缺省即"最新一页 + 默认条数"
+        String cursorField = parts.length > 4 ? parts[4].trim() : "";
+        Long beforeId = null;
+        if (!cursorField.isEmpty()) {
+            beforeId = parseHistoryCursor(cursorField);
+            if (beforeId == null) {
+                LOGGER.warning(() -> "历史查询分页游标非法，已拒绝: " + username + " - " + cursorField);
+                sendHistoryError("分页游标非法");
+                return;
+            }
+        }
+        String limitField = parts.length > 5 ? parts[5].trim() : "";
+        int limit = HISTORY_PAGE_DEFAULT_LIMIT;
+        if (!limitField.isEmpty()) {
+            Integer parsed = parseHistoryLimit(limitField);
+            if (parsed == null) {
+                LOGGER.warning(() -> "历史查询分页条数非法，已拒绝: " + username + " - " + limitField);
+                sendHistoryError("每页条数需为 " + HISTORY_PAGE_MIN_LIMIT + "-"
+                        + HISTORY_PAGE_MAX_LIMIT + " 的整数");
+                return;
+            }
+            limit = parsed;
+        }
         LocalDateTime from = parts.length > 1 && !parts[1].isEmpty()
                 ? DateUtil.parse(parts[1] + " 00:00:00") : null;
         LocalDateTime to = parts.length > 2 && !parts[2].isEmpty()
@@ -1186,13 +1271,103 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         // 查询对象恒为服务端保存的登录用户名：客户端提交的第一个字段被刻意忽略
         String target = username;
         MessageService messageService = server.getMessageService();
-        Result<List<Message>> result = messageService.queryHistory(target, from, to);
+        StringBuilder builder = new StringBuilder();
+        try {
+            // 分页下推到 SQL：历史记录总量大，先全量查回再截断既慢又浪费内存
+            List<Message> messages = messageService.queryPage(target, peer, from, to, beforeId, limit);
+            builder.append('1').append('|').append(messages.size()).append('|').append(peer);
+            // 游标行恒定占一行（无记录时值为空），使客户端解析位置固定，不必做分支判断；
+            // 取值用本页最小主键，与 DAO 的 id < 游标 语义对应，翻页时不会漏记录或重复
+            builder.append('\n').append(HISTORY_CURSOR_PREFIX)
+                    .append(messages.isEmpty() ? "" : messages.get(0).getId());
+            for (Message item : messages) {
+                builder.append('\n')
+                        .append(DateUtil.format(item.getTimestamp())).append('|')
+                        .append(item.getSender()).append('|')
+                        .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver()).append('|')
+                        .append(MessageExporter.contentOf(item));
+            }
+        } catch (ChatException e) {
+            LOGGER.warning(() -> "历史查询失败: " + username + " - " + e.getMessage());
+            builder.append('0').append('|').append("查询失败: " + e.getMessage());
+        }
+        TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
+                builder.toString(), MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.HISTORY_RESULT);
+        send(response);
+    }
+
+    /**
+     * 解析历史分页游标。
+     *
+     * @param value 已确认非空的上一页最小主键
+     * @return 合法的主键；非数字或非正数时返回 null，由调用方回执错误
+     */
+    private Long parseHistoryCursor(String value) {
+        try {
+            long cursor = Long.parseLong(value);
+            return cursor > 0 ? cursor : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 解析历史分页条数。
+     *
+     * <p>超出上限时截断而不是拒绝：分页条数属于性能参数，客户端多填只会拖慢自己，
+     * 服务端按上限收敛即可，没必要为此让整次查询失败。</p>
+     *
+     * @param value 已确认非空的每页条数
+     * @return 解析并截断后的条数；非数字或小于下限时返回 null，由调用方回执错误
+     */
+    private Integer parseHistoryLimit(String value) {
+        int limit;
+        try {
+            limit = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (limit < HISTORY_PAGE_MIN_LIMIT) {
+            return null;
+        }
+        return Math.min(limit, HISTORY_PAGE_MAX_LIMIT);
+    }
+
+    /**
+     * 处理聊天记录关键字搜索请求。
+     *
+     * <p>正文为单个字段：关键字。检索必须走带请求者参数的
+     * {@link MessageService#search(String, String)}，由服务层按"本人发送 / 发给本人 / 广播"
+     * 过滤可见范围；直接使用数据访问层的全库检索会把别人的私聊内容回给搜索者，
+     * 与历史查询曾经存在的水平越权同源。</p>
+     *
+     * <p>响应正文格式：成功为 {@code 1|命中条数} 加各命中行，失败为 {@code 0|中文原因}；
+     * 行格式与历史查询保持一致，客户端可复用同一套渲染。</p>
+     *
+     * @param message 携带关键字的文本消息
+     */
+    private void handleSearchRequest(TextMessage message) {
+        if (!requireLogin()) {
+            return;
+        }
+        String keyword = message.getContent() == null ? "" : message.getContent().trim();
+        if (keyword.isEmpty()) {
+            sendSearchResult("0|搜索关键字不能为空");
+            return;
+        }
+        if (keyword.length() > Constants.MESSAGE_MAX_LENGTH) {
+            LOGGER.warning(() -> "搜索关键字超长，已拒绝: " + username);
+            sendSearchResult("0|搜索关键字过长，最多 " + Constants.MESSAGE_MAX_LENGTH + " 个字符");
+            return;
+        }
+        Result<List<Message>> result = server.getMessageService().search(username, keyword);
         StringBuilder builder = new StringBuilder();
         if (!result.isSuccess()) {
             builder.append('0').append('|').append(result.getMessage());
         } else {
-            List<Message> messages = conversationOf(result.getData(), target, peer);
-            builder.append('1').append('|').append(messages.size()).append('|').append(peer);
+            List<Message> messages = result.getData();
+            builder.append('1').append('|').append(messages.size());
             for (Message item : messages) {
                 builder.append('\n')
                         .append(DateUtil.format(item.getTimestamp())).append('|')
@@ -1201,9 +1376,107 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                         .append(MessageExporter.contentOf(item));
             }
         }
+        sendSearchResult(builder.toString());
+    }
+
+    /**
+     * 下发搜索结果。
+     *
+     * @param content 结果正文
+     */
+    private void sendSearchResult(String content) {
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
-                builder.toString(), MessageType.TEXT_PRIVATE);
-        response.setType(MessageType.HISTORY_RESULT);
+                content, MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.SEARCH_RESULT);
+        send(response);
+    }
+
+    /**
+     * 处理消息撤回请求。
+     *
+     * <p>正文为单个字段：稳定消息标识。业务规则（是否存在、是否本人发送、是否超过时限、
+     * 是否已撤回）全部由 {@link MessageService#recall(String, String)} 判断，
+     * 网络层只负责捕获异常并转成中文回执，避免规则散落造成漏判。</p>
+     *
+     * <p>回执给发起者：成功 {@code OK|messageId}，失败 {@code FAIL|messageId|中文原因}。
+     * 撤回成功后再通知会话对端，使对端界面上的气泡同步变为"已撤回"。</p>
+     *
+     * @param message 携带消息标识的文本消息
+     */
+    private void handleRecallRequest(TextMessage message) {
+        if (!requireLogin()) {
+            return;
+        }
+        String messageId = message.getContent() == null ? "" : message.getContent().trim();
+        if (messageId.isEmpty()) {
+            sendRecallReply("FAIL||缺少消息标识，无法撤回");
+            return;
+        }
+        if (messageId.length() > Constants.MESSAGE_MAX_LENGTH) {
+            // 撤回请求的正文不经过 splitFields，长度必须在这里自行收敛，避免超长字符串进入数据库查询
+            LOGGER.warning(() -> "撤回请求的消息标识超长，已拒绝: " + username);
+            sendRecallReply("FAIL||消息标识过长，无法撤回");
+            return;
+        }
+        Result<Boolean> result;
+        try {
+            result = server.getMessageService().recall(messageId, username);
+        } catch (ChatException e) {
+            LOGGER.warning(() -> "消息撤回失败: " + username + " - " + messageId + " - " + e.getMessage());
+            sendRecallReply("FAIL|" + messageId + "|撤回失败：" + e.getMessage());
+            return;
+        }
+        if (!result.isSuccess()) {
+            LOGGER.info(() -> "消息撤回被拒绝: " + username + " - " + messageId + " - " + result.getMessage());
+            sendRecallReply("FAIL|" + messageId + "|" + result.getMessage());
+            return;
+        }
+        sendRecallReply("OK|" + messageId);
+        notifyRecallPeer(messageId);
+    }
+
+    /**
+     * 撤回成功后通知会话对端。
+     *
+     * <p>对端身份的权威来源是库里的原始记录，而不是请求正文：正文里的任何字段都可被伪造，
+     * 若照抄客户端提交的接收者，撤回通知就能被用来向任意用户投递报文。</p>
+     *
+     * <p>对端离线时直接跳过：历史查询对已撤回记录返回的是占位文本，
+     * 对端下次上线补拉历史看到的就是"已撤回"，通知并非必需，也不必为此缓存待发通知。</p>
+     *
+     * @param messageId 已撤回消息的稳定标识
+     */
+    private void notifyRecallPeer(String messageId) {
+        Message original;
+        try {
+            original = server.getMessageService().findByMessageId(messageId);
+        } catch (ChatException e) {
+            LOGGER.warning(() -> "撤回通知查询原消息失败: " + messageId + " - " + e.getMessage());
+            return;
+        }
+        if (original == null) {
+            return;
+        }
+        String peer = original.getReceiver();
+        // 群聊记录接收者为空，没有单一对端，本轮只回发起者
+        if (peer == null || peer.isEmpty() || !server.getUserManager().isOnline(peer)) {
+            return;
+        }
+        TextMessage notice = ChatMessageFactory.text(Constants.SYSTEM_SENDER, peer,
+                "PEER|" + messageId + "|" + username, MessageType.TEXT_PRIVATE);
+        notice.setType(MessageType.MSG_RECALL);
+        server.getUserManager().sendTo(peer, notice);
+    }
+
+    /**
+     * 下发撤回回执。
+     *
+     * @param content 回执正文，形如 {@code OK|messageId} 或 {@code FAIL|messageId|原因}
+     */
+    private void sendRecallReply(String content) {
+        TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
+                content, MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.MSG_RECALL);
         send(response);
     }
 
@@ -1276,33 +1549,6 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     private String clientAddress() {
         InetAddress address = socket.getInetAddress();
         return address == null ? "unknown" : address.getHostAddress();
-    }
-
-    /**
-     * 按会话对象过滤历史记录。
-     *
-     * @param messages 查询结果
-     * @param target   查询发起方（本人）
-     * @param peer     会话对象；为空时原样返回
-     * @return 过滤后的记录
-     */
-    private List<Message> conversationOf(List<Message> messages, String target, String peer) {
-        if (peer == null || peer.isEmpty()) {
-            return messages;
-        }
-        List<Message> filtered = new ArrayList<>();
-        for (Message item : messages) {
-            // 广播消息接收者为空，不属于任何一对一会话，直接排除
-            if (item.isBroadcast()) {
-                continue;
-            }
-            boolean selfToPeer = target.equals(item.getSender()) && peer.equals(item.getReceiver());
-            boolean peerToSelf = peer.equals(item.getSender()) && target.equals(item.getReceiver());
-            if (selfToPeer || peerToSelf) {
-                filtered.add(item);
-            }
-        }
-        return filtered;
     }
 
     /**

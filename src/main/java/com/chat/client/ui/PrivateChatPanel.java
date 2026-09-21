@@ -113,6 +113,22 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
+     * 私聊当前不支持引用发送，因此不提供"引用"右键菜单。
+     *
+     * <p>引用信息必须随消息一起上线才能被对端识别为结构化引用。私聊的发送入口
+     * {@code ChatClient.sendPrivateText(String, String)} 目前不接受引用参数，
+     * 而私聊消息依赖客户端内部的重发与状态登记，绕过它自行发送会让"发送中/已送达"
+     * 状态与超时重发全部失效，因此这里选择不支持，而不是偷偷降级成纯文本。
+     * 收到对端带引用的消息仍然可以正常渲染引用块（见 {@link #onMessage(Message)}）。</p>
+     *
+     * @return 固定返回 false
+     */
+    @Override
+    protected boolean isQuoteSupported() {
+        return false;
+    }
+
+    /**
      * 获取聊天对象名称。
      *
      * @return 对方用户名
@@ -149,6 +165,8 @@ public class PrivateChatPanel extends BaseChatPanel {
         String content = message instanceof TextMessage
                 ? ((TextMessage) message).getContent() : message.getSummary();
         boolean fromPeer = peer.equals(message.getSender());
-        appendMessage(fromPeer ? peer : "我", content, fromPeer ? COLOR_OTHER : COLOR_SELF);
+        // 交给基类渲染：对端若带引用信息，气泡里会显示引用块
+        appendIncoming(fromPeer ? peer : "我", content,
+                fromPeer ? COLOR_OTHER : COLOR_SELF, message, false);
     }
 }

@@ -116,6 +116,9 @@ public class ChatClient {
     /** 会话恢复失败（令牌过期）的应答前缀 */
     private static final String RESUME_EXPIRED_PREFIX = "EXPIRED";
 
+    /** 历史记录分页请求使用的默认每页条数；与设计文档保持一致 */
+    private static final String DEFAULT_PAGE_SIZE = "50";
+
     /** 消息监听器列表 */
     private final List<ChatListener> listeners = new CopyOnWriteArrayList<>();
 
@@ -891,6 +894,22 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean sendPrivateText(String receiver, String content) {
+        return sendPrivateText(receiver, content, null, null);
+    }
+
+    /**
+     * 发送带引用信息的私聊文本消息。
+     *
+     * <p>仍然走 {@link #sendTracked} 这条唯一通道：引用只是随消息一起发送的附加信息，
+     * 不能因为它另开一条发送路径，否则这条消息会丢掉确认登记、超时重发与发送状态展示。</p>
+     *
+     * @param receiver     接收者用户名
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @return 发送成功返回 true
+     */
+    public boolean sendPrivateText(String receiver, String content, String quoteId, String quoteSummary) {
         if (content == null || content.trim().isEmpty()) {
             return false;
         }
@@ -899,7 +918,33 @@ public class ChatClient {
                     + Constants.MESSAGE_MAX_LENGTH + " 个字符"));
             return false;
         }
-        return sendTracked(ChatMessageFactory.text(username, receiver, content, MessageType.TEXT_PRIVATE));
+        return sendTracked(buildText(username, receiver, content, MessageType.TEXT_PRIVATE,
+                quoteId, quoteSummary));
+    }
+
+    /**
+     * 构造一条出站文本消息。
+     *
+     * <p>不带引用时仍走 {@link ChatMessageFactory}：那里统一分配本地消息编号，
+     * 让日志与调试信息能看出先后顺序；带引用时必须用五参构造器，因为引用字段是 final，
+     * 只能在构造时确定。两条路径最终都交给同一个发送通道。</p>
+     *
+     * @param sender       发送者用户名
+     * @param receiver     接收者用户名，群聊传空字符串
+     * @param content      正文
+     * @param type         消息类型
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @return 文本消息
+     */
+    private TextMessage buildText(String sender, String receiver, String content, MessageType type,
+                                  String quoteId, String quoteSummary) {
+        if (quoteId == null && quoteSummary == null) {
+            return ChatMessageFactory.text(sender, receiver, content, type);
+        }
+        TextMessage message = new TextMessage(sender, receiver, content, quoteId, quoteSummary);
+        message.setType(type);
+        return message;
     }
 
     /**
@@ -931,6 +976,21 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean sendGroupText(String content) {
+        return sendGroupText(content, null, null);
+    }
+
+    /**
+     * 发送带引用信息的群聊文本消息。
+     *
+     * <p>群聊是广播语义，没有单一接收方，因此服务端不会回 {@code MSG_ACK}，
+     * 这里也不做待确认登记；引用信息随消息一起广播给全部在线成员。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @return 发送成功返回 true
+     */
+    public boolean sendGroupText(String content, String quoteId, String quoteSummary) {
         if (content == null || content.trim().isEmpty()) {
             return false;
         }
@@ -939,7 +999,7 @@ public class ChatClient {
                     + Constants.MESSAGE_MAX_LENGTH + " 个字符"));
             return false;
         }
-        return send(ChatMessageFactory.text(username, "", content, MessageType.TEXT_GROUP));
+        return send(buildText(username, "", content, MessageType.TEXT_GROUP, quoteId, quoteSummary));
     }
 
     /**
@@ -1044,11 +1104,73 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean requestHistory(String target, String fromDate, String toDate, String peer) {
+        return requestHistory(target, fromDate, toDate, peer, "", DEFAULT_PAGE_SIZE);
+    }
+
+    /**
+     * 请求历史聊天记录（键集分页）。
+     *
+     * <p>为什么用"上一页最小主键"而不是页码偏移：本项目的聊天记录会持续增长，
+     * 用 OFFSET 翻页时数据库必须先扫过前面所有行，越翻越慢；按主键向前取一页
+     * 每次都能走索引，代价恒定。首次加载传空游标，服务端返回最新一页。</p>
+     *
+     * @param target   目标用户名，为空表示查询全部
+     * @param fromDate 起始日期，格式 yyyy-MM-dd，可为空
+     * @param toDate   结束日期，格式 yyyy-MM-dd，可为空
+     * @param peer     会话对象用户名；非空时只返回 target 与该用户之间的私聊记录
+     * @param beforeId 上一页最小主键，空串表示取最新一页
+     * @param pageSize 每页条数，空串表示由服务端取默认值
+     * @return 发送成功返回 true
+     */
+    public boolean requestHistory(String target, String fromDate, String toDate, String peer,
+                                  String beforeId, String pageSize) {
+        // 追加两个字段而不是新增消息类型：旧版服务端只读取前四个字段，
+        // 多出来的内容会被忽略，因此新旧两端可以各自升级而不会互相打断
         String body = (target == null ? "" : target) + "|" + (fromDate == null ? "" : fromDate)
-                + "|" + (toDate == null ? "" : toDate) + "|" + (peer == null ? "" : peer);
+                + "|" + (toDate == null ? "" : toDate) + "|" + (peer == null ? "" : peer)
+                + "|" + (beforeId == null ? "" : beforeId)
+                + "|" + (pageSize == null || pageSize.isEmpty() ? DEFAULT_PAGE_SIZE : pageSize);
         TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER, body,
                 MessageType.TEXT_PRIVATE);
         message.setType(MessageType.HISTORY_REQUEST);
+        return send(message);
+    }
+
+    /**
+     * 请求按关键字搜索本人的聊天记录。
+     *
+     * <p>搜索在服务端完成：正文以密文入库，只有服务端能在解密后做匹配，
+     * 客户端不持有任何数据库连接。</p>
+     *
+     * @param keyword 关键字，空白串直接拒绝
+     * @return 发送成功返回 true
+     */
+    public boolean requestSearch(String keyword) {
+        if (keyword == null || keyword.trim().isEmpty()) {
+            return false;
+        }
+        TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
+                keyword.trim(), MessageType.TEXT_PRIVATE);
+        message.setType(MessageType.SEARCH_REQUEST);
+        return send(message);
+    }
+
+    /**
+     * 请求撤回自己发出的某条私聊消息。
+     *
+     * <p>是否允许撤回（例如是否在时限内）由服务端判定，
+     * 客户端只负责提交请求并展示服务端回执，避免两端各写一套规则后互相矛盾。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @return 发送成功返回 true
+     */
+    public boolean requestRecall(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return false;
+        }
+        TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
+                messageId.trim(), MessageType.TEXT_PRIVATE);
+        message.setType(MessageType.MSG_RECALL);
         return send(message);
     }
 
@@ -1434,6 +1556,24 @@ public class ChatClient {
      */
     public String getMessageReceiver(String messageId) {
         return messageId == null ? null : sentMessagePeers.get(messageId);
+    }
+
+    /**
+     * 查询某条"本端刚发出"消息的正文。
+     *
+     * <p>供界面在撤回时把气泡与消息标识对应起来：界面上渲染的本地回显只带正文，
+     * 不带标识，需要借助待确认表把两者关联。消息确认到达后待确认项即被移除，
+     * 因此本方法只对刚发送、尚未确认的消息有效——正好覆盖"2 分钟内可撤回"的场景。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @return 正文；消息不存在、已确认或不是文本消息时返回 null
+     */
+    public String getMessageContent(String messageId) {
+        PendingMessage pending = messageId == null ? null : pendingMessages.get(messageId);
+        if (pending == null || !(pending.message instanceof TextMessage)) {
+            return null;
+        }
+        return ((TextMessage) pending.message).getContent();
     }
 
     /**

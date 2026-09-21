@@ -93,6 +93,12 @@ public class MessageBubble extends JPanel {
     /** 正文测量冗余，吸收文本视图取整差异，避免最后一行被固定高度裁掉 */
     private static final int HEIGHT_SLACK = 2;
 
+    /** 宽度测量冗余：字体度量取整可能比实际绘制少一两个像素，留出余量避免最后一个字被折到下一行 */
+    private static final int WIDTH_SLACK = 4;
+
+    /** 被 @ 提及时的气泡底色（浅琥珀，与主题蓝形成对比又不刺眼） */
+    private static final Color MENTION_BG = new Color(0xFFF6E0);
+
     /** 可用宽度尚不可知时的兜底值，仅影响首帧测量结果 */
     private static final int FALLBACK_AVAILABLE_WIDTH = 480;
 
@@ -289,7 +295,30 @@ public class MessageBubble extends JPanel {
     }
 
     /**
-     * 设置引用块内容（预留槽位，本轮不接入协议）。
+     * 设置"被 @ 提及"的高亮状态。
+     *
+     * <p>只改气泡底色与描边，不改变消息文本本身：提醒是一种视觉强调，
+     * 不应该篡改聊天记录的内容。</p>
+     *
+     * @param highlighted 是否高亮
+     */
+    public void setHighlighted(boolean highlighted) {
+        if (bubblePane instanceof BubblePane) {
+            ((BubblePane) bubblePane).setHighlighted(highlighted);
+        }
+    }
+
+    /**
+     * 是否处于"被提及"高亮态。
+     *
+     * @return 高亮返回 true
+     */
+    public boolean isHighlighted() {
+        return bubblePane instanceof BubblePane && ((BubblePane) bubblePane).isHighlighted();
+    }
+
+    /**
+     * 设置引用块内容。
      *
      * @param text 引用摘要；为空表示不显示
      */
@@ -486,9 +515,9 @@ public class MessageBubble extends JPanel {
         String value = text == null ? "" : text;
         MEASURER.setFont(font);
         MEASURER.setText(value);
-        MEASURER.setSize(wrapWidth, Short.MAX_VALUE);
+        int width = Math.min(naturalWidth(value, font) + WIDTH_SLACK, wrapWidth);
+        MEASURER.setSize(width, Short.MAX_VALUE);
         int height = MEASURER.getPreferredSize().height;
-        int width = Math.min(naturalWidth(value, font), wrapWidth);
         return new Dimension(width, height);
     }
 
@@ -559,6 +588,9 @@ public class MessageBubble extends JPanel {
         /** 气泡归属，决定配色 */
         private final Kind kind;
 
+        /** 是否处于"被提及"高亮态 */
+        private boolean highlighted;
+
         /**
          * 构造气泡面板。
          *
@@ -583,14 +615,36 @@ public class MessageBubble extends JPanel {
                 g2.setColor(Theme.PRIMARY);
                 g2.fillRoundRect(0, 0, width, height, arc, arc);
             } else {
-                g2.setColor(Theme.CARD);
+                g2.setColor(highlighted ? MENTION_BG : Theme.CARD);
                 g2.fillRoundRect(0, 0, width, height, arc, arc);
-                g2.setColor(Theme.BORDER);
-                g2.setStroke(new BasicStroke(1f));
+                g2.setColor(highlighted ? Theme.ADMIN : Theme.BORDER);
+                g2.setStroke(new BasicStroke(highlighted ? 1.6f : 1f));
                 g2.drawRoundRect(0, 0, width, height, arc, arc);
             }
             g2.dispose();
             super.paintComponent(g);
+        }
+
+        /**
+         * 是否高亮。
+         *
+         * @return 高亮返回 true
+         */
+        boolean isHighlighted() {
+            return highlighted;
+        }
+
+        /**
+         * 设置高亮状态。
+         *
+         * @param value 是否高亮
+         */
+        void setHighlighted(boolean value) {
+            if (highlighted == value) {
+                return;
+            }
+            highlighted = value;
+            repaint();
         }
     }
 
