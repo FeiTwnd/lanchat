@@ -11,8 +11,10 @@ import java.util.logging.Logger;
  * 配置加载类。
  *
  * <p>职责：从 {@code config/chat.properties} 读取运行期配置（端口、路径、线程池参数等），
- * 并覆盖 {@link Constants} 中定义的默认值。配置缺失或读取失败时静默回退到默认值，
- * 保证程序在任何环境下都能启动——这是课程演示场景下最重要的可用性保障。</p>
+ * 并覆盖 {@link Constants} 中定义的默认值。普通配置缺失或读取失败时静默回退到默认值，
+ * 保证程序在任何环境下都能启动；而加密口令这类安全关键项刻意不设默认值，
+ * 缺失时由调用方（{@link com.chat.util.MessageCipher}、服务器启动自检）明确拒绝，
+ * 不让“忘记配置”悄悄退化成使用公开的弱密钥。</p>
  *
  * <p>设计说明：使用静态初始化 + 不可变 {@link Properties} 快照，读多写少，
  * 无需加锁；刻意不引入任何配置框架，符合“不用现成框架”的题目约束。</p>
@@ -212,11 +214,14 @@ public final class Config {
      * 该口令用于派生 AES 密钥，所有读写同一数据库的进程（服务器与客户端导出的场景）
      * 必须使用同一口令，否则查出来的记录会显示为无法解密。</p>
      *
-     * @return 加密口令；未配置时返回内置默认口令
+     * <p>刻意不提供内置默认口令：默认口令意味着“忘记配置”会静默退化为使用一个公开的弱密钥，
+     * 密文形同明文。未配置时返回空串，由 {@link com.chat.util.MessageCipher} 与服务器启动
+     * 自检明确拒绝，让问题在启动阶段暴露而不是在数据落库之后。</p>
+     *
+     * @return 加密口令；未配置时返回空字符串
      */
     public static String messageSecret() {
-        return override("lanchat.crypto.secret",
-                get("security.message.secret", Constants.DB_MESSAGE_SECRET));
+        return override("lanchat.crypto.secret", get("security.message.secret", ""));
     }
 
     /**

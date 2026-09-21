@@ -82,9 +82,11 @@ public class FileService {
     /**
      * 生成文件传输请求消息。
      *
-     * <p>业务校验：文件必须存在、是普通文件、可读、体积不超过
-     * {@link Constants#MAX_FILE_SIZE}；任一不满足直接抛出 {@link FileTransferException}，
-     * 让调用方明确得到“为什么发不出去”。</p>
+     * <p>业务校验：文件必须存在、是普通文件、可读且体积不超过
+     * {@link Constants#MAX_FILE_SIZE}（实际取配置项 {@code file.max.size} 的生效值）；
+     * 任一不满足直接抛出 {@link FileTransferException}，
+     * 让调用方明确得到“为什么发不出去”。空文件允许发送，按 1 个空块传输，
+     * 与 {@link com.chat.common.FileMessage#failReason()} 的块数口径保持一致。</p>
      *
      * @param sender   发送者用户名
      * @param receiver 接收者用户名
@@ -109,10 +111,15 @@ public class FileService {
         try {
             FileMessage request = ChatMessageFactory.file(sender, receiver, MessageType.FILE_REQUEST);
             request.setTransferId(UUID.randomUUID().toString());
-            request.setFileName(FileUtil.sanitizeFileName(file.getName()));
+            request.setFileName(safeFileName(file.getName()));
             request.setFileSize(file.length());
             request.setTotalChunks(FileUtil.chunkCount(file.length(), Constants.FILE_CHUNK_SIZE));
             request.setSha256(FileUtil.sha256(file));
+            String reason = request.failReason();
+            if (reason != null) {
+                // 读出文件后才可能发现元信息自相矛盾，这里提前失败，避免把非法请求发给对端
+                throw new FileTransferException("无法发送文件：" + reason);
+            }
             sendingFiles.put(request.getTransferId(), new SendingFile(file));
             LOGGER.info(() -> "准备发送文件 " + file.getName() + "（"
                     + FileUtil.humanSize(file.length()) + "，" + request.getTotalChunks() + " 块）");
@@ -207,7 +214,7 @@ public class FileService {
             String dir = (receiverDir == null || receiverDir.trim().isEmpty())
                     ? Constants.RECEIVED_DIR : receiverDir;
             FileUtil.ensureDir(dir);
-            File target = FileUtil.uniqueTarget(dir, request.getFileName());
+            File target = FileUtil.uniqueTarget(dir, safeFileName(request.getFileName()));
             ReceivingFile receiving = new ReceivingFile(request.getTransferId(), target,
                     request.getTotalChunks(), request.getFileSize());
             receivingFiles.put(request.getTransferId(), receiving);
@@ -224,9 +231,12 @@ public class FileService {
      * <p>严格校验块序号连续性：若收到的块序号与期望不符，说明网络乱序或对端实现有误，
      * 立即抛异常并清理残缺文件，绝不写入错位数据。</p>
      *
+     * <p>在连续性之前先做范围校验：声明总块数为 N 时，序号只允许落在 {@code [0, N)}，
+     * 否则说明对端在请求之外伪造了数据块，必须当场拒绝。</p>
+     *
      * @param chunk FILE_CHUNK 消息
      * @return 当前累计接收字节数
-     * @throws FileTransferException 会话不存在、块序号错乱或写盘失败时抛出
+     * @throws FileTransferException 会话不存在、块序号越界或错乱、写盘失败时抛出
      */
     public long appendChunk(FileMessage chunk) throws FileTransferException {
         if (chunk == null || chunk.getTransferId() == null) {
@@ -236,8 +246,14 @@ public class FileService {
         if (receiving == null) {
             throw new FileTransferException("接收会话不存在: " + chunk.getTransferId(), chunk.getTransferId());
         }
+        int index = chunk.getChunkIndex();
+        if (index < 0 || index >= receiving.getTotalChunks()) {
+            cancelReceive(chunk.getTransferId());
+            throw new FileTransferException("数据块序号越界：允许 0 - " + (receiving.getTotalChunks() - 1)
+                    + "，实际 " + index, chunk.getTransferId());
+        }
         try {
-            return receiving.append(chunk.getChunkIndex(), chunk.getData());
+            return receiving.append(index, chunk.getData());
         } catch (IOException e) {
             cancelReceive(chunk.getTransferId());
             throw new FileTransferException("数据块写入失败: " + e.getMessage(), chunk.getTransferId());
@@ -312,19 +328,50 @@ public class FileService {
     /**
      * 校验文件请求消息的合法性。
      *
+     * <p>结构性规则（文件名、块数、SHA-256 格式）统一委托给
+     * {@link FileMessage#failReason()}，本方法只补充“体积必须大于 0”与依赖配置的上限判断，
+     * 保证与文本通道解析使用同一套规则、且校验规则不在两处重复实现。</p>
+     *
      * @param request 请求消息
-     * @throws FileTransferException 请求非法时抛出
+     * @throws FileTransferException 请求为空、元信息非法、体积为 0 或超过大小上限时抛出
      */
     private void validateRequest(FileMessage request) throws FileTransferException {
-        if (request == null || request.getTransferId() == null) {
+        if (request == null) {
             throw new FileTransferException("无效的文件传输请求");
+        }
+        String reason = request.failReason();
+        if (reason != null) {
+            throw new FileTransferException("对方发送的文件元信息非法：" + reason);
         }
         if (request.getFileSize() > maxFileSize) {
             throw new FileTransferException("对方发送的文件超过大小上限 " + maxFileSizeText());
         }
-        if (request.getFileName() == null || request.getFileName().trim().isEmpty()) {
-            throw new FileTransferException("对方发送的文件名为空");
+    }
+
+    /**
+     * 清洗并校验文件名，得到可安全落盘的纯文件名。
+     *
+     * <p>先清洗再校验的顺序是刻意为之：清洗剔除路径部分，校验负责拒绝
+     * {@code ..} 这类清洗后仍保留危险语义的名字，两级防线不能相互替代。</p>
+     *
+     * @param rawName 原始文件名
+     * @return 不含路径的安全文件名
+     * @throws FileTransferException 名字为空、过长或含危险内容时抛出
+     */
+    private static String safeFileName(String rawName) throws FileTransferException {
+        String safe = FileUtil.sanitizeFileName(rawName);
+        if (safe.length() > FileMessage.MAX_FILE_NAME_LENGTH) {
+            throw new FileTransferException("文件名过长，最多 " + FileMessage.MAX_FILE_NAME_LENGTH + " 个字符");
         }
+        if (safe.contains("..") || safe.indexOf('/') >= 0 || safe.indexOf('\\') >= 0) {
+            throw new FileTransferException("文件名包含非法路径成分: " + rawName);
+        }
+        for (int i = 0; i < safe.length(); i++) {
+            if (Character.isISOControl(safe.charAt(i))) {
+                throw new FileTransferException("文件名包含控制字符: " + rawName);
+            }
+        }
+        return safe;
     }
 
     /**
@@ -542,6 +589,15 @@ public class FileService {
             synchronized (lock) {
                 return receivedBytes;
             }
+        }
+
+        /**
+         * 获取期望的总块数，用于判断对端发来的块序号是否越界。
+         *
+         * @return 总块数
+         */
+        private int getTotalChunks() {
+            return totalChunks;
         }
 
         /**

@@ -34,8 +34,14 @@ public abstract class AbstractMessageHandler implements MessageHandler {
      * <ul>
      *   <li>文本类消息 -> {@link #handleTextMessage(Message, Socket)}</li>
      *   <li>文件类消息 -> {@link #handleFileMessage(Message, Socket)}</li>
-     *   <li>其余控制类消息 -> {@link #handleSystemMessage(Message, Socket)}</li>
+     *   <li>控制类消息 -> {@link #handleSystemMessage(Message, Socket)}</li>
      * </ul>
+     *
+     * <p>为什么控制类型要逐个列举而不是用 {@code default} 兜底：兜底写法会把任何
+     * 服务器本不该接收的类型（例如各种 {@code *_RESULT} 回执）也悄悄送进控制处理流程，
+     * 既掩盖了协议异常，也让后续新增枚举值时默认落进错误分支。逐个列举后，
+     * 未纳入分派的类型会留下 warning 日志并被拒绝，行为可观测；已列举的控制类型
+     * 仍走原有的 {@link #handleSystemMessage(Message, Socket)}，兼容既有客户端与服务端。</p>
      *
      * @param message 待处理消息，为 null 时直接忽略
      * @param socket  消息来源连接
@@ -62,8 +68,32 @@ public abstract class AbstractMessageHandler implements MessageHandler {
             case FILE_RESULT:
                 handleFileMessage(message, socket);
                 break;
-            default:
+            case REGISTER:
+            case REGISTER_RESULT:
+            case LOGIN:
+            case LOGIN_RESULT:
+            case LOGOUT:
+            case USER_LIST_REQUEST:
+            case USER_ONLINE:
+            case USER_OFFLINE:
+            case USER_UPDATE:
+            case PASSWORD_CHANGE:
+            case HISTORY_REQUEST:
+            case HISTORY_RESULT:
+            case EXPORT_REQUEST:
+            case EXPORT_RESULT:
+            case HEARTBEAT:
+            case HEARTBEAT_ACK:
+            case MSG_ACK:
+            case OFFLINE_MESSAGE:
+            case SESSION_RESUME:
+            case SYSTEM:
+            case ERROR:
                 handleSystemMessage(message, socket);
+                break;
+            default:
+                // 走到这里说明枚举新增了类型却没同步分派规则，必须留下可观测日志而不是静默按控制消息处理
+                logger.warning(() -> "收到未纳入分派规则的消息类型，已拒绝: " + type);
                 break;
         }
     }

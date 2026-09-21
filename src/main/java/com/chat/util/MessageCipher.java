@@ -36,7 +36,10 @@ import java.util.logging.Logger;
  * <ul>
  *   <li>密文带固定前缀 {@code enc:v1:}，读取时若没有该前缀则按历史明文处理，
  *       因此"加密前写入的旧记录"依然可读；</li>
- *   <li>口令变更后旧记录无法解密，此时返回占位文本并记录警告，而不是抛异常让界面崩溃。</li>
+ *   <li>口令变更后旧记录无法解密，此时返回占位文本并记录警告，而不是抛异常让界面崩溃；</li>
+ *   <li>未配置口令（{@code security.message.secret} 为空）时不做任何加密降级：
+ *       加解密会抛出 {@link IllegalStateException}，并由服务器启动自检提前拒绝启动。
+ *       若在此退化为"不加密"或使用内置默认口令，聊天记录会在用户毫不知情的情况下以弱密钥落库。</li>
  * </ul>
  *
  * <p>边界说明：本类只保护"落盘后的聊天正文"，不改变网络传输方式——协议仍是
@@ -91,11 +94,38 @@ public final class MessageCipher {
     /** Base64 解码器 */
     private static final Base64.Decoder DECODER = Base64.getDecoder();
 
-    /** 派生后的密钥，类加载时按配置口令派生一次，避免每条记录都重复计算 */
-    private static final SecretKeySpec KEY = deriveKey(Config.messageSecret());
+    /**
+     * 派生后的密钥缓存。
+     *
+     * <p>惰性初始化并缓存：口令派生需要几万次迭代，不能每条记录都重算；
+     * 但也不能用静态初始化块——类加载即失败会让“未配置口令”这种配置问题
+     * 表现为难以阅读的 {@code ExceptionInInitializerError}，且仅仅加载本类就会报错。
+     * 改为首次加解密时初始化，异常信息直达调用方。</p>
+     */
+    private static volatile SecretKeySpec cachedKey;
 
     /** 私有构造，禁止实例化工具类 */
     private MessageCipher() {
+    }
+
+    /**
+     * 获取派生后的 AES 密钥（首次调用时按配置口令派生并缓存）。
+     *
+     * @return 256 位 AES 密钥
+     * @throws IllegalStateException 未配置加密口令或当前 JVM 不支持所需算法时抛出
+     */
+    private static SecretKeySpec secretKey() {
+        SecretKeySpec key = cachedKey;
+        if (key == null) {
+            synchronized (MessageCipher.class) {
+                key = cachedKey;
+                if (key == null) {
+                    key = deriveKey(Config.messageSecret());
+                    cachedKey = key;
+                }
+            }
+        }
+        return key;
     }
 
     /**
@@ -103,17 +133,24 @@ public final class MessageCipher {
      *
      * @param secret 配置中的加密口令
      * @return 256 位 AES 密钥
-     * @throws IllegalStateException 当前 JVM 不支持所需算法时抛出（JDK 必须支持，属于不可恢复错误）
+     * @throws IllegalStateException 未配置口令或当前 JVM 不支持所需算法时抛出
      */
     private static SecretKeySpec deriveKey(String secret) {
-        char[] password = (secret == null ? "" : secret).toCharArray();
+        if (secret == null || secret.trim().isEmpty()) {
+            throw new IllegalStateException("未配置消息加密口令，请在 config/chat.properties 中设置 "
+                    + "security.message.secret 后重试；注意口令变更后此前写入的历史密文将无法解密");
+        }
+        char[] password = secret.toCharArray();
+        PBEKeySpec spec = new PBEKeySpec(password, SALT, ITERATIONS, KEY_LENGTH_BITS);
         try {
             SecretKeyFactory factory = SecretKeyFactory.getInstance(KEY_ALGORITHM);
-            byte[] key = factory.generateSecret(
-                    new PBEKeySpec(password, SALT, ITERATIONS, KEY_LENGTH_BITS)).getEncoded();
+            byte[] key = factory.generateSecret(spec).getEncoded();
             return new SecretKeySpec(key, "AES");
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("初始化消息加密密钥失败: " + e.getMessage(), e);
+        } finally {
+            // 及时清空口令副本，减少明文口令在内存中的驻留时间
+            spec.clearPassword();
         }
     }
 
@@ -122,6 +159,7 @@ public final class MessageCipher {
      *
      * @param plain 明文正文，可为 null
      * @return 形如 {@code enc:v1:Base64(IV||密文)} 的字符串；入参为 null 或空串时原样返回
+     * @throws IllegalStateException 未配置加密口令时抛出
      */
     public static String encrypt(String plain) {
         if (plain == null || plain.isEmpty()) {
@@ -131,7 +169,7 @@ public final class MessageCipher {
             byte[] iv = new byte[IV_LENGTH];
             RANDOM.nextBytes(iv);
             Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-            cipher.init(Cipher.ENCRYPT_MODE, KEY, new GCMParameterSpec(TAG_LENGTH_BITS, iv));
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey(), new GCMParameterSpec(TAG_LENGTH_BITS, iv));
             byte[] encrypted = cipher.doFinal(plain.getBytes(StandardCharsets.UTF_8));
             byte[] combined = new byte[iv.length + encrypted.length];
             System.arraycopy(iv, 0, combined, 0, iv.length);
@@ -149,10 +187,11 @@ public final class MessageCipher {
      *
      * @param stored 数据库列值，可能为 null、历史明文或带前缀的密文
      * @return 明文正文；历史明文原样返回；解密失败返回占位提示
+     * @throws IllegalStateException 未配置加密口令时抛出（历史明文读取不受影响）
      */
     public static String decrypt(String stored) {
         if (stored == null || stored.isEmpty() || !stored.startsWith(PREFIX)) {
-            // 无前缀说明是加密之前写入的历史明文，保持可读
+            // 无前缀说明是加密之前写入的历史明文，保持可读，也不必要求配置口令
             return stored;
         }
         try {
@@ -162,7 +201,7 @@ public final class MessageCipher {
                 return UNDECRYPTABLE;
             }
             Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-            cipher.init(Cipher.DECRYPT_MODE, KEY,
+            cipher.init(Cipher.DECRYPT_MODE, secretKey(),
                     new GCMParameterSpec(TAG_LENGTH_BITS, combined, 0, IV_LENGTH));
             byte[] plain = cipher.doFinal(combined, IV_LENGTH, combined.length - IV_LENGTH);
             return new String(plain, StandardCharsets.UTF_8);

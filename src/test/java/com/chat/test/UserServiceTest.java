@@ -106,6 +106,9 @@ public class UserServiceTest {
     /**
      * 用例 4：登录成功与失败。
      *
+     * <p>失败分支同时校验"账号不存在"与"密码错误"返回完全一致的文案，
+     * 防止攻击者通过提示差异枚举出哪些用户名已注册。</p>
+     *
      * @throws Exception 测试异常
      */
     @Test("用户服务：登录成功并可查询到最近登录时间")
@@ -121,14 +124,20 @@ public class UserServiceTest {
         TestRunner.assertNotNull(userDao.findByUsername("carol").getLastLoginTime(),
                 "最近登录时间应被写回数据库");
 
-        TestRunner.assertFalse(service.login("carol", "wrong").isSuccess(), "错误密码应失败");
-        TestRunner.assertFalse(service.login("nobody", "123456").isSuccess(), "不存在的用户应失败");
+        Result<User> wrongPassword = service.login("carol", "wrong");
+        TestRunner.assertFalse(wrongPassword.isSuccess(), "错误密码应失败");
+        Result<User> unknownUser = service.login("nobody", "123456");
+        TestRunner.assertFalse(unknownUser.isSuccess(), "不存在的用户应失败");
+        TestRunner.assertEquals("用户名或密码错误", wrongPassword.getMessage(),
+                "登录失败应使用统一文案");
+        TestRunner.assertEquals(wrongPassword.getMessage(), unknownUser.getMessage(),
+                "用户不存在与密码错误的提示必须完全一致，避免暴露账号是否存在");
         TestRunner.assertFalse(service.login("", "123456").isSuccess(), "空用户名应失败");
         TestRunner.assertFalse(service.login("carol", "").isSuccess(), "空密码应失败");
     }
 
     /**
-     * 用例 5：密码以加盐散列形式存储。
+     * 用例 5：密码以加盐 PBKDF2 散列形式存储。
      *
      * @throws Exception 测试异常
      */
@@ -144,7 +153,12 @@ public class UserServiceTest {
         TestRunner.assertNotNull(raw, "应能从测试库读到原始用户记录");
         TestRunner.assertNotNull(raw.getSalt(), "应保存盐值");
         TestRunner.assertNotEquals("MySecret123", raw.getPasswordHash(), "不得保存明文密码");
-        TestRunner.assertEquals(64, raw.getPasswordHash().length(), "散列长度应为 64 字符");
+        TestRunner.assertTrue(raw.getPasswordHash().startsWith("pbkdf2$120000$"),
+                "新注册用户的口令散列应为 PBKDF2 格式");
+        TestRunner.assertEquals(78, raw.getPasswordHash().length(),
+                "PBKDF2 散列应为 pbkdf2$120000$ 前缀加 64 位十六进制，共 78 字符");
+        TestRunner.assertFalse(SecurityUtil.isLegacyHash(raw.getPasswordHash()),
+                "PBKDF2 散列不应被识别为历史散列");
         TestRunner.assertTrue(
                 SecurityUtil.verifyPassword("MySecret123", raw.getSalt(), raw.getPasswordHash()),
                 "保存的散列应能校验原始密码");
@@ -194,6 +208,10 @@ public class UserServiceTest {
     /**
      * 用例 8：删除用户的权限控制。
      *
+     * <p>管理员账号直接写入而不是调用 {@link UserService#initAdminIfAbsent()}：
+     * 后者依赖 {@code admin.password} 配置，本用例只关注删除权限，
+     * 不应因为部署环境是否配置了管理员口令而失败。</p>
+     *
      * @throws Exception 测试异常
      */
     @Test("用户服务：普通用户无权删除，管理员可删除")
@@ -209,7 +227,12 @@ public class UserServiceTest {
         TestRunner.assertNotNull(service.findByUsername("henry").getData(),
                 "越权删除失败后目标用户仍应存在");
 
-        TestRunner.assertTrue(service.initAdminIfAbsent(), "应成功创建管理员");
+        User admin = new User(Constants.ADMIN_USERNAME, Constants.ADMIN_NICKNAME);
+        admin.setSalt(SecurityUtil.generateSalt());
+        admin.setPasswordHash(SecurityUtil.hashPassword("admin123", admin.getSalt()));
+        admin.setRole(Constants.ROLE_ADMIN);
+        TestRunner.assertTrue(userDao.save(admin), "应能写入管理员账号");
+        TestRunner.assertFalse(service.initAdminIfAbsent(), "管理员已存在时不应重复创建");
         TestRunner.assertTrue(service.deleteUser(Constants.ADMIN_USERNAME, "henry").isSuccess(),
                 "管理员应能删除用户");
         TestRunner.assertFalse(service.findByUsername("henry").isSuccess(), "删除后应查询不到");

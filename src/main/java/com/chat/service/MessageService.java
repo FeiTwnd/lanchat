@@ -11,6 +11,8 @@ import java.io.File;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -177,6 +179,74 @@ public class MessageService {
             LOGGER.log(Level.WARNING, "导出写文件失败", e);
             return Result.fail("导出失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 判断稳定消息标识是否已存在。
+     *
+     * <p>供服务端落库前去重：网络重发或断线补投可能把同一条消息再次送达，
+     * 此处只做参数归一化与委托，判重规则由 DAO 决定。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @return 已存在返回 true；messageId 为 null 或空白时返回 false
+     * @throws ChatException 读取失败时抛出
+     */
+    public boolean existsByMessageId(String messageId) throws ChatException {
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return false;
+        }
+        return messageDao.existsByMessageId(messageId.trim());
+    }
+
+    /**
+     * 查询某接收者尚未送达的消息，用于登录后的离线补投。
+     *
+     * @param receiver 接收者用户名
+     * @param limit    最多返回条数；小于等于 0 时由 DAO 使用默认值
+     * @return 按时间先后排列的消息列表，永不返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    public List<Message> findUndelivered(String receiver, int limit) throws ChatException {
+        if (receiver == null || receiver.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+        return messageDao.findUndelivered(receiver.trim(), limit);
+    }
+
+    /**
+     * 批量把离线补投成功的消息标记为已送达。
+     *
+     * @param messageIds 稳定消息标识集合
+     * @return 实际更新的行数；messageIds 为 null 或空集合时返回 0
+     * @throws ChatException 更新失败时抛出
+     */
+    public int markDelivered(Collection<String> messageIds) throws ChatException {
+        if (messageIds == null || messageIds.isEmpty()) {
+            return 0;
+        }
+        return messageDao.markDelivered(messageIds);
+    }
+
+    /**
+     * 键集分页查询聊天记录，供界面向上翻页加载更早的消息。
+     *
+     * @param username 当前用户；null 或空白表示不限制
+     * @param peer     对端用户名；null 或空白表示不限定对端
+     * @param from     起始时间（含），可为 null
+     * @param to       结束时间（含），可为 null
+     * @param beforeId 分页游标；为 null 时从最新一条开始取
+     * @param limit    本页最多返回条数；小于等于 0 时由 DAO 使用默认值
+     * @return 按时间升序排列的消息列表，永不返回 null
+     * @throws ChatException 时间范围非法或读取失败时抛出
+     */
+    public List<Message> queryPage(String username, String peer, LocalDateTime from, LocalDateTime to,
+                                   Long beforeId, int limit) throws ChatException {
+        if (from != null && to != null && from.isAfter(to)) {
+            throw new ChatException("起始时间不能晚于结束时间");
+        }
+        String self = (username == null || username.trim().isEmpty()) ? null : username.trim();
+        String target = (peer == null || peer.trim().isEmpty()) ? null : peer.trim();
+        return messageDao.queryPage(self, target, from, to, beforeId, limit);
     }
 
     /**

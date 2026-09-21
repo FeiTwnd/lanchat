@@ -118,7 +118,8 @@ public final class ChatServer {
     /**
      * 启动服务器。
      *
-     * <p>启动流程：初始化管理员账号 -> 绑定 TCP 端口 -> 启动接受线程 -> 启动 UDP 应答器 ->
+     * <p>启动流程：校验加密口令是否配置 -> 初始化业务服务并校验数据库可用性 ->
+     * 初始化管理员账号 -> 绑定 TCP 端口 -> 启动接受线程 -> 启动 UDP 应答器 ->
      * 启动心跳扫描。任一步骤失败都会回滚已占用的资源，避免“半启动”状态。</p>
      *
      * @return 启动成功返回 true；端口被占用等失败情况返回 false
@@ -129,6 +130,16 @@ public final class ChatServer {
             return true;
         }
         try {
+            // 加密口令缺失与数据库不可用同级：缺失时消息只能用不可控的密钥落库，
+            // 或者根本写不进库，与其启动后在收发消息时才报错，不如在启动阶段明确拒绝
+            if (Config.messageSecret().trim().isEmpty()) {
+                String reason = "未配置 security.message.secret，消息加密口令缺失，服务器拒绝启动；"
+                        + "请在 config/chat.properties 中配置后重启（口令一旦变更，历史密文将无法解密）";
+                LOGGER.severe(reason);
+                notify(ServerObserver.EventType.ERROR, reason);
+                rollback();
+                return false;
+            }
             initServices();
             // 存储只保留数据库，因此数据库不可用时不存在"降级运行"这一选项：
             // 与其让服务器起来却无法注册/登录/查历史，不如明确拒绝启动并说明原因

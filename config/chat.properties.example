@@ -1,0 +1,49 @@
+# ============================================================================
+# 局域网聊天程序 配置模板
+# ============================================================================
+# 用法：
+#   1. 复制本文件为 config/chat.properties（程序只读取 chat.properties）；
+#   2. 按下面的注释填写数据库口令与聊天记录加密口令；
+#   3. 服务器与所有客户端必须使用同一份数据库配置；加密口令必须一致，
+#      否则查出来的历史记录会显示为“该消息无法解密”。
+#
+# 安全提醒：
+#   - chat.properties 含数据库口令与加密口令，不要把填好真实口令的副本提交到仓库；
+#   - 聊天记录加密口令一旦变更，此前写入的密文将无法解密，请备份后再改。
+# ============================================================================
+
+# ---------- 网络 ----------
+# 服务器 TCP 端口（仅服务器主机需要在防火墙上放行该端口的入站连接）
+server.port=9527
+# UDP 自动发现端口（仅服务器主机需要放行该 UDP 端口）
+discovery.port=30000
+# 服务器最大并发连接数
+server.max.connections=200
+# 客户端心跳间隔（毫秒），服务端据此判断掉线
+heartbeat.interval.ms=15000
+# 服务端判定连接超时的时长（毫秒）
+heartbeat.timeout.ms=60000
+
+# ---------- 文件传输 ----------
+# 接收到的文件保存目录（相对项目根目录或绝对路径）
+file.received.dir=data/received
+# 单个文件大小上限（字节，默认 200MB）
+file.max.size=209715200
+
+# ---------- 管理员账号 ----------
+# 首次启动时若 admin 账号不存在，则用该口令创建管理员。
+# 留空时不会创建管理员账号（只在日志中告警），程序不再提供任何内置默认口令。
+admin.password=
+
+# ---------- 数据库（本项目唯一的存储方式） ----------
+db.driver=com.mysql.cj.jdbc.Driver
+# serverTimezone 必须填数据库所在机器的真实时区；填错会导致库里时间整体偏移
+db.url=jdbc:mysql://localhost:3306/lanchat?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
+db.username=root
+db.password=
+
+# ---------- 聊天记录存储加密 ----------
+# chat_message.content 以 AES-GCM 密文保存，密钥由本口令经 PBKDF2-HMAC-SHA256 派生。
+# 必填：留空时服务器拒绝启动（避免“忘记配置”退化成使用公开弱密钥）。
+# 建议使用 32 位以上随机字符串，例如：openssl rand -hex 24
+security.message.secret=

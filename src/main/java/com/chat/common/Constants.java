@@ -111,25 +111,18 @@ public final class Constants {
     /** 数据库用户名默认值 */
     public static final String DB_USER = "root";
 
-    /**
-     * 聊天记录加密口令默认值。
-     *
-     * <p>仅用于开箱可用的演示场景：真实部署应在 {@code config/chat.properties} 中设置
-     * {@code security.message.secret}。口令一旦变更，此前写入的密文将无法解密，
-     * 因此多人共用同一数据库时必须保证各端口令一致。</p>
-     */
-    public static final String DB_MESSAGE_SECRET = "lanchat-default-cipher-secret";
-
     // ==================== 默认账号 ====================
 
-    /** 管理员用户名，首次启动时若不存在则自动创建 */
+    /**
+     * 管理员用户名，不存在时由 {@code admin.password} 配置的口令创建。
+     *
+     * <p>刻意不提供任何内置口令：内置口令会让“忘记配置”退化成“所有人共用一个公开口令”，
+     * 宁可跳过创建并在日志中告警，也不允许程序自己决定一个口令。</p>
+     */
     public static final String ADMIN_USERNAME = "admin";
 
-    /** 管理员默认昵称 */
+    /** 管理员昵称，仅在创建管理员账号时使用 */
     public static final String ADMIN_NICKNAME = "系统管理员";
-
-    /** 管理员默认密码，仅用于首次初始化，生产环境应立刻修改 */
-    public static final String ADMIN_DEFAULT_PASSWORD = "admin123";
 
     /** 普通用户角色标识 */
     public static final String ROLE_USER = "USER";

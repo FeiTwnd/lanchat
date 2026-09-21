@@ -149,6 +149,9 @@ public class ChatClient {
             out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             in = new ObjectInputStream(socket.getInputStream());
+            // 绑定反序列化白名单必须紧跟在创建之后：服务器返回的第一帧就可能携带恶意类型，
+            // 任意一次 readObject 之前都必须完成绑定，否则过滤器形同虚设
+            in.setObjectInputFilter(ChatMessageFactory.serializationFilter());
             connected = true;
             serverHost = host;
             serverPort = port;

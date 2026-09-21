@@ -22,8 +22,12 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -56,9 +60,15 @@ public class JdbcMessageDao implements MessageDao {
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".JdbcMessageDao");
 
-    /** 查询语句中使用的列清单，避免 SELECT * 带来的列顺序耦合 */
+    /** 查询语句中使用的列清单，避免 SELECT * 带来的列顺序耦合；delivered/read_flag/recalled 仅作查询条件，不映射到模型 */
     private static final String COLUMNS =
-            "id, msg_type, sender, receiver, content, file_name, file_size, sha256, create_time";
+            "id, message_id, msg_type, sender, receiver, content, file_name, file_size, sha256, create_time";
+
+    /** 分页与补投的默认条数：调用方未指定或传入非法 limit 时使用 */
+    private static final int DEFAULT_LIMIT = 50;
+
+    /** 分页与补投的条数上限：防止客户端请求超大页导致一次性拉取过多记录 */
+    private static final int MAX_LIMIT = 200;
 
     /** JDBC 连接地址 */
     private final String url;
@@ -118,20 +128,31 @@ public class JdbcMessageDao implements MessageDao {
     /**
      * 建表（幂等），语句与 {@code sql/schema.sql} 保持一致。
      *
+     * <p>可靠链路相关的新增列：{@code message_id} 保存跨端稳定标识，{@code delivered} 记录是否已送达，
+     * {@code read_flag}、{@code recalled} 为后续已读回执与撤回预留。
+     * {@code message_id} 上的唯一索引允许存在多行 NULL（MySQL 唯一索引不约束 NULL 值），
+     * 因此升级前写入的历史记录即使该列为 NULL 也不会冲突，无需数据迁移。</p>
+     *
      * @throws SQLException 执行失败时抛出
      */
     private void createTableIfAbsent() throws SQLException {
         String sql = "CREATE TABLE IF NOT EXISTS chat_message ("
                 + "id BIGINT NOT NULL AUTO_INCREMENT,"
-                + "msg_type VARCHAR(32) NOT NULL,"
+                + "message_id VARCHAR(36) NULL,"
+                + "msg_type VARCHAR(32) NOT NULL DEFAULT 'TEXT_PRIVATE',"
                 + "sender VARCHAR(32) NOT NULL DEFAULT '',"
                 + "receiver VARCHAR(32) NOT NULL DEFAULT '',"
                 + "content TEXT NULL,"
                 + "file_name VARCHAR(255) NULL,"
                 + "file_size BIGINT NULL,"
                 + "sha256 CHAR(64) NULL,"
+                + "delivered TINYINT NOT NULL DEFAULT 0,"
+                + "read_flag TINYINT NOT NULL DEFAULT 0,"
+                + "recalled TINYINT NOT NULL DEFAULT 0,"
                 + "create_time DATETIME NOT NULL,"
                 + "PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_message_id (message_id),"
+                + "KEY idx_receiver_delivered (receiver, delivered, id),"
                 + "KEY idx_chat_message_time (create_time),"
                 + "KEY idx_chat_message_sender (sender, create_time),"
                 + "KEY idx_chat_message_receiver (receiver, create_time)"
@@ -194,30 +215,39 @@ public class JdbcMessageDao implements MessageDao {
         if (message == null) {
             throw new ChatException("消息为 null，无法保存聊天记录");
         }
-        String sql = "INSERT INTO chat_message(msg_type, sender, receiver, content, file_name, file_size, "
-                + "sha256, create_time) VALUES(?,?,?,?,?,?,?,?)";
+        // 落库前统一补全稳定标识：旧版客户端不带该字段时由服务端生成，保证库中非空且便于去重
+        String messageId = message.ensureMessageId();
+        String sql = "INSERT INTO chat_message(message_id, msg_type, sender, receiver, content, file_name, "
+                + "file_size, sha256, delivered, read_flag, recalled, create_time) "
+                + "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)";
         try (Connection connection = openConnection();
              PreparedStatement ps = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, message.getType().name());
-            ps.setString(2, nullToEmpty(message.getSender()));
-            ps.setString(3, nullToEmpty(message.getReceiver()));
+            ps.setString(1, messageId);
+            // 类型为 null 时按系统消息入库，避免 NOT NULL 列写入失败
+            ps.setString(2, message.getType() == null ? MessageType.SYSTEM.name() : message.getType().name());
+            ps.setString(3, nullToEmpty(message.getSender()));
+            ps.setString(4, nullToEmpty(message.getReceiver()));
             String content = contentOf(message);
             if (content == null) {
-                ps.setNull(4, java.sql.Types.LONGVARCHAR);
+                ps.setNull(5, java.sql.Types.LONGVARCHAR);
             } else {
-                ps.setString(4, MessageCipher.encrypt(content));
+                ps.setString(5, MessageCipher.encrypt(content));
             }
             if (message instanceof FileMessage) {
                 FileMessage file = (FileMessage) message;
-                ps.setString(5, file.getFileName());
-                ps.setLong(6, file.getFileSize());
-                ps.setString(7, file.getSha256());
+                ps.setString(6, file.getFileName());
+                ps.setLong(7, file.getFileSize());
+                ps.setString(8, file.getSha256());
             } else {
-                ps.setNull(5, java.sql.Types.VARCHAR);
-                ps.setNull(6, java.sql.Types.BIGINT);
-                ps.setNull(7, java.sql.Types.CHAR);
+                ps.setNull(6, java.sql.Types.VARCHAR);
+                ps.setNull(7, java.sql.Types.BIGINT);
+                ps.setNull(8, java.sql.Types.CHAR);
             }
-            ps.setTimestamp(8, Timestamp.valueOf(message.getTimestamp() == null
+            // 新入库的消息一律为“未送达、未读、未撤回”，由后续投递与回执更新
+            ps.setInt(9, 0);
+            ps.setInt(10, 0);
+            ps.setInt(11, 0);
+            ps.setTimestamp(12, Timestamp.valueOf(message.getTimestamp() == null
                     ? LocalDateTime.now() : message.getTimestamp()));
             boolean saved = ps.executeUpdate() > 0;
             if (saved) {
@@ -282,6 +312,169 @@ public class JdbcMessageDao implements MessageDao {
         }
         sql.append(" ORDER BY create_time ASC, id ASC");
         return executeQuery(sql.toString(), params);
+    }
+
+    /**
+     * 键集分页查询聊天记录。
+     *
+     * <p>用 {@code id < ?} 而不是 {@code OFFSET} 做分页：OFFSET 需要数据库先扫描并丢弃前 N 行，
+     * 页码越大越慢；键集分页始终从索引直接定位游标位置，翻到第几页代价都一样。</p>
+     *
+     * <p>取数时按 id 倒序取“最近 limit 条”，再在内存中反转为升序返回，
+     * 这样界面按时间顺序追加即可，无需自己排序。</p>
+     *
+     * @param username 当前用户；null 或空白表示不限制
+     * @param peer     对端用户名；仅当 username 也非空时才生效，否则按不限制对端处理
+     * @param from     起始时间（含），可为 null
+     * @param to       结束时间（含），可为 null
+     * @param beforeId 分页游标，只取 id 小于该值的记录；为 null 时从最新一条开始取
+     * @param limit    本页最多返回条数；小于等于 0 时用默认值，超过上限时截断
+     * @return 按时间升序排列的消息列表，永不返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    @Override
+    public List<Message> queryPage(String username, String peer, LocalDateTime from, LocalDateTime to,
+                                   Long beforeId, int limit) throws ChatException {
+        requireAvailable();
+        StringBuilder sql = new StringBuilder("SELECT " + COLUMNS + " FROM chat_message WHERE 1=1");
+        List<Object> params = new ArrayList<>();
+        String self = (username == null || username.trim().isEmpty()) ? null : username.trim();
+        String target = (peer == null || peer.trim().isEmpty()) ? null : peer.trim();
+        if (self != null && target != null) {
+            // 指定对端时只取双方之间的私聊，避免把广播与无关会话混进同一个聊天窗口
+            sql.append(" AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))");
+            params.add(self);
+            params.add(target);
+            params.add(target);
+            params.add(self);
+        } else if (self != null) {
+            // 与 query 保持同一语义：本人收发的消息，或接收者为空（广播/系统通知）
+            sql.append(" AND (sender = ? OR receiver = ? OR receiver = '')");
+            params.add(self);
+            params.add(self);
+        }
+        if (from != null) {
+            sql.append(" AND create_time >= ?");
+            params.add(Timestamp.valueOf(from));
+        }
+        if (to != null) {
+            sql.append(" AND create_time <= ?");
+            params.add(Timestamp.valueOf(to));
+        }
+        if (beforeId != null) {
+            sql.append(" AND id < ?");
+            params.add(beforeId);
+        }
+        sql.append(" ORDER BY id DESC LIMIT ?");
+        params.add(normalizeLimit(limit));
+        List<Message> page = executeQuery(sql.toString(), params);
+        Collections.reverse(page);
+        return page;
+    }
+
+    /**
+     * 判断稳定消息标识是否已存在，用于落库前去重。
+     *
+     * @param messageId 稳定消息标识；null 或空白直接返回 false，不执行 SQL
+     * @return 已存在返回 true
+     * @throws ChatException 读取失败时抛出
+     */
+    @Override
+    public boolean existsByMessageId(String messageId) throws ChatException {
+        requireAvailable();
+        if (messageId == null || messageId.trim().isEmpty()) {
+            return false;
+        }
+        String sql = "SELECT 1 FROM chat_message WHERE message_id = ? LIMIT 1";
+        try (Connection connection = openConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, messageId.trim());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            throw new ChatException("消息标识判重失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 查询某接收者尚未送达的消息，供登录后离线补投。
+     *
+     * @param receiver 接收者用户名；null 或空白时返回空列表
+     * @param limit    最多返回条数；小于等于 0 时用默认值，超过上限时截断
+     * @return 按主键升序（即时间先后）排列的消息列表，永不返回 null
+     * @throws ChatException 读取失败时抛出
+     */
+    @Override
+    public List<Message> findUndelivered(String receiver, int limit) throws ChatException {
+        requireAvailable();
+        if (receiver == null || receiver.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+        String sql = "SELECT " + COLUMNS + " FROM chat_message WHERE receiver = ? AND delivered = 0 "
+                + "ORDER BY id ASC LIMIT ?";
+        List<Object> params = new ArrayList<>();
+        params.add(receiver.trim());
+        params.add(normalizeLimit(limit));
+        return executeQuery(sql, params);
+    }
+
+    /**
+     * 批量把消息标记为已送达。
+     *
+     * <p>入参为空时直接返回 0，不拼接 {@code IN ()} 这种非法 SQL；
+     * 标识先去重去空白，避免重复占位符带来的无谓开销。</p>
+     *
+     * @param messageIds 稳定消息标识集合；null 或空集合时返回 0
+     * @return 实际更新的行数
+     * @throws ChatException 更新失败时抛出
+     */
+    @Override
+    public int markDelivered(Collection<String> messageIds) throws ChatException {
+        requireAvailable();
+        if (messageIds == null || messageIds.isEmpty()) {
+            return 0;
+        }
+        Set<String> ids = new LinkedHashSet<>();
+        for (String messageId : messageIds) {
+            if (messageId != null && !messageId.trim().isEmpty()) {
+                ids.add(messageId.trim());
+            }
+        }
+        if (ids.isEmpty()) {
+            return 0;
+        }
+        StringBuilder sql = new StringBuilder("UPDATE chat_message SET delivered = 1 WHERE message_id IN (");
+        for (int i = 0; i < ids.size(); i++) {
+            if (i > 0) {
+                sql.append(',');
+            }
+            sql.append('?');
+        }
+        sql.append(')');
+        try (Connection connection = openConnection();
+             PreparedStatement ps = connection.prepareStatement(sql.toString())) {
+            int index = 1;
+            for (String messageId : ids) {
+                ps.setString(index++, messageId);
+            }
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new ChatException("消息送达标记失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 归一化分页条数：非法值回落到默认值，超限值截断到上限。
+     *
+     * @param limit 调用方传入的条数
+     * @return 落在 [1, MAX_LIMIT] 区间内的合法条数
+     */
+    private int normalizeLimit(int limit) {
+        if (limit <= 0) {
+            return DEFAULT_LIMIT;
+        }
+        return Math.min(limit, MAX_LIMIT);
     }
 
     /**
@@ -396,6 +589,8 @@ public class JdbcMessageDao implements MessageDao {
             message.setType(type);
         }
         message.setId(rs.getLong("id"));
+        // 稳定标识允许为 NULL（升级前的历史数据），原样读回由上层决定是否补生成
+        message.setMessageId(rs.getString("message_id"));
         Timestamp timestamp = rs.getTimestamp("create_time");
         if (timestamp != null) {
             message.setTimestamp(timestamp.toLocalDateTime());

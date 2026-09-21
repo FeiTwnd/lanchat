@@ -21,6 +21,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.time.LocalDateTime;
@@ -31,6 +32,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 
 /**
  * 单个客户端连接的处理器。
@@ -58,8 +60,14 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".ClientHandler");
 
-    /** 服务器全局传输登记表：传输编号 -> 相关用户名，用于校验文件消息的合法性 */
-    private static final Map<String, String> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
+    /** 用户名格式校验器，预编译正则避免每条报文都重新解析模式串 */
+    private static final Pattern USERNAME_PATTERN = Pattern.compile(Constants.USERNAME_PATTERN);
+
+    /** 传输编号长度上限：正常编号是 36 位 UUID，留出余量即可，过长的键只会白白占用内存 */
+    private static final int MAX_TRANSFER_ID_LENGTH = 64;
+
+    /** 服务器全局传输登记表：传输编号 -> 本次传输的收发双方与阶段状态，用于校验文件消息的合法性 */
+    private static final Map<String, TransferSession> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
 
     /** 客户端连接 */
     private final Socket socket;
@@ -127,6 +135,10 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             }
         } catch (EOFException | SocketException e) {
             LOGGER.info(() -> "客户端连接结束: " + identify());
+        } catch (java.io.InvalidClassException e) {
+            // 反序列化白名单拒绝该类型：可能是恶意 gadget 链，也可能是两端协议版本不一致。
+            // 必须用 WARNING 记录，FINE 级别默认不输出，事后将无从判断连接为何中断
+            LOGGER.warning(() -> "反序列化被白名单拒绝，连接即将关闭: " + e.getMessage());
         } catch (IOException e) {
             LOGGER.log(Level.FINE, "连接读取异常", e);
         } catch (ClassNotFoundException e) {
@@ -149,6 +161,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         out = new ObjectOutputStream(socket.getOutputStream());
         out.flush();
         in = new ObjectInputStream(socket.getInputStream());
+        // 绑定反序列化白名单必须紧跟在创建之后：连接建立后的第一帧就可能携带恶意类型，
+        // 任何一次 readObject 之前都必须完成绑定
+        in.setObjectInputFilter(ChatMessageFactory.serializationFilter());
         out.reset();
     }
 
@@ -192,6 +207,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * <p>安全要点：服务器强制以“连接已登录的用户名”覆盖消息中的发送者字段，
      * 防止恶意客户端伪造他人身份发送消息。</p>
      *
+     * <p>类型与正文校验：文本类消息只应由 {@link TextMessage} 承载，且正文需满足长度与字符集约束。
+     * 客户端可以自行构造任意 {@link Message} 子类并填上 TEXT_PRIVATE 类型，
+     * 若此处直接按文本处理，畸形内容会被当作正常聊天记录入库并转发，
+     * 因此先用 {@code instanceof} 确认实际类型，再交由工厂的校验方法判定正文。</p>
+     *
      * @param message 文本消息
      * @param socket  来源连接
      */
@@ -200,21 +220,33 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (!requireLogin()) {
             return;
         }
-        message.setSender(username);
-        if (message.getType() == MessageType.TEXT_GROUP) {
-            message.setReceiver("");
-            server.getUserManager().broadcastText(message);
-            saveOrWarn(message, "(群聊)");
-            server.notify(ServerObserver.EventType.GROUP_MESSAGE,
-                    username + " 群发: " + message.getSummary());
+        if (!(message instanceof TextMessage text)) {
+            LOGGER.warning(() -> "文本类消息的实际对象类型不符，已拒绝: "
+                    + message.getClass().getName() + " / " + message.getType());
+            send(ChatMessageFactory.error(username, "文本消息格式错误，已拒绝"));
             return;
         }
-        String receiver = message.getReceiver();
+        String contentError = ChatMessageFactory.checkTextContent(text.getContent());
+        if (contentError != null) {
+            LOGGER.warning(() -> "文本消息正文校验未通过: " + username + " - " + contentError);
+            send(ChatMessageFactory.error(username, contentError));
+            return;
+        }
+        text.setSender(username);
+        if (text.getType() == MessageType.TEXT_GROUP) {
+            text.setReceiver("");
+            server.getUserManager().broadcastText(text);
+            saveOrWarn(text, "(群聊)");
+            server.notify(ServerObserver.EventType.GROUP_MESSAGE,
+                    username + " 群发: " + text.getSummary());
+            return;
+        }
+        String receiver = text.getReceiver();
         if (receiver == null || receiver.isEmpty()) {
             send(ChatMessageFactory.error(username, "私聊消息缺少接收者"));
             return;
         }
-        boolean delivered = server.getUserManager().sendTo(receiver, message);
+        boolean delivered = server.getUserManager().sendTo(receiver, text);
         if (!delivered) {
             // 接收者不在线时明确回执失败，而不是静默丢弃；
             // 同时在服务器日志留痕：这条消息没有入库，事后排查"对方没收到"时可直接对照
@@ -222,13 +254,13 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "用户 " + receiver + " 不在线，消息未送达"));
             return;
         }
-        saveOrWarn(message, receiver);
+        saveOrWarn(text, receiver);
         // 回执给发送方，使其界面确认消息已发出
-        TextMessage echo = ChatMessageFactory.text(username, username, message.getSummary(),
+        TextMessage echo = ChatMessageFactory.text(username, username, text.getSummary(),
                 MessageType.TEXT_PRIVATE);
         send(echo);
         server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
-                username + " -> " + receiver + ": " + message.getSummary());
+                username + " -> " + receiver + ": " + text.getSummary());
     }
 
     /**
@@ -257,12 +289,24 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * <p>服务器不落盘、不拆包，只做“转发 + 合法性校验”，
      * 这样既能满足多人同时传文件的需求，又避免服务器成为磁盘与带宽瓶颈。</p>
      *
+     * <p>安全要点：文件消息的发送者、接收者、传输编号与所处阶段全部由客户端提供，
+     * 服务器必须先核对再中继，否则任何人都能凭空注册一次传输、
+     * 冒充他人推进别人的传输，或把数据帧投递给无关用户。</p>
+     *
      * @param message 文件消息
      * @param socket  来源连接
      */
     @Override
     public void handleFileMessage(Message message, Socket socket) {
         if (!requireLogin()) {
+            return;
+        }
+        // 发送者字段完全由客户端填写，而服务器随后会用它覆盖消息发送者并原样中继，
+        // 不先核对就等于替伪造者背书
+        if (!username.equals(message.getSender())) {
+            LOGGER.warning(() -> "文件消息发送者与登录用户不一致，已拒绝: " + message.getSender()
+                    + " / " + username);
+            send(ChatMessageFactory.error(username, "文件消息发送者与登录用户不一致，已拒绝"));
             return;
         }
         message.setSender(username);
@@ -279,6 +323,15 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "文件消息缺少接收者"));
             return;
         }
+        if (fileMessage.getTransferId() == null || fileMessage.getTransferId().isEmpty()
+                || fileMessage.getTransferId().length() > MAX_TRANSFER_ID_LENGTH) {
+            rejectFileMessage(fileMessage, "文件传输编号非法：不能为空且长度不超过 " + MAX_TRANSFER_ID_LENGTH);
+            return;
+        }
+        if (!isValidPeer(receiver)) {
+            rejectFileMessage(fileMessage, "文件消息接收者非法：格式不正确或指向本人");
+            return;
+        }
         switch (fileMessage.getType()) {
             case FILE_REQUEST:
                 // 转发原始消息对象（而非解析后的副本），
@@ -286,23 +339,137 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 handleFileRequest(message, fileMessage, receiver);
                 break;
             case FILE_ACCEPT:
-                TRANSFER_REGISTRY.put(fileMessage.getTransferId(), username);
-                relay(fileMessage, receiver);
+                if (acceptTransfer(fileMessage)) {
+                    relay(fileMessage, receiver);
+                }
                 break;
             case FILE_REJECT:
             case FILE_RESULT:
-                TRANSFER_REGISTRY.remove(fileMessage.getTransferId());
-                relay(fileMessage, receiver);
-                saveTransferRecord(fileMessage);
+                if (finishTransfer(fileMessage)) {
+                    TRANSFER_REGISTRY.remove(fileMessage.getTransferId());
+                    relay(fileMessage, receiver);
+                    saveTransferRecord(fileMessage);
+                }
                 break;
             case FILE_CHUNK:
             case FILE_END:
-                relay(fileMessage, receiver);
+                if (relayTransferStep(fileMessage)) {
+                    relay(fileMessage, receiver);
+                }
                 break;
             default:
                 send(ChatMessageFactory.error(username, "不支持的文件消息类型: " + fileMessage.getType()));
                 break;
         }
+    }
+
+    /**
+     * 校验用户名是否为可用的会话对象。
+     *
+     * <p>为什么不额外查询数据库确认"用户存在"：只有登录成功（已在数据库中核验存在）
+     * 的用户才会进入在线表，而文件传输本就要求对端在线，因此格式校验配合在线判定
+     * 已足以排除任意字符串，也避免为每一次文件请求增加一次数据库往返。</p>
+     *
+     * @param peer 待校验用户名
+     * @return 合法且不是本人返回 true
+     */
+    private boolean isValidPeer(String peer) {
+        return peer != null && !peer.equals(username) && USERNAME_PATTERN.matcher(peer).matches();
+    }
+
+    /**
+     * 拒绝一条非法的文件消息：记录 warning、回执中文错误，并清理已失效的登记项。
+     *
+     * <p>清理只针对当前连接是参与者的登记项：若不加这个限制，任意第三方伪造一条畸形报文
+     * 就能把别人的正常传输从登记表里抹掉，拒绝非法消息的手段反而成了拒绝服务。</p>
+     *
+     * @param message 非法消息
+     * @param reason  中文拒绝原因，同时回执给客户端
+     */
+    private void rejectFileMessage(FileMessage message, String reason) {
+        String transferId = message == null ? null : message.getTransferId();
+        TransferSession session = transferId == null ? null : TRANSFER_REGISTRY.get(transferId);
+        if (session != null && session.involves(username)) {
+            TRANSFER_REGISTRY.remove(transferId);
+        }
+        LOGGER.warning(() -> "文件消息被拒绝: " + username + " - " + reason);
+        send(ChatMessageFactory.error(username, reason));
+    }
+
+    /**
+     * 校验接收方的同意应答并推进登记状态。
+     *
+     * @param message 同意消息
+     * @return 校验通过返回 true；否则回执错误并返回 false
+     */
+    private boolean acceptTransfer(FileMessage message) {
+        TransferSession session = TRANSFER_REGISTRY.get(message.getTransferId());
+        if (session == null) {
+            rejectFileMessage(message, "文件传输未登记，已拒绝应答");
+            return false;
+        }
+        if (!username.equals(session.receiver) || !session.sender.equals(message.getReceiver())) {
+            rejectFileMessage(message, "只有文件接收方可以应答该传输");
+            return false;
+        }
+        if (session.accepted || session.ended) {
+            rejectFileMessage(message, "文件传输状态不允许重复应答");
+            return false;
+        }
+        session.accepted = true;
+        return true;
+    }
+
+    /**
+     * 校验数据块与结束帧是否可以中继。
+     *
+     * <p>状态约束的意义：未登记编号不得凭空进入传输阶段，未获接收方同意不得开始发送数据，
+     * 已收到结束帧的传输不得再次结束——否则接收方会重复拼接同一段数据或重复写出文件。</p>
+     *
+     * @param message 数据块或结束消息
+     * @return 校验通过返回 true；否则回执错误并返回 false
+     */
+    private boolean relayTransferStep(FileMessage message) {
+        TransferSession session = TRANSFER_REGISTRY.get(message.getTransferId());
+        if (session == null) {
+            rejectFileMessage(message, "文件传输未登记，已拒绝数据帧");
+            return false;
+        }
+        if (!username.equals(session.sender) || !session.receiver.equals(message.getReceiver())) {
+            rejectFileMessage(message, "文件数据帧的发送者与登记不一致");
+            return false;
+        }
+        if (!session.accepted) {
+            rejectFileMessage(message, "接收方尚未同意，已拒绝数据帧");
+            return false;
+        }
+        if (session.ended) {
+            rejectFileMessage(message, "文件传输已结束，已拒绝重复结束帧");
+            return false;
+        }
+        if (message.getType() == MessageType.FILE_END) {
+            session.ended = true;
+        }
+        return true;
+    }
+
+    /**
+     * 校验结束回执（结果或被拒绝）是否来自本次传输的合法参与者。
+     *
+     * @param message 结果或拒绝消息
+     * @return 校验通过返回 true；否则回执错误并返回 false
+     */
+    private boolean finishTransfer(FileMessage message) {
+        TransferSession session = TRANSFER_REGISTRY.get(message.getTransferId());
+        if (session == null) {
+            rejectFileMessage(message, "文件传输未登记或已结束，已拒绝重复回执");
+            return false;
+        }
+        if (!session.involves(username) || !session.peerOf(username).equals(message.getReceiver())) {
+            rejectFileMessage(message, "文件回执的参与者与登记不一致");
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -314,18 +481,22 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * @return 文件请求消息；无法解析时返回 null
      */
     private FileMessage decodeFileRequest(Message message) {
-        if (message instanceof FileMessage) {
-            return (FileMessage) message;
+        if (message instanceof FileMessage fileMessage) {
+            return fileMessage;
         }
-        if (message instanceof TextMessage) {
-            TextMessage text = (TextMessage) message;
+        if (message instanceof TextMessage text) {
+            // 承载请求的正文是竖线分隔的控制报文，先做字段数量与字符集校验，
+            // 避免超长字段数组进入解码器
+            if (ChatMessageFactory.splitFields(text.getContent()) == null) {
+                return null;
+            }
             return FileTransferCodec.decode(text.getContent(), text.getSender(), text.getReceiver());
         }
         return null;
     }
 
     /**
-     * 处理文件传输请求：校验接收者在线并转发原始消息。
+     * 处理文件传输请求：校验接收者在线并登记本次传输，然后转发原始消息。
      *
      * @param original 原始消息（可能是文本承载的请求）
      * @param request  解析后的文件请求
@@ -341,7 +512,16 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "用户 " + receiver + " 不在线，无法发送文件"));
             return;
         }
-        TRANSFER_REGISTRY.put(request.getTransferId(), receiver);
+        // 使用 putIfAbsent 而不是 put：旧实现允许同一传输编号被反复覆盖登记，
+        // 攻击者可借此把进行中的传输接收者改到自己名下，从而截获文件数据帧
+        TransferSession previous = TRANSFER_REGISTRY.putIfAbsent(
+                request.getTransferId(), new TransferSession(username, receiver));
+        if (previous != null) {
+            LOGGER.warning(() -> "文件传输编号重复，已拒绝请求: " + username
+                    + " - " + request.getTransferId());
+            send(ChatMessageFactory.error(username, "文件传输编号已存在，已拒绝重复请求"));
+            return;
+        }
         relay(original, receiver);
         server.notify(ServerObserver.EventType.FILE_TRANSFER,
                 username + " 请求向 " + receiver + " 发送 " + request.getSummary());
@@ -405,6 +585,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /**
      * 处理系统控制类消息：登录、注册、注销、心跳、用户列表、历史查询、资料修改。
      *
+     * <p>类型校验说明：控制报文正文都放在 {@link TextMessage} 中，但客户端可以塞入任意子类。
+     * 这里统一用 {@code instanceof} 模式匹配，而不是直接强转——强转失败抛出的
+     * {@code ClassCastException} 不在 {@link #run()} 的捕获范围内，会让整个连接线程退出，
+     * 等于一条畸形报文就能踢掉一个用户。现在只拒绝该条消息并留下 warning，连接继续可用。</p>
+     *
      * @param message 控制消息
      * @param socket  来源连接
      */
@@ -412,10 +597,18 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     public void handleSystemMessage(Message message, Socket socket) {
         switch (message.getType()) {
             case LOGIN:
-                handleLogin((TextMessage) message);
+                if (message instanceof TextMessage text) {
+                    handleLogin(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
                 break;
             case REGISTER:
-                handleRegister((TextMessage) message);
+                if (message instanceof TextMessage text) {
+                    handleRegister(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
                 break;
             case LOGOUT:
                 close();
@@ -428,27 +621,56 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 sendUserList();
                 break;
             case USER_UPDATE:
-                handleUserUpdate((TextMessage) message);
+                if (message instanceof TextMessage text) {
+                    handleUserUpdate(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
                 break;
             case PASSWORD_CHANGE:
-                handlePasswordChange((TextMessage) message);
+                if (message instanceof TextMessage text) {
+                    handlePasswordChange(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
                 break;
             case HISTORY_REQUEST:
-                handleHistoryRequest((TextMessage) message);
+                if (message instanceof TextMessage text) {
+                    handleHistoryRequest(text);
+                } else {
+                    rejectTextRequirement(message);
+                }
                 break;
             case EXPORT_REQUEST:
                 handleExportRequest(socket);
                 break;
             default:
-                LOGGER.fine(() -> "收到未处理的控制消息: " + message.getType());
+                // 已登录用户发来服务器专属类型（如各 RESULT、HEARTBEAT_ACK）属于协议异常，
+                // 必须留下可观测日志，否则这类报文会被静默丢弃、无从排查
+                LOGGER.warning(() -> "收到服务器未处理的控制消息，已忽略: " + username
+                        + " - " + message.getType());
                 break;
         }
+    }
+
+    /**
+     * 拒绝实际类型与要求不符的控制消息。
+     *
+     * @param message 类型不符的消息
+     */
+    private void rejectTextRequirement(Message message) {
+        LOGGER.warning(() -> "控制消息的实际对象类型不符，已拒绝: "
+                + message.getClass().getName() + " / " + message.getType());
+        send(ChatMessageFactory.error(username, "控制消息格式错误，已拒绝"));
     }
 
     /**
      * 处理登录请求。
      *
      * <p>消息正文格式：{@code 用户名|密码}。校验通过后注册到在线表并广播最新用户列表。</p>
+     *
+     * <p>正文先经 {@link ChatMessageFactory#splitFields(String)} 做字段数量与字符集校验，
+     * 超限的正文直接按格式错误处理，不进入业务层。</p>
      *
      * @param message 携带凭据的文本消息
      */
@@ -457,15 +679,17 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "当前连接已登录"));
             return;
         }
-        String content = message.getContent();
-        int separator = content.indexOf('|');
-        if (separator <= 0) {
+        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        if (parts == null || parts.length < 2 || parts[0].isEmpty()) {
             sendLoginResult(false, "登录请求格式错误", null);
             return;
         }
-        String name = content.substring(0, separator);
-        String password = content.substring(separator + 1);
-        Result<User> result = server.getUserService().login(name, password);
+        String name = parts[0];
+        String password = parts[1];
+        // 登录来源用于失败限流的维度：只用用户名计数时，换用户名即可绕过锁定；
+        // 带上来源后，"同一来源爆破同一账号"会更快触发锁定，而共用出口 IP 的教室场景
+        // 仍以用户名为主键，不会互相误伤
+        Result<User> result = server.getUserService().login(name, password, clientAddress());
         if (!result.isSuccess()) {
             server.notify(ServerObserver.EventType.LOGIN_FAILED, name + " 登录失败: " + result.getMessage());
             sendLoginResult(false, result.getMessage(), null);
@@ -494,8 +718,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "已登录状态下不能重复注册"));
             return;
         }
-        String[] parts = message.getContent().split("\\|", -1);
-        if (parts.length < 2) {
+        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        if (parts == null || parts.length < 2) {
             sendPlainResult(MessageType.REGISTER_RESULT, false, "注册请求格式错误");
             return;
         }
@@ -522,7 +746,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (!requireLogin()) {
             return;
         }
-        String[] parts = message.getContent().split("\\|", -1);
+        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        if (parts == null) {
+            send(ChatMessageFactory.error(username, "用户资料变更请求格式错误"));
+            return;
+        }
         String command = parts.length > 0 ? parts[0] : "";
         String argument = parts.length > 1 ? parts[1] : "";
         UserService userService = server.getUserService();
@@ -558,8 +786,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (!requireLogin()) {
             return;
         }
-        String[] parts = message.getContent().split("\\|", -1);
-        if (parts.length < 2) {
+        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        if (parts == null || parts.length < 2) {
             send(ChatMessageFactory.error(username, "密码修改请求格式错误"));
             return;
         }
@@ -648,19 +876,41 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * 日期可为空表示不限制；会话对象为空时返回"本人收发的全部记录 + 广播"，
      * 非空时只返回这两个人之间的私聊记录——私聊窗口在打开时用它补拉最近的对话。</p>
      *
+     * <p>安全要点：正文里的第一个字段由客户端自行填写，服务器绝不能信任它——
+     * 只要改写这一个字符串，任何登录用户都能读到别人的聊天记录，属于典型的水平越权。
+     * 因此查询对象一律取本连接登录成功后保存的用户名，客户端提交的值仅保留字段位置以兼容旧协议，
+     * 绝不参与查询；会话对象虽然只在本人记录范围内做二次过滤，也无法绕过越权，
+     * 但仍需校验格式并排除本人，避免非法字符串进入后续比较与回显。</p>
+     *
      * @param message 携带查询条件的文本消息
      */
     private void handleHistoryRequest(TextMessage message) {
         if (!requireLogin()) {
             return;
         }
-        String[] parts = message.getContent().split("\\|", -1);
-        String target = parts.length > 0 && !parts[0].isEmpty() ? parts[0] : username;
+        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        if (parts == null) {
+            LOGGER.warning(() -> "历史查询报文非法，已拒绝: " + username);
+            sendHistoryError("历史查询请求格式错误或字段超限");
+            return;
+        }
+        String peer = parts.length > 3 ? parts[3].trim() : "";
+        if (!peer.isEmpty() && !USERNAME_PATTERN.matcher(peer).matches()) {
+            LOGGER.warning(() -> "历史查询会话对象非法，已拒绝: " + username + " - " + peer);
+            sendHistoryError("会话对象用户名非法");
+            return;
+        }
+        if (username.equals(peer)) {
+            LOGGER.warning(() -> "历史查询会话对象为本人，已拒绝: " + username);
+            sendHistoryError("会话对象不能是本人");
+            return;
+        }
         LocalDateTime from = parts.length > 1 && !parts[1].isEmpty()
                 ? DateUtil.parse(parts[1] + " 00:00:00") : null;
         LocalDateTime to = parts.length > 2 && !parts[2].isEmpty()
                 ? DateUtil.parse(parts[2] + " 23:59:59") : null;
-        String peer = parts.length > 3 ? parts[3].trim() : "";
+        // 查询对象恒为服务端保存的登录用户名：客户端提交的第一个字段被刻意忽略
+        String target = username;
         MessageService messageService = server.getMessageService();
         Result<List<Message>> result = messageService.queryHistory(target, from, to);
         StringBuilder builder = new StringBuilder();
@@ -679,6 +929,18 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         }
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
                 builder.toString(), MessageType.TEXT_PRIVATE);
+        response.setType(MessageType.HISTORY_RESULT);
+        send(response);
+    }
+
+    /**
+     * 下发历史查询失败回执。
+     *
+     * @param reason 中文失败原因
+     */
+    private void sendHistoryError(String reason) {
+        TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
+                "0|" + reason, MessageType.TEXT_PRIVATE);
         response.setType(MessageType.HISTORY_RESULT);
         send(response);
     }
@@ -727,6 +989,19 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return "";
         }
         return socket.getLocalAddress().getHostAddress() + ":" + socket.getLocalPort();
+    }
+
+    /**
+     * 取连接的客户端地址，用作登录失败限流的来源维度。
+     *
+     * <p>刻意不返回 {@code null}：拿不到地址时回退为 {@code unknown}，
+     * 使限流退化为"仅按用户名"而不是整体失效——限流宁可稍宽，也不能因为取不到地址就形同不存在。</p>
+     *
+     * @return 客户端 IP 文本；无法获取时返回 {@code unknown}
+     */
+    private String clientAddress() {
+        InetAddress address = socket.getInetAddress();
+        return address == null ? "unknown" : address.getHostAddress();
     }
 
     /**
@@ -785,7 +1060,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         server.removeHandler(this);
         if (name != null) {
             server.getUserManager().unregister(name);
-            TRANSFER_REGISTRY.values().removeIf(name::equals);
+            // 无论用户是发送方还是接收方，其参与的所有传输都已无法继续，登记项必须随之清理
+            TRANSFER_REGISTRY.values().removeIf(session -> session.involves(name));
             onUserOffline(name);
             LOGGER.info(() -> "用户连接已清理: " + name);
         }
@@ -895,5 +1171,62 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     @Override
     public String toString() {
         return "ClientHandler{user=" + username + ", remote=" + getRemoteAddress() + "}";
+    }
+
+    /**
+     * 一次文件传输的登记信息。
+     *
+     * <p>为什么登记的不止一个用户名：文件消息跨越请求、应答、数据块、结束、结果五个阶段，
+     * 每个阶段都要判断"发起者是不是本次传输的合法参与者、当前状态是否允许进入下一阶段"。
+     * 只存对端用户名无法区分收发双方，也就无法识别"未同意就传数据""重复结束"这类非法跳转。</p>
+     */
+    private static final class TransferSession {
+
+        /** 文件发送方（文件请求的发起者） */
+        private final String sender;
+
+        /** 文件接收方 */
+        private final String receiver;
+
+        /**
+         * 接收方是否已同意接收。
+         *
+         * <p>该状态由接收方连接线程写入、发送方连接线程读取，故声明为 volatile 保证可见性。</p>
+         */
+        private volatile boolean accepted;
+
+        /** 是否已收到结束帧，用于拒绝重复结束 */
+        private volatile boolean ended;
+
+        /**
+         * 构造登记项。
+         *
+         * @param sender   文件发送方用户名
+         * @param receiver 文件接收方用户名
+         */
+        private TransferSession(String sender, String receiver) {
+            this.sender = sender;
+            this.receiver = receiver;
+        }
+
+        /**
+         * 判断指定用户是否为本次传输的参与者。
+         *
+         * @param name 用户名
+         * @return 是发送方或接收方返回 true
+         */
+        private boolean involves(String name) {
+            return sender.equals(name) || receiver.equals(name);
+        }
+
+        /**
+         * 取指定参与者在本传输中的对端用户名。
+         *
+         * @param name 参与者用户名
+         * @return 对端用户名；name 不是参与者时返回发送方，调用前应先用 {@link #involves(String)} 判断
+         */
+        private String peerOf(String name) {
+            return sender.equals(name) ? receiver : sender;
+        }
     }
 }

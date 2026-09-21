@@ -105,7 +105,9 @@ public class JdbcUserDao implements UserDao {
                 + "username VARCHAR(32) PRIMARY KEY,"
                 + "nickname VARCHAR(64) NOT NULL,"
                 + "salt CHAR(32) NOT NULL,"
-                + "password_hash CHAR(64) NOT NULL,"
+                // 必须与 sql/schema.sql 一致：PBKDF2 散列形如 pbkdf2$120000$<64 位十六进制>，
+                // 约 78 字符，沿用历史 CHAR(64) 会在写入时被数据库拒绝（Data too long）
+                + "password_hash VARCHAR(128) NOT NULL,"
                 + "role VARCHAR(16) NOT NULL DEFAULT 'USER',"
                 + "create_time DATETIME NULL,"
                 + "last_login_time DATETIME NULL)";
