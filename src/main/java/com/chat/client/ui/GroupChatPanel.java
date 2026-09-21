@@ -40,7 +40,6 @@ public class GroupChatPanel extends BaseChatPanel {
     public GroupChatPanel(ChatClient client, Supplier<List<String>> onlineUsers) {
         super(client);
         this.onlineUsers = onlineUsers;
-        getInputField().setToolTipText(placeholder());
     }
 
     /**
