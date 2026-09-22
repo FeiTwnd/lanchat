@@ -217,6 +217,9 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /** 客户端引用 */
     protected final transient ChatClient client;
 
+    /** 撤回策略，由主窗口注入；未注入时消息气泡不出现"撤回"项 */
+    private transient RecallHandler recallHandler;
+
     /** 聊天记录滚动面板 */
     private final JScrollPane historyScroll;
 
@@ -566,6 +569,39 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     }
 
     /**
+     * 注入撤回策略。
+     *
+     * <p>由主窗口在创建聊天窗口时注入，面板不反向依赖主窗口：撤回的时限判断要读发送时刻，
+     * 那份记录只有主窗口有，面板只负责把气泡右键菜单里的点击转交出去。</p>
+     *
+     * @param handler 撤回策略；传 null 表示本会话不提供撤回入口
+     */
+    public void setRecallHandler(RecallHandler handler) {
+        this.recallHandler = handler;
+    }
+
+    /**
+     * 撤回策略：把"能不能撤"与"执行撤回"两件事交给掌握发送状态的一方实现。
+     */
+    public interface RecallHandler {
+
+        /**
+         * 判断某条消息此刻是否可撤回。
+         *
+         * @param messageId 稳定消息标识
+         * @return 可撤回返回 true
+         */
+        boolean canRecall(String messageId);
+
+        /**
+         * 请求撤回某条消息。
+         *
+         * @param messageId 稳定消息标识
+         */
+        void recall(String messageId);
+    }
+
+    /**
      * 获取待发送引用的被引用消息标识。
      *
      * @return 稳定消息标识，没有引用时为 null
@@ -655,10 +691,27 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * @param color   来源颜色
      */
     public void appendMessage(String prefix, String content, Color color) {
+        appendMessage(prefix, content, color, null);
+    }
+
+    /**
+     * 向聊天记录追加一条消息气泡，并带上稳定消息标识。
+     *
+     * <p>标识是"这条消息能被引用、能被撤回"的前提。本人发出的消息只有走带标识的重载
+     * 才有右键菜单：本地回显时正文、时刻都由面板自己产生，标识却由发送通道分配，
+     * 不由发送方回传的话，面板永远无从知道自己是哪一条。</p>
+     *
+     * @param prefix    前缀（发送者或提示）
+     * @param content   正文
+     * @param color     来源颜色
+     * @param messageId 稳定消息标识，没有时传 null
+     */
+    public void appendMessage(String prefix, String content, Color color, String messageId) {
         String text = content == null ? "" : content;
         appendEntry(new Entry(prefix, text, COLOR_SELF.equals(color),
                 COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color),
-                LocalDateTime.now(), color, null, null, false));
+                LocalDateTime.now(), color,
+                messageId == null || messageId.isEmpty() ? null : messageId, null, false));
     }
 
     /**
@@ -799,18 +852,72 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /**
      * 构建消息右键菜单。
      *
-     * <p>目前只有"引用"一项。引用需要被引用消息的稳定标识，而历史记录响应里不带该标识，
-     * 因此只有实时收到的消息才有右键菜单，历史消息无法引用。</p>
+     * <p>两项都要求消息带稳定标识：引用需要它来指代被引用的那一条，撤回需要它来向服务端
+     * 指明撤哪一条，而历史记录响应里不带该标识，因此历史消息没有右键菜单。</p>
+     *
+     * <p>"撤回"只在本人发出的消息上出现，且是否真的可撤回交给 {@link RecallHandler} 裁决：
+     * 时限与发送时刻只有掌握发送状态的主窗口知道，面板不重复记一份，避免两处判断互相矛盾。</p>
      *
      * @param entry 消息模型
-     * @return 右键菜单
+     * @return 右键菜单；没有任何可选项时返回 null
      */
-    private JPopupMenu buildQuoteMenu(Entry entry) {
+    private JPopupMenu buildRowMenu(Entry entry) {
+        String messageId = entry.messageId();
+        if (messageId == null || messageId.isEmpty()) {
+            return null;
+        }
         JPopupMenu menu = new JPopupMenu();
-        JMenuItem quote = new JMenuItem("引用");
-        quote.addActionListener(e -> setPendingQuote(entry.messageId(), entry.content()));
-        menu.add(quote);
-        return menu;
+        if (isQuoteSupported()) {
+            JMenuItem quote = new JMenuItem("引用");
+            quote.addActionListener(e -> setPendingQuote(messageId, entry.content()));
+            menu.add(quote);
+        }
+        if (entry.self() && recallHandler != null) {
+            JMenuItem recall = new JMenuItem("撤回");
+            recall.addActionListener(e -> recallHandler.recall(messageId));
+            // 可撤回与否随时间流逝而变（2 分钟一到就不再可撤），也可能因为刚刚撤回成功而失效，
+            // 因此每次弹出菜单时重新判定一次，而不是在气泡渲染时就定死
+            menu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
+
+                @Override
+                public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent event) {
+                    recall.setVisible(recallHandler.canRecall(messageId));
+                }
+
+                @Override
+                public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent event) {
+                    // 无需处理：可见性每次弹出时重算
+                }
+
+                @Override
+                public void popupMenuCanceled(javax.swing.event.PopupMenuEvent event) {
+                    // 无需处理：取消不改动菜单项
+                }
+            });
+            menu.add(recall);
+        }
+        return menu.getComponentCount() == 0 ? null : menu;
+    }
+
+    /**
+     * 把右键菜单安装到消息行及其全部子组件上。
+     *
+     * <p>必须递归安装：{@code setComponentPopupMenu} 不会被子组件继承，只装在气泡最外层容器上时，
+     * 右键落在正文文本区或头像上会走该组件自己的分发路径，菜单根本不弹——使用者看到的
+     * 就是"右键没反应"。</p>
+     *
+     * @param component 消息行组件
+     * @param menu      右键菜单
+     */
+    private void installRowMenu(Component component, JPopupMenu menu) {
+        if (component instanceof JComponent) {
+            ((JComponent) component).setComponentPopupMenu(menu);
+        }
+        if (component instanceof java.awt.Container) {
+            for (Component child : ((java.awt.Container) component).getComponents()) {
+                installRowMenu(child, menu);
+            }
+        }
     }
 
     /**
@@ -1280,8 +1387,9 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         if (entry.highlight()) {
             bubble.setHighlighted(true);
         }
-        if (isQuoteSupported() && entry.messageId() != null && !entry.messageId().isEmpty()) {
-            bubble.setComponentPopupMenu(buildQuoteMenu(entry));
+        JPopupMenu rowMenu = buildRowMenu(entry);
+        if (rowMenu != null) {
+            installRowMenu(bubble, rowMenu);
         }
         bubble.setAvailableWidth(messageList.getWidth() > 0
                 ? messageList.getWidth() : FALLBACK_LIST_WIDTH);

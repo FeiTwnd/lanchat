@@ -117,6 +117,18 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
+     * 获取自定义标题栏。
+     *
+     * <p>供子类在标题栏上叠加状态提示（例如主窗口的未读合计角标）；
+     * 标题栏在构造时必定已创建，正常情况下不会是 null。</p>
+     *
+     * @return 标题栏
+     */
+    protected SkinTitleBar titleBar() {
+        return titleBar;
+    }
+
+    /**
      * 递归设置组件字体，保证中文在所有平台上一致渲染。
      *
      * @param component 根组件

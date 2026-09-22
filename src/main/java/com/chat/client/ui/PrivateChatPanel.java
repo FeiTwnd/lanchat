@@ -56,13 +56,13 @@ public class PrivateChatPanel extends BaseChatPanel {
      */
     @Override
     protected boolean doSend(String content) {
-        boolean sent = client.sendPrivateText(peer, content);
-        if (sent) {
-            appendMessage("我", content, COLOR_SELF);
+        String messageId = client.sendPrivateTextReturningId(peer, content, null, null);
+        if (messageId != null) {
+            appendMessage("我", content, COLOR_SELF, messageId);
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }
-        return sent;
+        return messageId != null;
     }
 
     /**
@@ -148,13 +148,13 @@ public class PrivateChatPanel extends BaseChatPanel {
                     COLOR_ERROR);
             return false;
         }
-        boolean sent = client.sendPrivateText(peer, content, quoteId, quoteSummary);
-        if (sent) {
-            appendMessage("我", content, COLOR_SELF);
+        String messageId = client.sendPrivateTextReturningId(peer, content, quoteId, quoteSummary);
+        if (messageId != null) {
+            appendMessage("我", content, COLOR_SELF, messageId);
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }
-        return sent;
+        return messageId != null;
     }
 
     /**

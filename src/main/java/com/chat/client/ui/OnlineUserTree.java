@@ -1,6 +1,7 @@
 package com.chat.client.ui;
 
 import com.chat.client.ui.theme.AvatarFactory;
+import com.chat.client.ui.theme.Badge;
 import com.chat.client.ui.theme.Theme;
 import com.chat.common.User;
 
@@ -12,7 +13,9 @@ import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import java.awt.Component;
+import java.awt.Dimension;
 import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,6 +51,9 @@ public class OnlineUserTree extends JTree {
     /** 离线分组名 */
     private static final String GROUP_OFFLINE = "离线";
 
+    /** 未读角标与正文之间的间距（像素） */
+    private static final int BADGE_GAP = 8;
+
     /** 根节点 */
     private final DefaultMutableTreeNode root = new DefaultMutableTreeNode("在线用户");
 
@@ -59,6 +65,14 @@ public class OnlineUserTree extends JTree {
 
     /** 本次会话出现过但当前已离线的用户 */
     private final transient Map<String, User> offline = new LinkedHashMap<>();
+
+    /**
+     * 各用户的私聊未读条数：用户名 -> 未读条数，没有未读的用户不出现在表中。
+     *
+     * <p>必须存放在树模型之外：{@link #rebuild()} 每次刷新都会重建全部节点，
+     * 未读若挂在节点上，任何一次用户列表推送都会把它清零。</p>
+     */
+    private final transient Map<String, Integer> unread = new LinkedHashMap<>();
 
     /** 过滤关键字 */
     private transient String filter = "";
@@ -107,8 +121,68 @@ public class OnlineUserTree extends JTree {
         for (String username : current) {
             offline.remove(username);
         }
+        // 未读表与在线/离线表是两套数据，必须跟着一起清理：
+        // 用户离线后被管理员删除时就再也不会出现在任何一张表里，
+        // 残留的计数既画不出红点，又会让标题栏的合计角标长期虚高
+        unread.keySet().removeIf(username -> !online.containsKey(username)
+                && !offline.containsKey(username));
         rebuild();
         return online.size();
+    }
+
+    /**
+     * 设置各用户的私聊未读条数。
+     *
+     * @param counts 用户名 -> 未读条数；计数为 0 或负数的条目会被忽略
+     */
+    public void setUnread(Map<String, Integer> counts) {
+        unread.clear();
+        if (counts != null) {
+            for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                    unread.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        repaint();
+    }
+
+    /**
+     * 获取某用户的私聊未读条数。
+     *
+     * @param username 用户名
+     * @return 未读条数，没有未读时返回 0
+     */
+    public int unreadCount(String username) {
+        Integer count = username == null ? null : unread.get(username);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 判断某用户是否在线。
+     *
+     * @param username 用户名
+     * @return 在线返回 true
+     */
+    public boolean isOnline(String username) {
+        return username != null && online.containsKey(username);
+    }
+
+    /**
+     * 按用户名查找用户，先查在线表再查离线表。
+     *
+     * <p>{@link #onlineUsers()} 只覆盖在线用户，而资料卡对离线用户同样要能打开——
+     * "谁刚刚还在"正是列表保留离线分组的价值所在。</p>
+     *
+     * @param username 用户名
+     * @return 用户对象；两张表都没有时返回 null
+     */
+    public User findUser(String username) {
+        if (username == null) {
+            return null;
+        }
+        User user = online.get(username);
+        return user != null ? user : offline.get(username);
     }
 
     /**
@@ -128,6 +202,23 @@ public class OnlineUserTree extends JTree {
      */
     public User selectedUser() {
         TreePath path = getSelectionPath();
+        if (path == null) {
+            return null;
+        }
+        Object last = ((DefaultMutableTreeNode) path.getLastPathComponent()).getUserObject();
+        return last instanceof Entry ? ((Entry) last).user : null;
+    }
+
+    /**
+     * 获取指定路径对应的用户。
+     *
+     * <p>与 {@link #selectedUser()} 的区别是不看选中态、只看路径：鼠标点击发生在选中态更新之前，
+     * 单击弹资料卡时若读选中态，拿到的会是上一次点中的那一行。</p>
+     *
+     * @param path 节点路径
+     * @return 用户对象；路径为空、指向分组节点或根节点时返回 null
+     */
+    public User selectedUserOn(TreePath path) {
         if (path == null) {
             return null;
         }
@@ -270,6 +361,15 @@ public class OnlineUserTree extends JTree {
         private transient boolean selectedRow;
 
         /**
+         * 当前渲染的行的未读条数。
+         *
+         * <p>渲染器是静态嵌套类、不持有外层树的引用，未读数只能由
+         * {@link #getTreeCellRendererComponent} 从传入的 {@code tree} 参数上取一次，
+         * 再留给随后的 {@link #paint} 使用——渲染与绘制是两个先后发生的调用。</p>
+         */
+        private transient int unreadCount;
+
+        /**
          * 渲染节点。
          *
          * @param tree     树
@@ -287,6 +387,7 @@ public class OnlineUserTree extends JTree {
                                                      boolean hasFocus) {
             super.getTreeCellRendererComponent(tree, value, selected, expanded, leaf, row, hasFocus);
             selectedRow = selected;
+            unreadCount = 0;
             Object payload = ((DefaultMutableTreeNode) value).getUserObject();
             setFont(Theme.fontBase());
             setIconTextGap(6);
@@ -304,6 +405,10 @@ public class OnlineUserTree extends JTree {
                         + user.getUsername() + " · " + role + " · " + state + "</font></body></html>");
                 setIcon(AvatarFactory.avatar(entry.online, user.isAdmin(), 34));
                 setToolTipText(nickname + "（" + user.getUsername() + "）· " + role + " · " + state);
+                // 未读只认树上的那份数据：渲染器自己不保存任何计数，避免与树的状态各记一份
+                if (tree instanceof OnlineUserTree) {
+                    unreadCount = ((OnlineUserTree) tree).unreadCount(user.getUsername());
+                }
             } else {
                 setText(String.valueOf(payload));
                 setFont(Theme.fontBold());
@@ -326,6 +431,33 @@ public class OnlineUserTree extends JTree {
                 g.fillRect(0, 0, getWidth(), getHeight());
             }
             super.paint(g);
+            if (unreadCount > 0) {
+                // 画在父类之后：图标与文字由 super.paint 铺好，角标必须压在最上层。
+                // 宽度已在 getPreferredSize 里为角标预留好，这里贴着行右端画即可
+                Graphics2D g2 = (Graphics2D) g.create();
+                Badge.paint(g2, getWidth(), getHeight() / 2, unreadCount);
+                g2.dispose();
+            }
+        }
+
+        /**
+         * 在首选宽度里为未读角标预留位置。
+         *
+         * <p>必须在这里加宽而不是在绘制时往右画：树的行宽取自渲染器的首选尺寸，
+         * 绘制会被限制在这个宽度内，直接画到行尾只会把正文尾巴盖住。</p>
+         *
+         * <p>加宽量只取决于角标自身宽度，不参考树或视口的宽度，因此不会与树的布局
+         * 形成互相撑大的循环；没有未读的行宽度分毫不变。</p>
+         *
+         * @return 首选尺寸
+         */
+        @Override
+        public Dimension getPreferredSize() {
+            Dimension size = super.getPreferredSize();
+            if (unreadCount > 0) {
+                size.width += BADGE_GAP + Badge.widthOf(unreadCount);
+            }
+            return size;
         }
 
         /**

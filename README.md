@@ -3,7 +3,7 @@
 一个基于 **Java SE + Socket + 多线程 + Swing** 的类 QQ 局域网聊天系统，采用 C/S 架构，
 纯标准库实现，**不依赖任何第三方框架**（不使用 Netty、Spring、JavaFX）；唯一的外部 jar 是
 MySQL 的 JDBC 驱动（`lib/mysql-connector-j-8.2.0.jar`），用于连接本项目唯一的存储——MySQL。
-代码原创，总计 19024 行主源码（59 个文件）与 2577 行测试代码（10 个文件），全部中文注释。
+代码原创，总计 21849 行主源码（62 个文件）与 2730 行测试代码（10 个文件），全部中文注释。
 
 ---
 
@@ -15,8 +15,11 @@ MySQL 的 JDBC 驱动（`lib/mysql-connector-j-8.2.0.jar`），用于连接本�
 | 用户管理 | 注册、登录、修改昵称、修改密码、按用户名查询、管理员删除用户 | 口令以 PBKDF2（12 万次迭代）加盐散列存储，不存明文；兼容历史单轮 SHA-256 散列并在登录成功后透明升级；用户名唯一；同一账号不允许重复登录；登录失败 5 次锁定 5 分钟 |
 | 在线用户列表 | 好友树形式展示在线用户，按管理员/普通用户/离线分组并显示人数 | 服务端 `ConcurrentHashMap` 维护在线表，变更后向所有客户端广播列表快照；客户端 `JTree` + 自定义 `TreeCellRenderer` 渲染头像、昵称、账号与在线状态 |
 | 界面皮肤 | 无系统边框窗口、自绘标题栏与按钮、Java2D 生成头像与图标，零图片资源 | `com.chat.client.ui.theme` 包统一配色、字体与绘制；窗口可拖动、双击最大化、右下角缩放 |
-| 私聊 | 双击用户即可一对一聊天 | 消息含发送者/接收者/内容/时间/类型，服务器按接收者定向转发，对方不在线时明确回执失败 |
+| 私聊 | 双击用户即可一对一聊天 | 消息含发送者/接收者/内容/时间/类型，服务器按接收者定向转发，对方不在线时明确回执失败；窗口未打开时消息计入未读并在好友树该行显示红点，不主动弹窗打断使用者 |
 | 群聊 | 群聊大厅，所有人可见 | 服务器广播给全部在线连接，含用户上下线系统通知；群聊窗口关闭期间累计未读条数并显示在主界面入口按钮上 |
+| 未读提示 | 好友树每行红点角标 + 主窗口标题栏合计角标 | 群聊未读与各私聊未读分别累计，标题栏显示两者合计（超过 99 显示 `99+`）；打开窗口或把窗口切回前台即清零 |
+| 消息撤回 | 仅发送者本人可在 2 分钟内撤回 | 入口有两处：私聊窗口里自己消息气泡的右键菜单、主窗口功能菜单，共用同一份「是否可撤回」判定；群聊大厅是全员广播，服务端对群聊记录没有"单一对端"可通知，因此群聊气泡的右键菜单只提供「引用」、不提供「撤回」；服务端二次校验身份与时限，重复撤回幂等；撤回后正文以占位文本替换，历史查询、关键字检索与导出三条路径同时不可见原文 |
+| 消息搜索 | 按关键字检索本人收发的消息 | 服务端在应用层解密后匹配（正文加密落库），结果对话框可直接跳转到对应会话 |
 | 文件传输 | 发送任意类型文件，带实时进度条 | 64KB 分块传输、接收方确认、SHA-256 完整性校验、失败自动清理残缺文件、单文件上限 200MB |
 | 消息可靠性 | 稳定消息标识、送达确认、离线消息补投、断线重连 | 网络层与服务端已实现：发送侧为每条消息生成稳定 `message_id`，服务端据此幂等去重；接收方确认后置为已投递，未投递的消息在对方下次登录时补投（客户端按标识去重，实现"至少一次投递"）；连接断开后客户端用会话令牌（30 分钟有效）自动重连并恢复登录态。相关界面展示随第 3 轮完善 |
 | 消息持久化 | 聊天记录统一存入 MySQL，支持按用户与日期范围查询、导出 | 三张表 `chat_user` / `chat_message` / `chat_file_log`，启动时自动建表；正文以 AES-GCM 密文落库 |
@@ -88,7 +91,46 @@ javac -version
 
 ## 四、快速开始
 
-### 方式一：在 IntelliJ IDEA 中运行（推荐）
+### 方式一：在 VSCode 中运行（推荐）
+
+本项目在 VSCode 下的构建配置位于 `.vscode/settings.json` 与 `.vscode/launch.json`：
+前者声明源码根、依赖 jar 与 JDK，后者提供全部运行配置。不依赖 Maven/Gradle，
+也无需手工配置源码根与类路径。
+
+> 说明：IDE 工程文件按惯例不入库（与 `.idea/` 同等处理，见 `.gitignore`），
+> 因此克隆仓库后若没有 `.vscode/` 目录，按本节步骤自行创建同名文件即可，
+> 关键是 `java.project.sourcePaths`、`java.project.referencedLibraries`、
+> `java.configuration.runtimes` 三项以及各运行配置的 `cwd`。
+
+1. **打开正确的目录**：`File -> Open Folder`，选择项目根目录 `lanchat-master/`
+   （即直接包含 `src`、`lib`、`config` 的那一层）。不要打开它的上级目录 ——
+   否则工作区根不是项目根，`.vscode` 配置不生效（运行配置下拉框会是空的），
+   程序也会因工作目录不对而读不到 `config/chat.properties`。
+2. **安装 Java 扩展**：安装扩展包 `vscjava.vscode-java-pack`（含 Language Support for Java、
+   Debugger for Java）。装好后首次打开工程会自动导入，状态栏显示导入进度，通常需要几十秒；
+   待 `.java` 文件不再报红、类名可以 `Ctrl+点击` 跳转，即为导入完成。
+3. **确认 JDK**：`.vscode/settings.json` 中已把 `java.configuration.runtimes` 的 `default`
+   指向本机 JDK 26。**本项目代码使用了 Java 16+ 的 `instanceof` 模式匹配**
+   （见 `com.chat.server.ClientHandler`），用 JDK 11 编译必然失败，因此项目使用的 JDK 不得低于 17。
+   若你的 JDK 安装路径不同，只需修改该文件中的 `path`。
+4. **运行**：按 `Ctrl+Shift+D` 打开「运行和调试」面板，在顶部下拉框选择配置后按 `F5`。
+   可选配置与 IDEA 方式完全一致（见下方表格）。
+5. **多开客户端**：演示双人聊天时，选中「客户端（可多开）」后**重复按 `F5`** 即可 ——
+   VSCode 会为每次启动建立独立的调试会话，不会像 IDEA 那样终止已登录的客户端。
+
+三点必须注意：
+
+- **工作目录**：`launch.json` 中所有配置的 `cwd` 均锁定为 `${workspaceFolder}`（项目根）。
+  这与程序以 `user.dir` 定位 `config/chat.properties` 和 `data/` 的约定一致，请勿改动。
+- **端口占用**：同一时刻只保留一个服务器实例，否则新实例会因 9527 端口被占用而启动失败，
+  运行集成测试前尤其需要检查。
+- **编码**：VSCode 默认按 UTF-8 读写源码，一般无需额外设置；若中文注释显示乱码，
+  检查右下角的文件编码是否为 UTF-8。
+
+> 编译输出目录：VSCode 为 `out/vscode`，IDEA 为 `out/production/lanchat-master`，
+> 两者刻意分开，即使两个 IDE 同时打开也不会互相覆盖 class 文件。
+
+### 方式二：在 IntelliJ IDEA 中运行（可选）
 
 本项目是普通 Java 工程，不依赖 Maven/Gradle，用 IDEA 打开后按以下步骤操作即可。
 
@@ -99,8 +141,8 @@ javac -version
    `com.chat.test` 包下的类会全部报红，测试也无法运行。
 3. 添加数据库驱动：`File -> Project Structure -> Libraries -> + -> Java`，选择仓库内的
    `lib/mysql-connector-j-8.2.0.jar`（服务器与测试配置需要；只运行客户端可以不添加）。
-4. 编译：菜单 `Build -> Rebuild Project`。主源码产物在 `out/production/LANChat`，
-   测试源码产物在 `out/test/LANChat`。
+4. 编译：菜单 `Build -> Rebuild Project`。主源码产物在 `out/production/lanchat-master`，
+   测试源码产物在 `out/test/lanchat-master`。
 5. 运行：在工具栏的运行配置下拉框中选择下表中的任一配置，点击 `Run`。
 
 | 配置名 | 主类 | 程序参数 | 说明 |
@@ -109,7 +151,7 @@ javac -version
 | 客户端（可多开） | `com.chat.client.ChatClientApp` | 无 | 演示多用户必须先允许并行运行 |
 | 客户端（含内置服务器） | `com.chat.client.ChatClientApp` | `--local-server` | 单机一键演示 |
 | 单元测试（47 用例） | `com.chat.test.TestRunner` | 无 | 项目自带的零依赖测试框架 |
-| 集成测试（7 用例） | `com.chat.test.IntegrationTest` | 无 | 内部自行启动服务器与多个客户端 |
+| 集成测试（8 用例） | `com.chat.test.IntegrationTest` | 无 | 内部自行启动服务器与多个客户端 |
 
 本机 `.idea/runConfigurations/` 下已生成上述 5 个配置，打开 IDEA 后可直接在下拉框中选择
 （IDE 工程文件按惯例不入库，因此只在本机生效）；若列表中没有出现，按上表手工新增即可。
@@ -127,24 +169,24 @@ javac -version
   中文界面文案；另外 `config/chat.properties` 由 `Properties.load(InputStream)` 读取，
   该方法按 ISO-8859-1 解码，若要在配置值中写中文，需使用 `\uXXXX` 转义形式。
 
-IDEA 的编译输出目录是 `out/production/LANChat`（主源码）与 `out/test/LANChat`（测试源码），
-源码本身不产生其它中间目录。
+IDEA 的编译输出目录是 `out/production/lanchat-master`（主源码）与 `out/test/lanchat-master`（测试源码），
+VSCode 则输出到 `out/vscode`；两者互不干扰。
 
-### 方式二：命令行方式（可选）
+### 方式三：命令行方式（可选）
 
 在 IDEA 中构建过一次之后，也可以直接用命令行运行它的产物。
 服务器需要连接数据库，因此类路径中必须包含 JDBC 驱动 jar：
 
 ```bash
 # 服务器（图形控制台）
-java -cp "out/production/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.server.ChatServer
+java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.chat.server.ChatServer
 
 # 客户端（可多开）——客户端不连数据库，无需驱动
-java -cp out/production/LANChat com.chat.client.ChatClientApp
+java -cp out/production/lanchat-master com.chat.client.ChatClientApp
 
 # 测试
-java -cp "out/production/LANChat:out/test/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.test.TestRunner
-java -cp "out/production/LANChat:out/test/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.test.IntegrationTest
+java -cp "out/production/lanchat-master:out/test/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.chat.test.TestRunner
+java -cp "out/production/lanchat-master:out/test/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.chat.test.IntegrationTest
 ```
 
 Windows 下把类路径分隔符 `:` 换成 `;`。
@@ -202,7 +244,7 @@ LANChat/
 │   ├── server/        服务器端：主服务、连接处理器、消息处理器、用户管理、UDP 发现、控制台界面
 │   └── client/        客户端：网络层 + ui 子包的 Swing 界面
 │       └── ui/theme/  界面皮肤：配色与字体、Java2D 图标与头像、自绘按钮与标题栏、窗口缩放手柄
-├── src/test/java/com/chat/test/       测试代码（10 个 .java，2577 行；零依赖自研测试框架）
+├── src/test/java/com/chat/test/       测试代码（10 个 .java，2730 行；零依赖自研测试框架）
 ├── config/            chat.properties 与其模板 chat.properties.example
 ├── sql/               schema.sql 建表与升级脚本（程序启动时会自动建表，此脚本用于手工初始化或重建）
 ├── lib/               mysql-connector-j-8.2.0.jar（服务器与测试连接数据库所需）
@@ -266,7 +308,7 @@ mysql -u root -p < sql/schema.sql
 #    security.message.secret、admin.password
 
 # 3. 启动服务器时把驱动加入类路径（IDEA 中把 lib/mysql-connector-j-8.2.0.jar 加为工程依赖）
-java -cp "out/production/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.server.ChatServer
+java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.chat.server.ChatServer
 ```
 
 数据库不可用时服务器会**拒绝启动**并在日志中说明原因（而不是静默换一种存储方式）。
@@ -279,12 +321,12 @@ java -cp "out/production/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.serve
 
 项目采用**零依赖自研测试框架**（自定义 `@Test` 注解 + 反射运行器 `TestRunner`），
 **不使用 JUnit / Mockito**，保证任何 JDK 环境都能直接编译运行。在 IDEA 的运行配置下拉框中选择
-`单元测试（47 用例）` 或 `集成测试（7 用例）` 后点击 `Run` 即可（命令行等价写法见第四节）。
+`单元测试（47 用例）` 或 `集成测试（8 用例）` 后点击 `Run` 即可（命令行等价写法见第四节）。
 
 | 测试类型 | 用例数 | 结果 | 覆盖范围 |
 |---|---|---|---|
 | 单元测试 | 47 | 全部通过 | `SecurityUtilTest` 7、`UserDaoTest` 7、`UserServiceTest` 9、`MessageServiceTest` 12、`FileServiceTest` 12 |
-| 集成测试 | 7 | 全部通过 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景 |
+| 集成测试 | 8 | 全部通过 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景、消息撤回（本人/时限/幂等/越权/占位替换） |
 | 组件级界面校验 | 6 | 全部通过 | 默认头像无渐变、在线/离线状态标记与管理员描边、好友树选中行整行浅蓝且无系统外观橙色、选中态像素断言、私聊与群聊窗口的"发送文件"按钮（离屏渲染 + 像素断言，截图见 `docs/test/screenshots/`） |
 | 界面走查 | 14 | 上一轮通过，本轮未重跑 | 无边框窗口与拖动缩放、好友树分组、私聊/群聊渲染次数、文件传输进度、离线归组（Xvfb + Robot，上一轮快照） |
 
@@ -307,7 +349,7 @@ java -cp "out/production/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.serve
 | 数据库与持久化设计 | `docs/design/03-数据库与持久化设计.md` | MySQL 存储、ER 图、三张表的表结构、索引与安全设计 |
 | 实现说明 | `docs/design/04-实现说明.md` | 文件清单、关键方法签名、关键算法、扩展指南 |
 | 测试报告 | `docs/test/测试报告.md` | 测试策略、结果汇总、需求覆盖矩阵、缺陷记录 |
-| 测试用例表 | `docs/test/测试用例表.md` | 74 个用例（47 单元 + 7 集成 + 6 组件级界面校验 + 14 上一轮界面走查）的输入、预期、实际与结论 |
+| 测试用例表 | `docs/test/测试用例表.md` | 75 个用例（47 单元 + 8 集成 + 6 组件级界面校验 + 14 上一轮界面走查）的输入、预期、实际与结论 |
 | 课程设计报告 | `docs/report/课程设计报告.md` | 按高校模板撰写的完整报告 |
 | 答辩 PPT 大纲 | `docs/ppt/答辩PPT大纲.md` | 逐页大纲、演示脚本、答辩问题准备 |
 
@@ -392,10 +434,19 @@ java -cp "out/production/LANChat:lib/mysql-connector-j-8.2.0.jar" com.chat.serve
   已在服务端、客户端与界面接通。
 - 界面（第 3 轮）已交付：左右消息气泡（自己靠右、他人靠左、系统消息居中）、多行输入
   （Enter 发送 / Shift+Enter 换行、输入法组合期间不误发）、智能时间戳、空状态、
-  群聊入口按钮的未读条数、拖拽发送文件、剪贴板图片发送、Unicode 表情面板、
-  群聊 `@` 提醒与候选补全、引用回复（私聊与群聊）、消息搜索对话框、主窗口菜单中的撤回入口、
-  历史记录分页与「加载更早的消息」；并修复了文件被拒或失败后发送会话与文件句柄未释放的问题。
-- 界面（第 3 轮）尚未落地：私聊与全局未读角标、断线横幅、头像资料卡。
+  拖拽发送文件、剪贴板图片发送、Unicode 表情面板、群聊 `@` 提醒与候选补全、
+  引用回复（私聊与群聊）、消息搜索对话框、**私聊气泡右键与主窗口菜单两处**的撤回入口
+  （群聊气泡的右键菜单提供「引用」；群聊是全员广播，服务端对群聊记录没有单一对端可通知，故不提供撤回）、
+  历史记录分页与「加载更早的消息」；
+  并修复了文件被拒或失败后发送会话与文件句柄未释放的问题。
+- 未读提示已覆盖群聊与私聊：群聊入口按钮显示「进入群聊大厅（N 条未读）」，
+  好友树中该用户所在行右端显示红点角标，主窗口标题栏同时显示两处未读的合计数
+  （超过 99 显示 `99+`）；打开对应窗口或将窗口切回前台即清零。
+- 连接异常有常驻横幅提示：与服务器断开并进入重连时，主窗口顶部出现警示色横幅并显示重连次数；
+  重连成功后横幅转为成功色提示「已重新连接，会话已恢复」，3 秒后自动消失。
+- 好友树中单击任一用户行会弹出头像资料卡（头像、昵称、`用户名 · 角色 · 状态`），
+  卡片内可直接「发消息」打开与该用户的私聊窗口。单击会先等过一个系统双击间隔再弹卡，
+  因此双击打开私聊时不会顺带弹出资料卡；同一时刻只保留一张卡片。
 
 ### 11.3 其它
 

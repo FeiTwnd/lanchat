@@ -47,18 +47,22 @@ public class GroupChatPanel extends BaseChatPanel {
     /**
      * 发送群聊消息。
      *
+     * <p>必须取带标识的返回值而不是只看发送成功与否：本地回显的正文与时刻都由面板自己产生，
+     * 标识却由发送通道分配，不取回来的话，自己发的这一条在界面上永远没有标识，
+     * 也就装不出右键菜单——私聊那边同样的问题即缺陷 D-19，此处是群聊侧的同一根因。</p>
+     *
      * @param content 正文
      * @return 发送成功返回 true
      */
     @Override
     protected boolean doSend(String content) {
-        boolean sent = client.sendGroupText(content);
-        if (sent) {
-            appendMessage("我", content, COLOR_SELF);
+        String messageId = client.sendGroupTextReturningId(content, null, null);
+        if (messageId != null) {
+            appendMessage("我", content, COLOR_SELF, messageId);
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }
-        return sent;
+        return messageId != null;
     }
 
     /**
@@ -122,6 +126,10 @@ public class GroupChatPanel extends BaseChatPanel {
      * <p>群聊本来就不做发送确认（见 {@code ChatClient.sendGroupText}），
      * 因此这里直接用带引用参数的文本消息走同一条广播通道，不需要绕开任何重发机制。</p>
      *
+     * <p>标识的分配与取回都交给客户端：发送通道是"这条消息最终用哪个标识发出去"的唯一权威点，
+     * 面板自己造一个标识再交给通道，等于把同一件事写两份；取回来的标识还要用于本地回显，
+     * 否则自己发的引用消息同样没有右键菜单。</p>
+     *
      * @param content      正文
      * @param quoteId      被引用消息的稳定标识
      * @param quoteSummary 被引用消息的摘要
@@ -136,16 +144,13 @@ public class GroupChatPanel extends BaseChatPanel {
             appendLine("[系统] 消息过长，最多 " + Constants.MESSAGE_MAX_LENGTH + " 个字符", COLOR_ERROR);
             return false;
         }
-        TextMessage message = new TextMessage(client.getUsername(), "", content, quoteId, quoteSummary);
-        message.setType(MessageType.TEXT_GROUP);
-        message.ensureMessageId();
-        boolean sent = client.send(message);
-        if (sent) {
-            appendMessage("我", content, COLOR_SELF);
+        String messageId = client.sendGroupTextReturningId(content, quoteId, quoteSummary);
+        if (messageId != null) {
+            appendMessage("我", content, COLOR_SELF, messageId);
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }
-        return sent;
+        return messageId != null;
     }
 
     /**

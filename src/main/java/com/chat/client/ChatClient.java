@@ -923,6 +923,34 @@ public class ChatClient {
     }
 
     /**
+     * 发送私聊文本消息并返回其稳定消息标识。
+     *
+     * <p>与 {@link #sendPrivateText(String, String, String, String)} 是同一条发送通道、
+     * 同一套校验，唯一区别是把标识交回给调用方。界面需要在气泡上就地撤回自己刚发出的消息，
+     * 而撤回请求只认标识、不认正文，因此发送方必须拿得到它：消息在 {@code sendTracked}
+     * 内部才被分配标识，调用方从返回值之外没有别的途径能知道是哪一条。</p>
+     *
+     * @param receiver     接收者用户名
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     */
+    public String sendPrivateTextReturningId(String receiver, String content, String quoteId,
+                                             String quoteSummary) {
+        if (content == null || content.trim().isEmpty()) {
+            return null;
+        }
+        if (content.length() > Constants.MESSAGE_MAX_LENGTH) {
+            notifyMessage(ChatMessageFactory.error(username, "消息过长，最多 "
+                    + Constants.MESSAGE_MAX_LENGTH + " 个字符"));
+            return null;
+        }
+        return sendTrackedId(buildText(username, receiver, content, MessageType.TEXT_PRIVATE,
+                quoteId, quoteSummary));
+    }
+
+    /**
      * 构造一条出站文本消息。
      *
      * <p>不带引用时仍走 {@link ChatMessageFactory}：那里统一分配本地消息编号，
@@ -957,16 +985,30 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     private boolean sendTracked(TextMessage message) {
+        return sendTrackedId(message) != null;
+    }
+
+    /**
+     * 发送需要确认的私聊消息，并把稳定消息标识交回调用方。
+     *
+     * <p>标识在这里分配而不是由调用方预置：{@code ensureMessageId()} 只在消息还没有标识时
+     * 才分配，因此这是"这条消息最终用哪个标识发出去"的唯一权威点。界面侧撤回自己的消息时
+     * 需要凭这个标识定位气泡，从返回值拿比事后猜更可靠。</p>
+     *
+     * @param message 待发送的私聊消息
+     * @return 稳定消息标识；未连接导致发送失败时返回 null
+     */
+    private String sendTrackedId(TextMessage message) {
         String messageId = message.ensureMessageId();
         pendingMessages.put(messageId, new PendingMessage(message));
         sentMessagePeers.put(messageId, message.getReceiver());
         notifyMessageState(messageId, SendState.SENDING, "");
         if (send(message)) {
-            return true;
+            return messageId;
         }
         // 未连接时立即给出失败结论，避免界面一直停留在"发送中"
         failPending(messageId, "尚未连接服务器");
-        return false;
+        return null;
     }
 
     /**
@@ -991,15 +1033,39 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean sendGroupText(String content, String quoteId, String quoteSummary) {
+        return sendGroupTextReturningId(content, quoteId, quoteSummary) != null;
+    }
+
+    /**
+     * 发送群聊文本消息并返回其稳定消息标识。
+     *
+     * <p>与 {@link #sendGroupText(String, String, String)} 是同一条广播通道、同一套校验，
+     * 唯一区别是把标识交回给调用方。标识的用途与私聊一致：界面要凭它给"自己刚发出的这一条"
+     * 装上右键菜单（引用、以及为将来的就地操作留出入口）；撤回不在其列——服务端对群聊记录
+     * 没有单一对端可通知，撤回通知本轮只回发起者，因此群聊气泡上不出现"撤回"项。</p>
+     *
+     * <p>标识必须由本端在发送前分配：群聊是广播语义，服务端不回 {@code MSG_ACK}，
+     * 消息标识只会在落库时补生成，发送方无从得知，气泡也就永远拿不到标识。
+     * 这与私聊那条 {@code sendTrackedId} 取模型的理由相同。</p>
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     */
+    public String sendGroupTextReturningId(String content, String quoteId, String quoteSummary) {
         if (content == null || content.trim().isEmpty()) {
-            return false;
+            return null;
         }
         if (content.length() > Constants.MESSAGE_MAX_LENGTH) {
             notifyMessage(ChatMessageFactory.error(username, "消息过长，最多 "
                     + Constants.MESSAGE_MAX_LENGTH + " 个字符"));
-            return false;
+            return null;
         }
-        return send(buildText(username, "", content, MessageType.TEXT_GROUP, quoteId, quoteSummary));
+        TextMessage message = buildText(username, "", content, MessageType.TEXT_GROUP,
+                quoteId, quoteSummary);
+        String messageId = message.ensureMessageId();
+        return send(message) ? messageId : null;
     }
 
     /**

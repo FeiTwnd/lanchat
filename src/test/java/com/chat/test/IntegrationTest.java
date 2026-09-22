@@ -35,7 +35,9 @@ import java.util.function.Predicate;
  *   <li>两个客户端之间的私聊消息可达；</li>
  *   <li>群聊消息广播到所有在线客户端；</li>
  *   <li>文件从发送方完整传输到接收方并通过 SHA-256 校验；</li>
- *   <li>异常场景：服务器未启动、登录密码错误、向不在线用户发私聊、超限文件发送。</li>
+ *   <li>异常场景：服务器未启动、登录密码错误、向不在线用户发私聊、超限文件发送；</li>
+ *   <li>消息撤回：本人撤回成功、对端收到撤回通知、重复撤回幂等、撤回他人消息与超时消息被拒绝、
+ *       撤回后正文以占位文本替代且不再被关键字检索命中。</li>
  * </ol>
  *
  * <p>实现方式：不使用界面，直接驱动 {@link ChatClient}（与 GUI 共用同一网络层），
@@ -124,6 +126,25 @@ public class IntegrationTest {
         }
 
         /**
+         * 统计满足条件的消息条数。
+         *
+         * <p>{@link #await} 每次都从缓冲区头部扫描，只要存在一条旧命中就会立即返回，
+         * 因此"又收到一条同样的消息"这类断言不能靠 {@code await}，只能数条数。</p>
+         *
+         * @param condition 条件
+         * @return 命中条数
+         */
+        int count(Predicate<Message> condition) {
+            int hits = 0;
+            for (Message message : received) {
+                if (condition.test(message)) {
+                    hits++;
+                }
+            }
+            return hits;
+        }
+
+        /**
          * 获取已缓存的消息数量。
          *
          * @return 消息数量
@@ -154,9 +175,11 @@ public class IntegrationTest {
         failures += test.runSafely("集成测试 6：用户下线后列表刷新", test::testOfflineRefresh);
         failures += test.runSafely("集成测试 7：异常场景（未启动服务器/错误密码/离线用户/超限文件）",
                 test::testExceptionCases);
+        failures += test.runSafely("集成测试 8：消息撤回（本人/时限/幂等/越权/占位替换）",
+                test::testRecall);
         System.out.println("\n========== 集成测试汇总 ==========");
-        System.out.println("用例总数: 7");
-        System.out.println("通过: " + (7 - failures));
+        System.out.println("用例总数: 8");
+        System.out.println("通过: " + (8 - failures));
         System.out.println("失败: " + failures);
         System.out.println("结论: " + (failures == 0 ? "全部通过" : "存在失败用例"));
         test.shutdown();
@@ -279,6 +302,17 @@ public class IntegrationTest {
             TestRunner.assertTrue(group.isBroadcast(), "群聊消息应为广播消息");
         }
 
+        // 群聊没有 ACK，稳定标识只能由本端在发送前分配：界面靠它给"自己发的那一条"装右键菜单
+        // （此前缺的正是这一环），对端靠它引用同一条消息。这里把"取回的标识 == 广播出去的标识"
+        // 这条闭环固定下来，避免以后又把标识只留在发送通道里。
+        String groupMessageId = alice.sendGroupTextReturningId("带标识的群聊测试", null, null);
+        TestRunner.assertNotNull(groupMessageId, "群聊发送应返回稳定消息标识");
+        Message tagged = bufferOf("bob01").await(message -> message.getType() == MessageType.TEXT_GROUP
+                && message.getSummary().contains("带标识的群聊测试"), 5000);
+        TestRunner.assertNotNull(tagged, "bob 应收到带标识的群聊消息");
+        TestRunner.assertEquals(groupMessageId, tagged.getMessageId(),
+                "广播出去的群聊消息应携带发送方取回的那个标识");
+
         Message notification = bufferOf("alice01").await(message -> message.getType() == MessageType.SYSTEM
                 && message.getSummary().contains("bob01") && message.getSummary().contains("上线"), 5000);
         TestRunner.assertNotNull(notification, "alice 应收到 bob01 上线的系统通知");
@@ -383,6 +417,106 @@ public class IntegrationTest {
         Message offlineNotice = bufferOf("alice01").await(message -> message.getType() == MessageType.SYSTEM
                 && message.getSummary().contains("bob01") && message.getSummary().contains("下线"), 5000);
         TestRunner.assertNotNull(offlineNotice, "alice 应收到 bob01 下线的系统通知");
+    }
+
+    /**
+     * 用例 8：消息撤回的完整链路。
+     *
+     * <p>覆盖服务端裁决的全部规则：本人撤回成功后回执形如 {@code OK|messageId} 并通知会话对端；
+     * 重复撤回按幂等处理；撤回他人消息、撤回超时消息、撤回不存在的标识均被拒绝；
+     * 撤回后记录保留但读出为占位文本，且不再被关键字检索命中。</p>
+     *
+     * <p>撤回链路此前只有界面侧的手工验证，仓库内没有自动化用例：界面点不出菜单时，
+     * 服务端这一半是完全正确的，缺陷只能靠人发现。本用例把"协议这一半"固定下来。</p>
+     *
+     * @throws Exception 测试异常
+     */
+    private void testRecall() throws Exception {
+        prepareEnvironment();
+        startServer();
+        ChatClient alice = connectWithBuffer("alice01");
+        ChatClient bob = connectWithBuffer("bob01");
+        waitUntil(() -> ChatServer.getInstance().getUserManager().size() == 2, 3000, "两名用户应在线上");
+
+        String messageId = alice.sendPrivateTextReturningId("bob01", "这条消息稍后会被撤回", null, null);
+        TestRunner.assertNotNull(messageId, "发送私聊应返回稳定消息标识");
+        TestRunner.assertNotNull(bufferOf("bob01").await(message ->
+                        message.getType() == MessageType.TEXT_PRIVATE
+                                && message.getSummary().contains("稍后会被撤回"), 5000),
+                "bob 应先收到原文");
+
+        // 1. 本人撤回成功
+        TestRunner.assertTrue(alice.requestRecall(messageId), "撤回请求应能发出");
+        Message ok = bufferOf("alice01").await(message -> message.getType() == MessageType.MSG_RECALL
+                && payloadOf(message).startsWith("OK|"), 5000);
+        TestRunner.assertNotNull(ok, "alice 应收到撤回成功回执");
+        TestRunner.assertEquals("OK|" + messageId, payloadOf(ok), "回执应带被撤回的消息标识");
+
+        // 2. 会话对端收到通知，界面据此把气泡改为"对方撤回了一条消息"
+        Message notice = bufferOf("bob01").await(message -> message.getType() == MessageType.MSG_RECALL
+                && payloadOf(message).startsWith("PEER|"), 5000);
+        TestRunner.assertNotNull(notice, "bob 应收到对端撤回通知");
+        TestRunner.assertEquals("PEER|" + messageId + "|alice01", payloadOf(notice),
+                "撤回通知应带消息标识与发起者");
+
+        // 3. 重复撤回幂等：仍返回 OK，而不是报"已撤回"错误
+        //    await 每次都从缓冲区头部扫描，会命中第 1 步的旧回执，因此这里数条数
+        TestRunner.assertTrue(alice.requestRecall(messageId), "重复撤回请求应能发出");
+        waitUntil(() -> countIn("alice01", message -> message.getType() == MessageType.MSG_RECALL
+                        && ("OK|" + messageId).equals(payloadOf(message))) >= 2, 5000,
+                "重复撤回应再收到一次 OK 回执");
+
+        // 4. 撤回他人消息被服务端拒绝：客户端提交的标识绕不过身份校验
+        String bobId = bob.sendPrivateTextReturningId("alice01", "bob 自己发的消息", null, null);
+        TestRunner.assertNotNull(bobId, "bob 发送应返回消息标识");
+        TestRunner.assertNotNull(bufferOf("alice01").await(message ->
+                        message.getType() == MessageType.TEXT_PRIVATE
+                                && message.getSummary().contains("bob 自己发的消息"), 5000),
+                "alice 应先收到 bob 的原文");
+        TestRunner.assertTrue(alice.requestRecall(bobId), "撤回请求应能发出");
+        Message denied = bufferOf("alice01").await(message -> message.getType() == MessageType.MSG_RECALL
+                && payloadOf(message).startsWith("FAIL|" + bobId + "|"), 5000);
+        TestRunner.assertNotNull(denied, "撤回他人消息应被拒绝");
+        TestRunner.assertTrue(payloadOf(denied).contains("只能撤回自己发送的消息"),
+                "拒绝原因应说明只能撤回自己的消息，实际为: " + payloadOf(denied));
+
+        // 5. 不存在的标识被拒绝，且拒绝回执带上该标识便于界面定位
+        TestRunner.assertTrue(alice.requestRecall("no-such-message-id"), "撤回请求应能发出");
+        Message missing = bufferOf("alice01").await(message -> message.getType() == MessageType.MSG_RECALL
+                && payloadOf(message).startsWith("FAIL|no-such-message-id|"), 5000);
+        TestRunner.assertNotNull(missing, "不存在的消息应被拒绝");
+
+        // 5.1 超时消息被拒绝：时限判的是"发出时刻"，不能靠界面上的菜单状态来保证
+        //     直接落一条 3 分钟前的记录，避免用例真的等待 2 分钟
+        TextMessage outdated = ChatMessageFactory.text("alice01", "bob01", "三分钟前发出的消息",
+                MessageType.TEXT_PRIVATE);
+        outdated.setTimestamp(java.time.LocalDateTime.now().minusMinutes(Constants.RECALL_WINDOW_MINUTES + 1L));
+        TestRunner.assertTrue(ChatServer.getInstance().getMessageService().saveMessage(outdated).isSuccess(),
+                "超时消息应能直接落库");
+        String outdatedId = outdated.getMessageId();
+        TestRunner.assertTrue(alice.requestRecall(outdatedId), "撤回请求应能发出");
+        Message expired = bufferOf("alice01").await(message -> message.getType() == MessageType.MSG_RECALL
+                && payloadOf(message).startsWith("FAIL|" + outdatedId + "|"), 5000);
+        TestRunner.assertNotNull(expired, "超过时限的消息应被拒绝");
+        TestRunner.assertTrue(payloadOf(expired).contains("超过撤回时限"),
+                "拒绝原因应说明超过时限，实际为: " + payloadOf(expired));
+
+        // 6. 撤回只标记不删除，读出时以占位文本替换正文
+        Message stored = ChatServer.getInstance().getMessageService().findByMessageId(messageId);
+        TestRunner.assertNotNull(stored, "撤回后记录应当仍存在（只置标记位，不删行）");
+        TestRunner.assertEquals(Constants.RECALLED_PLACEHOLDER, stored.getSummary(),
+                "撤回后读出应为占位文本");
+
+        // 7. 关键字检索同样看不到原文：这是"撤回"对使用者真正有意义的语义
+        //    先做一次正向对照——同一次运行里检索未撤回的正文应当命中，
+        //    否则"命中 0 条"可能只是检索本身坏了，断言会变成空转
+        MessageService service = ChatServer.getInstance().getMessageService();
+        List<Message> control = service.search("alice01", "bob 自己发的消息").getData();
+        TestRunner.assertTrue(control != null && !control.isEmpty(),
+                "对照：未撤回的正文应能被关键字检索命中");
+        List<Message> hits = service.search("alice01", "稍后会被撤回").getData();
+        TestRunner.assertNotNull(hits, "检索应返回结果集");
+        TestRunner.assertEquals(0, hits.size(), "已撤回的正文不应再被关键字检索命中");
     }
 
     /**
@@ -541,6 +675,36 @@ public class IntegrationTest {
         BufferingListener buffer = buffers.get(username);
         TestRunner.assertNotNull(buffer, "应存在 " + username + " 的消息缓冲器");
         return buffer;
+    }
+
+    /**
+     * 统计某客户端已收到的、满足条件的消息条数。
+     *
+     * @param username  用户名
+     * @param condition 条件
+     * @return 命中条数
+     */
+    private int countIn(String username, Predicate<Message> condition) {
+        return bufferOf(username).count(condition);
+    }
+
+    /**
+     * 读取一条文本消息的协议正文。
+     *
+     * <p>协议回执不能用 {@link Message#getSummary()} 断言：那是给界面展示用的摘要，
+     * 正文超过 30 个字符就会被截断成"前 30 字 + ..."，而一条撤回回执
+     * {@code OK|messageId} 本身就有 39 个字符，用摘要比对永远等不到相等。
+     * 界面侧之所以不受影响，是因为它读的也是 {@code getContent()}。</p>
+     *
+     * @param message 消息
+     * @return 文本正文；非文本消息返回空串
+     */
+    private static String payloadOf(Message message) {
+        if (message instanceof TextMessage) {
+            String content = ((TextMessage) message).getContent();
+            return content == null ? "" : content;
+        }
+        return "";
     }
 
     /**

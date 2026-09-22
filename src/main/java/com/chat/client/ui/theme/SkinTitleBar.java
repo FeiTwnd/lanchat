@@ -43,6 +43,9 @@ public class SkinTitleBar extends JPanel {
     /** 标题栏高度 */
     public static final int HEIGHT = 38;
 
+    /** 未读角标距右边缘的内缩（像素），留出最小化与关闭按钮的位置 */
+    private static final int BADGE_RIGHT_INSET = 76;
+
     /** 所属窗口 */
     private final transient JFrame frame;
 
@@ -60,6 +63,9 @@ public class SkinTitleBar extends JPanel {
 
     /** 拖动开始时的窗口位置 */
     private transient Point windowStart;
+
+    /** 未读合计角标：0 表示不显示 */
+    private transient int badgeCount;
 
     /**
      * 构造标题栏。
@@ -110,6 +116,22 @@ public class SkinTitleBar extends JPanel {
     }
 
     /**
+     * 设置未读合计角标。
+     *
+     * <p>默认 0 即不显示，因此登录窗口、服务器控制台等同样使用本标题栏的窗口
+     * 不设置它就不会有任何变化。</p>
+     *
+     * @param count 未读条数，小于等于 0 表示不显示
+     */
+    public void setBadgeCount(int count) {
+        if (badgeCount == count) {
+            return;
+        }
+        badgeCount = Math.max(0, count);
+        repaint();
+    }
+
+    /**
      * 绘制渐变底与底部细分隔线。
      *
      * @param g 画笔
@@ -123,6 +145,11 @@ public class SkinTitleBar extends JPanel {
         g2.setColor(new Color(0x00000022, true));
         g2.setStroke(new BasicStroke(1f));
         g2.drawLine(0, getHeight() - 1, getWidth(), getHeight() - 1);
+        if (badgeCount > 0) {
+            // 角标画在绘制流程里而不是做成一个 JLabel：标题栏宽度随窗口变化，
+            // 放组件就要参与布局并在窗口缩放时反复重排，直接画反而稳定
+            Badge.paint(g2, getWidth() - BADGE_RIGHT_INSET, HEIGHT / 2, badgeCount);
+        }
         g2.dispose();
         super.paintComponent(g);
     }

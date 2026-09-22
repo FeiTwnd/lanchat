@@ -17,6 +17,7 @@ data/received/*
 # IDE 工程文件
 .idea/
 *.iml
+.vscode/
 
 # 过程文档（仅本地留存，不纳入版本管理）
 docs/superpowers/

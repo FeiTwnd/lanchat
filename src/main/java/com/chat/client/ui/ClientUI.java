@@ -28,11 +28,13 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.Timer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.tree.TreePath;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GridLayout;
+import java.awt.Toolkit;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
@@ -65,8 +67,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>可靠性相关展示：</p>
  * <ul>
  *   <li>底部状态栏展示连接状态（连接中/已连接/重连中第 n 次/已恢复）与消息发送状态；</li>
- *   <li>断线后进入自动重连，界面只提示一次断线，重连进度在状态栏持续更新；</li>
+ *   <li>断线后进入自动重连，顶部横幅常驻提示重连进度，恢复后短暂提示一次"会话已恢复"；</li>
  *   <li>"对方离线""发送失败"这类需要用户关注的状态会同时写一行到对应聊天窗口。</li>
+ * </ul>
+ *
+ * <p>未读提示：</p>
+ * <ul>
+ *   <li>私聊与群聊都遵循"窗口没打开就只累计未读、不主动弹窗"，否则未读永远来不及累计；</li>
+ *   <li>私聊未读画在好友树对应用户行的右端，群聊未读写在群聊入口按钮上；</li>
+ *   <li>两者的合计画在标题栏角标上，打开对应窗口即清零。</li>
  * </ul>
  *
  * <p>数据规模相关入口：</p>
@@ -75,7 +84,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *       向前插入后补偿滚动位置，使用者正在看的那一行不会跳动；</li>
  *   <li>关键字搜索在服务端完成（正文以密文入库，只有服务端能解密匹配），
  *       结果以表格对话框展示，双击可跳转；</li>
- *   <li>撤回入口在本窗口菜单中列出"2 分钟内本人发送的消息"，服务端回执后替换对应气泡。</li>
+ *   <li>撤回有两个入口：本人消息气泡的右键菜单精确指向"这一条"，本窗口功能面板上的
+ *       "撤回消息…"则把 2 分钟内可撤回的消息列出来供选择。两处共用同一份时限判断
+ *       （见 {@link #canRecallNow(String)}），服务端回执后替换对应气泡。</li>
  * </ul>
  *
  * <p>线程安全：所有网络回调都可能发生在非界面线程，因此本类所有界面更新
@@ -113,6 +124,30 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
 
     /** 群聊未读条数：群聊窗口未打开时累计，打开后清零 */
     private transient int unreadGroupCount;
+
+    /**
+     * 私聊未读条数：对端用户名 -> 未读条数。
+     *
+     * <p>只在事件分发线程内读写（计数发生在消息分发、清零发生在窗口显示，两者都已在 EDT 上），
+     * 因此用普通 {@code LinkedHashMap} 而不必上并发集合。键存在的意义是"这个会话有未读"，
+     * 计数归零时直接移除，不给界面留一个计数为 0 的空条目。</p>
+     */
+    private final transient Map<String, Integer> unreadPrivate = new java.util.LinkedHashMap<>();
+
+    /** 断线横幅：重连中常驻、恢复后短暂提示，默认隐藏 */
+    private final transient DisconnectBanner banner = new DisconnectBanner();
+
+    /** 上一次连接状态回调是否处于"正在重连"，用于区分"重连成功"与"登录首次连接成功" */
+    private transient boolean bannerWasReconnecting;
+
+    /** 恢复横幅的自动隐藏计时器 */
+    private transient Timer bannerTimer;
+
+    /** 单击用户行打开资料卡的确认延时兜底值（毫秒）：读不到平台双击间隔时使用 */
+    private static final int PROFILE_CLICK_DELAY_FALLBACK_MS = 300;
+
+    /** 资料卡计时器：等待期内若来了第二次点击（即双击）就取消，不弹多余的卡片 */
+    private transient Timer profileClickTimer;
 
     /**
      * 是否正在退出登录。
@@ -195,18 +230,23 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
      * 组装界面组件。
      */
     private void initComponents() {
-        // 双击用户节点直接打开私聊窗口，符合即时通讯软件的通用交互习惯
+        // 单击用户行查看资料卡、双击直接打开私聊窗口，符合即时通讯软件的通用交互习惯
         userTree.addMouseListener(new MouseAdapter() {
 
             /**
-             * 双击打开私聊窗口。
+             * 单击查看资料卡，双击打开私聊窗口。
              *
              * @param e 鼠标事件
              */
             @Override
             public void mouseClicked(MouseEvent e) {
                 if (e.getClickCount() == 2) {
+                    // 双击的第一下已经排了一个待弹的资料卡，这里必须先撤掉，
+                    // 否则"双击打开私聊"会顺带弹出一张停在屏幕上的资料卡
+                    cancelProfileCard();
                     openPrivateChatWithSelected();
+                } else if (e.getClickCount() == 1) {
+                    scheduleProfileCard(e);
                 }
             }
         });
@@ -218,10 +258,76 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         splitPane.setBorder(BorderFactory.createEmptyBorder());
         splitPane.setOpaque(false);
 
+        // 断线横幅与头部卡片共用 NORTH：横幅必须紧贴窗口顶部且不能顶掉头部卡片，
+        // 因此 NORTH 内再套一层，横幅放在头部卡片下方
+        JPanel north = new JPanel(new BorderLayout());
+        north.setOpaque(false);
+        north.add(buildHeader(), BorderLayout.NORTH);
+        north.add(banner, BorderLayout.SOUTH);
+
         body().setLayout(new BorderLayout());
-        body().add(buildHeader(), BorderLayout.NORTH);
+        body().add(north, BorderLayout.NORTH);
         body().add(splitPane, BorderLayout.CENTER);
         body().add(buildStatusBar(), BorderLayout.SOUTH);
+    }
+
+    /**
+     * 延时确认一次"单击用户行"：过了平台的双击间隔仍没有第二次点击，才弹出资料卡。
+     *
+     * <p>Swing 对一次双击会先投递 {@code clickCount == 1} 的事件、再投递 {@code == 2} 的事件，
+     * 在第一次点击上立即弹卡的话，使用者每次双击打开私聊都会顺带弹出一张资料卡。</p>
+     *
+     * <p>间隔取平台的 {@code awt.multiClickInterval}，与系统设置里"双击速度"保持一致：
+     * 写死一个偏小的值会让手速慢的使用者依然看到多余的卡片。</p>
+     *
+     * @param event 单击事件
+     */
+    private void scheduleProfileCard(MouseEvent event) {
+        cancelProfileCard();
+        profileClickTimer = new Timer(doubleClickInterval(),
+                mouseEvent -> showProfileCardAt(event));
+        profileClickTimer.setRepeats(false);
+        profileClickTimer.start();
+    }
+
+    /**
+     * 撤销尚未到期的资料卡计时器。
+     */
+    private void cancelProfileCard() {
+        if (profileClickTimer != null) {
+            profileClickTimer.stop();
+            profileClickTimer = null;
+        }
+    }
+
+    /**
+     * 读取当前平台的双击判定间隔。
+     *
+     * @return 毫秒数；取不到时返回 {@link #PROFILE_CLICK_DELAY_FALLBACK_MS}
+     */
+    private static int doubleClickInterval() {
+        Object interval = Toolkit.getDefaultToolkit().getDesktopProperty("awt.multiClickInterval");
+        return interval instanceof Integer ? (Integer) interval : PROFILE_CLICK_DELAY_FALLBACK_MS;
+    }
+
+    /**
+     * 按点击位置弹出用户资料卡。
+     *
+     * <p>只有命中用户叶子节点才弹：分组标题行与根节点没有对应的用户，
+     * 点在它们上面弹出一张空卡片比不弹更糟。</p>
+     *
+     * @param event 鼠标事件
+     */
+    private void showProfileCardAt(MouseEvent event) {
+        TreePath path = userTree.getPathForLocation(event.getX(), event.getY());
+        if (path == null) {
+            return;
+        }
+        User user = userTree.selectedUserOn(path);
+        if (user != null) {
+            UserProfileCard.show(this, user, userTree.isOnline(user.getUsername()),
+                    () -> openPrivateWindow(user.getUsername()));
+        }
     }
 
     /**
@@ -460,24 +566,101 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
      * @return 私聊窗口
      */
     public PrivateChatUI openPrivateWindow(String username) {
+        return privateWindowFor(username, true);
+    }
+
+    /**
+     * 取出（必要时创建）私聊窗口。
+     *
+     * <p>{@code show=false} 只保证窗口与面板存在，用于把收到的消息缓存进面板并累计未读，
+     * 与 {@link #openGroupWindow(boolean)} 的语义完全一致：不主动弹出窗口打扰使用者，
+     * 否则私聊未读永远来不及累计就会被"消息一到就置顶窗口"抹平。</p>
+     *
+     * @param username 对方用户名
+     * @param show     是否显示并置顶窗口
+     * @return 私聊窗口
+     */
+    private PrivateChatUI privateWindowFor(String username, boolean show) {
         // 面板不再单独注册为客户端监听器：消息统一由本窗口分发，
         // 否则同一条消息会被“面板自监听”与“本窗口转发”各渲染一次
         PrivateChatUI window = privateWindows.get(username);
         if (window == null) {
             window = new PrivateChatUI(client, username);
             privateWindows.put(username, window);
+            // 撤回策略由主窗口注入：面板拿不到发送时刻，也不该重复记一份时限判断
+            window.getPanel().setRecallHandler(new BaseChatPanel.RecallHandler() {
+                @Override
+                public boolean canRecall(String messageId) {
+                    return canRecallNow(messageId);
+                }
+
+                @Override
+                public void recall(String messageId) {
+                    submitRecall(messageId);
+                }
+            });
             // 顶部翻页入口由主窗口装配：聊天面板保持"只负责渲染"的单一职责，
             // 翻页所需的游标由主窗口在与服务端交互时掌握
             window.getPanel().add(buildEarlierPanel(username), BorderLayout.NORTH);
+            // 使用者直接用鼠标点回窗口（不经过本方法）时也要清未读，因此额外挂一次焦点监听
+            window.addWindowFocusListener(new java.awt.event.WindowAdapter() {
+                @Override
+                public void windowGainedFocus(java.awt.event.WindowEvent event) {
+                    clearPrivateUnread(username);
+                }
+            });
             // 新建窗口时补拉与该用户的最近一页对话：面板里的内容只存在于内存，
             // 关闭窗口或重启客户端后若不补拉，使用者会以为对方的消息丢了
             client.requestHistory(client.getUsername(), "", "", username);
         }
-        if (!window.isVisible()) {
-            window.setVisible(true);
+        if (show) {
+            clearPrivateUnread(username);
+            if (!window.isVisible()) {
+                window.setVisible(true);
+            }
+            window.toFront();
+        } else if (!window.isVisible()) {
+            addPrivateUnread(username);
         }
-        window.toFront();
         return window;
+    }
+
+    /**
+     * 累计一个会话的私聊未读并刷新角标。
+     *
+     * @param username 对方用户名
+     */
+    private void addPrivateUnread(String username) {
+        unreadPrivate.merge(username, 1, Integer::sum);
+        refreshUnreadBadges();
+    }
+
+    /**
+     * 清除一个会话的私聊未读并刷新角标。
+     *
+     * @param username 对方用户名
+     */
+    private void clearPrivateUnread(String username) {
+        if (unreadPrivate.remove(username) != null) {
+            refreshUnreadBadges();
+        }
+    }
+
+    /**
+     * 刷新全部未读角标：好友树上每个会话的红点，以及标题栏上的合计角标。
+     *
+     * <p>合计值在这里现算而不是另记一个计数器：另记一份就必须在每次增减时同步维护，
+     * 漏掉任何一处都会让角标与实际未读长期不符。</p>
+     */
+    private void refreshUnreadBadges() {
+        userTree.setUnread(unreadPrivate);
+        int total = unreadGroupCount;
+        for (int count : unreadPrivate.values()) {
+            total += count;
+        }
+        if (titleBar() != null) {
+            titleBar().setBadgeCount(total);
+        }
     }
 
     /**
@@ -527,6 +710,8 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             groupButton.setText(unreadGroupCount == 0
                     ? "进入群聊大厅" : "进入群聊大厅（" + unreadGroupCount + " 条未读）");
         }
+        // 群聊未读同时计入标题栏的合计角标，两者必须一起刷新
+        refreshUnreadBadges();
     }
 
     /**
@@ -823,7 +1008,9 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         // 走到这里发送者必然是对端，会话键直接取它即可
         String content = message.getContent() == null ? "" : message.getContent();
         onEdt(() -> {
-            PrivateChatPanel panel = openPrivateWindow(sender).getPanel();
+            // 不主动弹出窗口：与群聊一致，窗口没打开时只把消息缓存进面板并累计未读，
+            // 否则"消息一到就置顶私聊窗口"会让私聊未读永远来不及累计
+            PrivateChatPanel panel = privateWindowFor(sender, false).getPanel();
             panel.onMessage(message);
             // 登记气泡：对端撤回时需要按消息标识找到这一行并替换为撤回提示
             rememberBubble(message.getMessageId(), sender, content, false);
@@ -1333,11 +1520,41 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
     }
 
     /**
+     * 判断某条消息此刻是否可撤回。
+     *
+     * <p>撤回策略的唯一落点，同时服务于气泡右键菜单与主窗口的功能面板入口，
+     * 两处共用同一份判断，不各自记一份时限。真正的权威仍是服务端：
+     * 这里只是让界面不要提供一个按下去必然失败的入口。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @return 可撤回返回 true
+     */
+    private boolean canRecallNow(String messageId) {
+        BubbleRef ref = messageId == null ? null : bubbleIndex.get(messageId);
+        return ref != null && ref.mine
+                && System.currentTimeMillis() - ref.createdAt <= RECALL_WINDOW_MS;
+    }
+
+    /**
+     * 提交一条撤回请求。
+     *
+     * @param messageId 稳定消息标识
+     */
+    private void submitRecall(String messageId) {
+        if (!client.requestRecall(messageId)) {
+            showError("撤回请求发送失败，请检查与服务端的连接");
+        } else {
+            statusLabel.setText("撤回请求已发送……");
+        }
+    }
+
+    /**
      * 弹出可撤回消息列表并提交撤回请求。
      *
-     * <p>撤回入口放在主窗口菜单而不是聊天气泡右键：气泡菜单由聊天面板实现，
-     * 而"哪条消息是本机刚发出、是否还在 2 分钟内"这类信息只有掌握发送状态的
-     * 主窗口知道，放在这里可以避免两处各记一份而互相矛盾。</p>
+     * <p>主窗口功能面板上的汇总入口：气泡右键能精确指向"这一条"，而功能面板只能
+     * 把所有还在 2 分钟内的本人消息列出来让使用者选。两处入口共用
+     * {@link #canRecallNow(String)} 与 {@link #submitRecall(String)}，
+     * 判断与提交都只有一份实现。</p>
      */
     private void recallMessage() {
         long now = System.currentTimeMillis();
@@ -1366,11 +1583,7 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         }
         for (int i = 0; i < options.length; i++) {
             if (options[i].equals(choice)) {
-                if (!client.requestRecall(candidates.get(i).getKey())) {
-                    showError("撤回请求发送失败，请检查与服务端的连接");
-                } else {
-                    statusLabel.setText("撤回请求已发送……");
-                }
+                submitRecall(candidates.get(i).getKey());
                 return;
             }
         }
@@ -1412,7 +1625,8 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         }
         String content = message.getContent() == null ? "" : message.getContent();
         onEdt(() -> {
-            PrivateChatPanel panel = openPrivateWindow(sender).getPanel();
+            // 离线补投同样是使用者没看过的真实消息，与普通私聊一样缓存并计入未读，不弹窗
+            PrivateChatPanel panel = privateWindowFor(sender, false).getPanel();
             panel.appendMessage(sender + "（离线消息）", content, BaseChatPanel.COLOR_OTHER);
             // 离线消息同样登记气泡：对方撤回时也要能把这一行替换掉
             rememberBubble(message.getMessageId(), sender, content, false);
@@ -1435,6 +1649,7 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         onEdt(() -> {
             statusLabel.setText(reason);
             serverHint.setText(serverHintText(connected));
+            updateBanner(connected, reconnecting, reason);
             if (connected) {
                 panelsNotifiedDisconnect = false;
             }
@@ -1460,6 +1675,54 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                 System.exit(0);
             }
         });
+    }
+
+    /**
+     * 依据连接状态更新顶部断线横幅。
+     *
+     * <p>三种走向：正在重连时常驻警示横幅；恢复连接后短暂提示一次"会话已恢复"，
+     * 让使用者明确知道刚才那段时间的消息没有丢；其余情况隐藏横幅。</p>
+     *
+     * <p>"已恢复"只在上一状态确实是重连中才提示：登录成功同样会回调 {@code connected=true}，
+     * 不加这个判断的话每次登录都会闪出一条"已重新连接"。</p>
+     *
+     * @param connected    是否已连接
+     * @param reconnecting 是否处于重连流程中
+     * @param reason       服务端给出或本地推断的原因
+     */
+    private void updateBanner(boolean connected, boolean reconnecting, String reason) {
+        if (connected) {
+            if (bannerWasReconnecting) {
+                banner.showRestored("已重新连接，会话已恢复");
+                startBannerTimer();
+            }
+            bannerWasReconnecting = false;
+            return;
+        }
+        if (reconnecting) {
+            // 文案直接用回调带来的原因：服务端/网络层已经把它写成"…，正在重连（第 n 次）"，
+            // 界面再拼一次次数只会两处口径
+            banner.showReconnecting(reason);
+            bannerWasReconnecting = true;
+            return;
+        }
+        // 走到这里说明是终态断开，紧接着就会退出程序，横幅只是兜底不留残影
+        bannerWasReconnecting = false;
+        banner.dismiss();
+    }
+
+    /**
+     * 启动恢复横幅的自动隐藏计时器。
+     *
+     * <p>每次重新计时前先停掉上一个，避免连续两次重连恢复时第一个计时器提前把第二个横幅收掉。</p>
+     */
+    private void startBannerTimer() {
+        if (bannerTimer != null) {
+            bannerTimer.stop();
+        }
+        bannerTimer = new Timer(3000, event -> banner.dismiss());
+        bannerTimer.setRepeats(false);
+        bannerTimer.start();
     }
 
     /**

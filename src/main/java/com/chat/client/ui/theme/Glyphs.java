@@ -124,6 +124,20 @@ public final class Glyphs {
     }
 
     /**
+     * 对勾图标：用于"已恢复""校验通过"这类正向结果提示。
+     *
+     * @param size  边长
+     * @param color 颜色
+     * @return 图标
+     */
+    public static Icon check(final int size, final Color color) {
+        return of(size, color, (g, s) -> {
+            g.drawLine((int) (s * 0.24), (int) (s * 0.54), (int) (s * 0.43), (int) (s * 0.72));
+            g.drawLine((int) (s * 0.43), (int) (s * 0.72), (int) (s * 0.78), (int) (s * 0.3));
+        });
+    }
+
+    /**
      * 刷新图标：缺口圆环加箭头。
      *
      * @param size  边长
