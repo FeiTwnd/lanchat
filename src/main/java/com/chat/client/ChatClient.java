@@ -938,6 +938,21 @@ public class ChatClient {
      */
     public String sendPrivateTextReturningId(String receiver, String content, String quoteId,
                                              String quoteSummary) {
+        return sendPrivateTextReturningId(receiver, content, quoteId, quoteSummary, null);
+    }
+
+    /**
+     * 发送带完整引用信息（含被引用者）的私聊消息，并返回其稳定消息标识。
+     *
+     * @param receiver     接收者用户名
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @param quoteSender  被引用消息的发送者显示名，可为 null
+     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     */
+    public String sendPrivateTextReturningId(String receiver, String content, String quoteId,
+                                             String quoteSummary, String quoteSender) {
         if (content == null || content.trim().isEmpty()) {
             return null;
         }
@@ -947,7 +962,7 @@ public class ChatClient {
             return null;
         }
         return sendTrackedId(buildText(username, receiver, content, MessageType.TEXT_PRIVATE,
-                quoteId, quoteSummary));
+                quoteId, quoteSummary, quoteSender));
     }
 
     /**
@@ -967,10 +982,30 @@ public class ChatClient {
      */
     private TextMessage buildText(String sender, String receiver, String content, MessageType type,
                                   String quoteId, String quoteSummary) {
-        if (quoteId == null && quoteSummary == null) {
+        return buildText(sender, receiver, content, type, quoteId, quoteSummary, null);
+    }
+
+    /**
+     * 构造一条出站文本消息（含被引用者）。
+     *
+     * <p>两个重载的区别只在于是否携带被引用消息的发送者：引用块要按"谁：内容"展示，
+     * 缺了它就只剩一行无主的内容。旧的三参调用点（不引用任何消息）保持原样。</p>
+     *
+     * @param sender       发送者用户名
+     * @param receiver     接收者用户名，群聊传空字符串
+     * @param content      正文
+     * @param type         消息类型
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @param quoteSender  被引用消息的发送者显示名，可为 null
+     * @return 文本消息
+     */
+    private TextMessage buildText(String sender, String receiver, String content, MessageType type,
+                                  String quoteId, String quoteSummary, String quoteSender) {
+        if (quoteId == null && quoteSummary == null && quoteSender == null) {
             return ChatMessageFactory.text(sender, receiver, content, type);
         }
-        TextMessage message = new TextMessage(sender, receiver, content, quoteId, quoteSummary);
+        TextMessage message = new TextMessage(sender, receiver, content, quoteId, quoteSummary, quoteSender);
         message.setType(type);
         return message;
     }
@@ -1041,8 +1076,7 @@ public class ChatClient {
      *
      * <p>与 {@link #sendGroupText(String, String, String)} 是同一条广播通道、同一套校验，
      * 唯一区别是把标识交回给调用方。标识的用途与私聊一致：界面要凭它给"自己刚发出的这一条"
-     * 装上右键菜单（引用、以及为将来的就地操作留出入口）；撤回不在其列——服务端对群聊记录
-     * 没有单一对端可通知，撤回通知本轮只回发起者，因此群聊气泡上不出现"撤回"项。</p>
+     * 装上右键菜单，并凭它把服务端回来的撤回通知定位到具体的那个气泡。</p>
      *
      * <p>标识必须由本端在发送前分配：群聊是广播语义，服务端不回 {@code MSG_ACK}，
      * 消息标识只会在落库时补生成，发送方无从得知，气泡也就永远拿不到标识。
@@ -1054,6 +1088,20 @@ public class ChatClient {
      * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
      */
     public String sendGroupTextReturningId(String content, String quoteId, String quoteSummary) {
+        return sendGroupTextReturningId(content, quoteId, quoteSummary, null);
+    }
+
+    /**
+     * 发送带完整引用信息（含被引用者）的群聊消息，并返回其稳定消息标识。
+     *
+     * @param content      正文
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @param quoteSender  被引用消息的发送者显示名，可为 null
+     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     */
+    public String sendGroupTextReturningId(String content, String quoteId, String quoteSummary,
+                                           String quoteSender) {
         if (content == null || content.trim().isEmpty()) {
             return null;
         }
@@ -1063,7 +1111,7 @@ public class ChatClient {
             return null;
         }
         TextMessage message = buildText(username, "", content, MessageType.TEXT_GROUP,
-                quoteId, quoteSummary);
+                quoteId, quoteSummary, quoteSender);
         String messageId = message.ensureMessageId();
         return send(message) ? messageId : null;
     }
@@ -1144,6 +1192,74 @@ public class ChatClient {
     public boolean requestUserList() {
         SystemMessage message = ChatMessageFactory.control(username, Constants.SYSTEM_SENDER,
                 MessageType.USER_LIST_REQUEST);
+        return send(message);
+    }
+
+    /**
+     * 请求修改昵称。
+     *
+     * <p>把协议拼装收敛到客户端里：设置界面只关心"填了什么、发出去没有"，
+     * 不该自己拼 {@code CHANGE_NICK|} 这类线格式，否则线格式一改就要满界面找调用点。</p>
+     *
+     * @param nickname 新昵称
+     * @return 发送成功返回 true
+     */
+    public boolean requestNicknameChange(String nickname) {
+        return sendUserUpdate("CHANGE_NICK", nickname);
+    }
+
+    /**
+     * 请求修改头像。
+     *
+     * <p>先在本地做长度闸门再发送：超过 {@link Constants#AVATAR_MAX_LENGTH} 的报文
+     * 一定会被服务端拒绝，先在本地拦下可以省掉一次往返，也让提示来得更即时。
+     * 这里不重复做图片格式校验——那是服务端的职责，客户端校验只是体验优化。</p>
+     *
+     * @param base64 头像 PNG 的 Base64 文本；传 null 或空串表示恢复默认头像
+     * @return 发送成功返回 true；本地即判定为过大时返回 false
+     */
+    public boolean requestAvatarChange(String base64) {
+        if (base64 != null && base64.length() > Constants.AVATAR_MAX_LENGTH) {
+            notifyMessage(ChatMessageFactory.error(username,
+                    "头像过大，最多 " + Constants.AVATAR_MAX_LENGTH + " 字节，请换一张更小的图片"));
+            return false;
+        }
+        return sendUserUpdate("CHANGE_AVATAR", base64);
+    }
+
+    /**
+     * 请求修改密码。
+     *
+     * <p>已登录会话即可完成，不需要重新登录：服务端会校验原密码，
+     * 通过后直接更新散列与盐，当前会话不受影响。</p>
+     *
+     * @param oldPassword 原密码
+     * @param newPassword 新密码
+     * @return 发送成功返回 true
+     */
+    public boolean requestPasswordChange(String oldPassword, String newPassword) {
+        // 与其它控制报文一样用 TextMessage 作载体（control 造出来的对象没有正文可放）
+        TextMessage text = new TextMessage(username, Constants.SYSTEM_SENDER,
+                (oldPassword == null ? "" : oldPassword) + "|" + (newPassword == null ? "" : newPassword));
+        text.setType(MessageType.PASSWORD_CHANGE);
+        return send(text);
+    }
+
+    /**
+     * 发送一条用户资料变更请求。
+     *
+     * <p>照既有 {@code changeNickname} 的写法：先按文本消息构造（正文格式为
+     * {@code 命令|参数}），再把类型改成 {@link MessageType#USER_UPDATE}。
+     * 复用文本消息作为载体而不是新增消息类，是因为资料变更本质上就是"一条命令 + 一个参数"。</p>
+     *
+     * @param command  命令名，例如 {@code CHANGE_NICK}
+     * @param argument 命令参数，可为 null
+     * @return 发送成功返回 true
+     */
+    private boolean sendUserUpdate(String command, String argument) {
+        TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
+                command + "|" + (argument == null ? "" : argument), MessageType.TEXT_PRIVATE);
+        message.setType(MessageType.USER_UPDATE);
         return send(message);
     }
 
@@ -1249,8 +1365,24 @@ public class ChatClient {
      * @return 发送成功返回 true
      */
     public boolean requestExport() {
-        return send(ChatMessageFactory.control(username, Constants.SYSTEM_SENDER,
-                MessageType.EXPORT_REQUEST));
+        return requestExport("");
+    }
+
+    /**
+     * 请求导出指定会话的聊天记录。
+     *
+     * <p>范围由界面按当前窗口给出：私聊窗口传 {@code @对端用户名}，群聊窗口传
+     * {@code @ALL}，不传则保持"本人全部记录"的旧语义。服务端只在这个范围内筛选
+     * 已经查出的本人记录，范围参数无法用来扩大可见范围。</p>
+     *
+     * @param scope 导出范围，取值见 {@link Constants#EXPORT_SCOPE_PREFIX}；空串表示全部
+     * @return 发送成功返回 true
+     */
+    public boolean requestExport(String scope) {
+        TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
+                scope == null ? "" : scope, MessageType.TEXT_PRIVATE);
+        message.setType(MessageType.EXPORT_REQUEST);
+        return send(message);
     }
 
     /**

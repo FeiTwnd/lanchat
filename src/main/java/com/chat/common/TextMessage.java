@@ -32,6 +32,15 @@ public class TextMessage extends Message {
     private final String quoteSummary;
 
     /**
+     * 被引用消息的发送者显示名；为空表示未记录（旧版对端发来的消息）。
+     *
+     * <p>引用块要按"谁：内容"两段展示（与主流即时通讯软件一致），只有摘要而无发送者
+     * 就只能显示一行无主的内容，读者无法判断引用的是谁说的话。因此该字段与
+     * {@link #quoteSummary} 成对使用。</p>
+     */
+    private final String quoteSender;
+
+    /**
      * 构造文本消息。
      *
      * <p>构造器只负责填充数据，消息类型由 {@link ChatMessageFactory} 统一设置，
@@ -43,7 +52,7 @@ public class TextMessage extends Message {
      * @throws IllegalArgumentException 当 content 为 null 时抛出
      */
     public TextMessage(String sender, String receiver, String content) {
-        this(sender, receiver, content, null, null);
+        this(sender, receiver, content, null, null, null);
     }
 
     /**
@@ -61,6 +70,26 @@ public class TextMessage extends Message {
      */
     public TextMessage(String sender, String receiver, String content,
                        String quoteId, String quoteSummary) {
+        this(sender, receiver, content, quoteId, quoteSummary, null);
+    }
+
+    /**
+     * 构造带完整引用信息（含被引用者）的文本消息。
+     *
+     * <p>保留上一级 5 参构造器并让它委托到这里，而不是就地把它改成 6 参：
+     * 既有调用点（服务端的转发与回执、测试用例）不必逐个修改，
+     * 新增参数对它们是"不传即无"的可选信息。</p>
+     *
+     * @param sender       发送者用户名
+     * @param receiver     接收者用户名，群聊传空字符串
+     * @param content      消息正文，不允许为 null
+     * @param quoteId      被引用消息的稳定标识，可为 null
+     * @param quoteSummary 被引用消息的摘要，可为 null
+     * @param quoteSender  被引用消息的发送者显示名，可为 null
+     * @throws IllegalArgumentException 当 content 为 null 时抛出
+     */
+    public TextMessage(String sender, String receiver, String content,
+                       String quoteId, String quoteSummary, String quoteSender) {
         if (content == null) {
             throw new IllegalArgumentException("消息正文不能为 null");
         }
@@ -69,6 +98,7 @@ public class TextMessage extends Message {
         this.content = content;
         this.quoteId = quoteId == null ? "" : quoteId;
         this.quoteSummary = quoteSummary == null ? "" : quoteSummary;
+        this.quoteSender = quoteSender == null ? "" : quoteSender;
     }
 
     /**
@@ -99,6 +129,18 @@ public class TextMessage extends Message {
      */
     public String getQuoteSummary() {
         return quoteSummary == null ? "" : quoteSummary;
+    }
+
+    /**
+     * 获取被引用消息的发送者显示名。
+     *
+     * <p>与其它引用字段一样把 null 统一成空串：旧版对端发来的消息没有该字段，
+     * 反序列化后为 null，调用方少写一次判空。</p>
+     *
+     * @return 被引用消息的发送者显示名；未记录时返回空串
+     */
+    public String getQuoteSender() {
+        return quoteSender == null ? "" : quoteSender;
     }
 
     /**

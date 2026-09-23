@@ -146,6 +146,37 @@ public class UserManager {
     }
 
     /**
+     * 用最新的用户资料替换在线缓存中的那一份。
+     *
+     * <p><b>为什么必须有这个方法</b>：{@link #broadcastUserList()} 编码的是
+     * {@link #userProfiles} 这份缓存快照，而不是重新查库。资料变更只写数据库的话，
+     * 缓存里留着的仍是登录那一刻的旧值，广播出去的也就还是旧昵称、旧头像——
+     * 表现为"界面提示修改成功、重启客户端后也确实变了，但对方看到的一直是老样子"。
+     * 昵称修改此前就存在这一问题，头像若沿用同一路径会连自己都看不到变化。</p>
+     *
+     * <p>为什么只覆盖 {@code online} 这一个运行期字段：用户对象里只有它是"不持久化、
+     * 由在线表推导"的状态，其余字段都是数据库的镜像。传入的副本来自
+     * {@code copyForTransfer}，其 {@code online} 恒为 false，因此这里必须按在线表重新推导，
+     * 否则一次改名就会把该用户在列表里标成离线。</p>
+     *
+     * <p>用户不在线时直接返回：缓存只维护在线用户，为离线用户塞一份资料会让
+     * {@code onlineUsers()} 多出不该出现的人。</p>
+     *
+     * @param user 变更后的用户资料（应已脱敏）
+     */
+    public void updateProfile(User user) {
+        if (user == null || user.getUsername() == null) {
+            return;
+        }
+        if (!onlineUsers.containsKey(user.getUsername())) {
+            return;
+        }
+        user.setOnline(true);
+        userProfiles.put(user.getUsername(), user);
+        LOGGER.info(() -> "在线用户资料已更新: " + user.getUsername());
+    }
+
+    /**
      * 在线人数。
      *
      * @return 在线用户数量

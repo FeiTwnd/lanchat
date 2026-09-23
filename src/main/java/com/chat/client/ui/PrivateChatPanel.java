@@ -68,6 +68,11 @@ public class PrivateChatPanel extends BaseChatPanel {
     /**
      * 发送文件：接收方固定为当前私聊窗口的对端。
      *
+     * <p>提示文案分两种：平常那句"（对方确认后开始传输）"是如实的，因为收文件的人
+     * 确实要先点一下接收；但"与我"的会话里没有第二个人，传输窗口收到请求时已经
+     * 自动接受，再写"确认后开始传输"就成了一句永远不会发生的话——使用者会盯着窗口等一个
+     * 根本不会出现的确认按钮。这里按会话是不是自己，把话说准。</p>
+     *
      * @param file 待发送文件
      */
     @Override
@@ -75,8 +80,43 @@ public class PrivateChatPanel extends BaseChatPanel {
         FileTransferUI window = FileTransferUI.windowFor(client, peer);
         window.setVisible(true);
         window.sendNow(file);
-        appendLine("[系统] 已向 " + peer + " 发起文件传输：" + file.getName() + "（" + peer
-                + " 确认后开始传输）", COLOR_SYSTEM);
+        appendLine("[系统] 已向 " + peer + " 发起文件传输：" + file.getName() + (isSelfChat()
+                ? "（发给自己，自动接收）"
+                : "（" + peer + " 确认后开始传输）"), COLOR_SYSTEM);
+    }
+
+    /**
+     * 私聊文件发送的预检：对端在线才允许发。
+     *
+     * <p>判断依据是主窗口在用户列表刷新时写入的状态——面板拿不到在线名单，
+     * 而"对端此刻在不在线"只有那份名单说了算。</p>
+     *
+     * @return 对端在线返回 true
+     */
+    @Override
+    protected boolean hasSendTarget() {
+        // 与自己私聊时接收方就是本人，不存在"对方不在线"的情况
+        return isSelfChat() || super.hasSendTarget();
+    }
+
+    /**
+     * 无接收方时的原因描述。
+     *
+     * @return 中文原因
+     */
+    @Override
+    protected String noTargetReason() {
+        return peer + " 当前不在线，无法发送文件（消息仍可发出，对方下次上线后会收到）";
+    }
+
+    /**
+     * 判断本会话是否是"与自己聊天"。
+     *
+     * @return 对端即本人返回 true
+     */
+    private boolean isSelfChat() {
+        String self = client.getUsername();
+        return self != null && self.equals(peer);
     }
 
     /**
@@ -88,21 +128,25 @@ public class PrivateChatPanel extends BaseChatPanel {
      * <p>解析出的时间交给基类按"今天/昨天/本年/跨年"规则显示：历史记录可能来自昨天甚至去年，
      * 只显示时分会让使用者误以为是很久以前的当天消息。</p>
      *
-     * @param records 历史记录，按时间升序，每项为 {@code {时间, 发送者用户名, 正文}}
+     * @param records 历史记录，按时间升序，每项为 {@code {时间, 发送者用户名, 接收者, 消息标识, 正文}}
      * @return 实际渲染的条数
      */
     public int fillHistory(java.util.List<String[]> records) {
         if (records == null || records.isEmpty()) {
             return 0;
         }
+        boolean selfChat = isSelfChat();
         java.util.List<HistoryEntry> history = new java.util.ArrayList<>(records.size());
         for (String[] record : records) {
-            if (record.length < 3) {
+            if (record.length < 5) {
                 continue;
             }
             boolean fromPeer = peer.equals(record[1]);
-            history.add(new HistoryEntry(fromPeer ? peer : "我", record[2], !fromPeer,
-                    DateUtil.parse(record[0])));
+            // 与自己的会话里收发双方都是本人，全部按本人消息渲染：
+            // 若按"发送者是否为对端"判断，自己发的消息会全部落到左边
+            boolean mine = selfChat || !fromPeer;
+            history.add(new HistoryEntry(mine ? "我" : peer, record[4], mine,
+                    DateUtil.parse(record[0]), record[3]));
         }
         // 基类按时间升序插到列表最前面，并负责跳过已经渲染过的消息
         int rendered = prependHistory(history);
@@ -148,9 +192,14 @@ public class PrivateChatPanel extends BaseChatPanel {
                     COLOR_ERROR);
             return false;
         }
-        String messageId = client.sendPrivateTextReturningId(peer, content, quoteId, quoteSummary);
+        String quoteSender = getPendingQuoteSender();
+        String messageId = client.sendPrivateTextReturningId(peer, content, quoteId, quoteSummary,
+                quoteSender);
         if (messageId != null) {
-            appendMessage("我", content, COLOR_SELF, messageId);
+            // 本地回显必须带上引用块：引用是使用者写这条消息时的上下文，
+            // 自己看不到它就会以为引用没有生效（对方那边其实是看得见的）
+            appendMessage("我", content, COLOR_SELF, messageId, quoteSummary, quoteSender,
+                    client.getUsername());
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }

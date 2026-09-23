@@ -6,8 +6,8 @@ import java.time.LocalDateTime;
 /**
  * 用户实体类。
  *
- * <p>职责：描述一个账号的全部持久化信息（用户名、昵称、密码散列、盐、角色、注册与登录时间），
- * 同时作为在线用户列表的载体在网络上传输（此时不携带敏感字段）。</p>
+ * <p>职责：描述一个账号的全部持久化信息（用户名、昵称、头像、密码散列、盐、角色、
+ * 注册与登录时间），同时作为在线用户列表的载体在网络上传输（此时不携带敏感字段）。</p>
  *
  * <p>封装说明：所有字段私有，通过 getter/setter 访问；密码相关字段在序列化到客户端前
  * 必须由 {@link #clearCredential()} 清空，避免散列与盐随在线用户列表广播出去。</p>
@@ -43,6 +43,17 @@ public class User implements Serializable {
 
     /** 是否在线（运行期状态，不持久化） */
     private boolean online;
+
+    /**
+     * 自定义头像（PNG 图片的 Base64 文本）；为 null 表示未设置，界面回落到默认剪影。
+     *
+     * <p>属于公共资料，因此 {@link #clearCredential()} 不清理它——头像本来就要随
+     * 在线用户列表下发给所有人看。</p>
+     *
+     * <p>长度上限与格式校验见 {@link Constants#AVATAR_MAX_LENGTH} 与
+     * {@link AvatarCodec}，服务端在写入前必须校验，不能依赖客户端自觉。</p>
+     */
+    private String avatar;
 
     /**
      * 无参构造，供文件反序列化与测试使用。
@@ -220,10 +231,39 @@ public class User implements Serializable {
      * 清理密码凭据，用于把用户对象发送给客户端之前脱敏。
      *
      * <p>把自己从“持久化实体”临时降级为“公共资料对象”，避免散列与盐经网络泄露。</p>
+     *
+     * <p>刻意不动 {@link #avatar}：头像本就是公共资料，清掉它会让客户端收到一张空头像。</p>
      */
     public void clearCredential() {
         this.passwordHash = null;
         this.salt = null;
+    }
+
+    /**
+     * 获取自定义头像。
+     *
+     * @return PNG 图片的 Base64 文本；未设置时返回 null
+     */
+    public String getAvatar() {
+        return avatar;
+    }
+
+    /**
+     * 设置自定义头像。
+     *
+     * @param avatar PNG 图片的 Base64 文本，传 null 或空串表示恢复默认头像
+     */
+    public void setAvatar(String avatar) {
+        this.avatar = avatar == null || avatar.isEmpty() ? null : avatar;
+    }
+
+    /**
+     * 判断是否设置了自定义头像。
+     *
+     * @return 已设置返回 true
+     */
+    public boolean hasAvatar() {
+        return avatar != null && !avatar.isEmpty();
     }
 
     /**

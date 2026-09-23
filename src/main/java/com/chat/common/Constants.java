@@ -75,6 +75,47 @@ public final class Constants {
     /** 服务器允许的最大文件体积提示文本，用于错误信息拼装 */
     public static final String MAX_FILE_SIZE_TEXT = "200MB";
 
+    /**
+     * 可作为图片发送的文件扩展名（小写，不含点）。
+     *
+     * <p>仅供文件选择器过滤使用，不作为安全校验：扩展名是用户可随意改写的，
+     * 服务端与接收端都不依赖它判断内容，实际发送走的仍是通用文件通道。</p>
+     */
+    public static final String[] IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "bmp"};
+
+    // ==================== 头像 ====================
+
+    /**
+     * 头像的显示边长（像素）。
+     *
+     * <p>客户端把用户选择的图片统一裁切缩放成这个尺寸的 PNG 再上传，
+     * 因此服务端存下来的就是最终显示尺寸，各界面直接按需缩放即可。</p>
+     */
+    public static final int AVATAR_SIDE = 96;
+
+    /**
+     * 头像 Base64 文本的长度上限。
+     *
+     * <p>96×96 的 PNG 通常在 4-12KB，Base64 后约 6-16KB，取 32KB 留出充足余量。
+     * 设上限的目的不是防图片本身，而是防止头像列被塞入任意长文本：
+     * 头像会随每次用户列表广播下发给所有在线用户，无上限等于给广播报文开了个口子。</p>
+     */
+    public static final int AVATAR_MAX_LENGTH = 32768;
+
+    /**
+     * 用户选择头像图片时的源图边长上限（像素）：4096。
+     *
+     * <p>为什么需要这个上限：{@code ImageIO.read} 在缩放之前就会把整张图解成
+     * {@code BufferedImage}，一亿像素的图即约 400MB，足以让客户端直接 OOM。
+     * 4096 边长的图约占 67MB，属于可以接受的瞬时开销，也覆盖了手机拍照与
+     * 常见壁纸的尺寸；超过它的图在读取尺寸后立即拒绝并提示，而不是硬读进内存。</p>
+     *
+     * <p>注意它与 {@link #AVATAR_SIDE} 的分工：本常量管"允许多大的图进来"，
+     * 进来之后一律按短边等比缩放并居中裁切成 {@code AVATAR_SIDE} 见方的正方形——
+     * 直接把非正方形图片拉伸成正方形会把人物压扁，必须裁而不是拉。</p>
+     */
+    public static final int AVATAR_IMAGE_MAX_SIDE = 4096;
+
     // ==================== 路径与目录 ====================
 
     /** 项目根目录（以 user.dir 为基准），是其它路径的解析基准 */
@@ -154,6 +195,37 @@ public final class Constants {
 
     /** 广播接收者标识（日志与界面展示用） */
     public static final String BROADCAST_TAG = "ALL";
+
+    /**
+     * 聊天记录导出范围的前缀。
+     *
+     * <p>导出请求的正文用它标记"导出哪一个会话"：{@code @ALL} 是群聊大厅，
+     * {@code @用户名} 是与该用户的私聊，正文为空则导出本人全部记录。
+     * 之所以要这个前缀而不是直接写用户名：用户名允许出现字母数字下划线，
+     * 单看一个 {@code ALL} 无从分辨那是群聊还是某个真叫这个名字的账号，
+     * 而用户名里不可能出现 {@code @}。</p>
+     */
+    public static final String EXPORT_SCOPE_PREFIX = "@";
+
+    /** 导出范围：群聊大厅 */
+    public static final String BROADCAST_SCOPE = EXPORT_SCOPE_PREFIX + BROADCAST_TAG;
+
+    /** 资料变更回执的分区标识：昵称 */
+    public static final String PROFILE_SECTION_NICK = "NICK";
+
+    /** 资料变更回执的分区标识：头像 */
+    public static final String PROFILE_SECTION_AVATAR = "AVATAR";
+
+    /** 资料变更回执的分区标识：密码 */
+    public static final String PROFILE_SECTION_PASSWORD = "PASSWORD";
+
+    /**
+     * 资料变更回执的正文分隔后的字段数：{@code 成败|分区|原因}。
+     *
+     * <p>原因放在最后一列，因此按竖线切分时要用这个上限而不是只切两段——
+     * 否则原因里若含竖线会把后半句截掉。</p>
+     */
+    public static final int PROFILE_RESULT_FIELD_COUNT = 3;
 
     /** 编码统一使用 UTF-8，避免中文乱码 */
     public static final Charset CHARSET = StandardCharsets.UTF_8;

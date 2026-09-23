@@ -39,6 +39,12 @@ public class JdbcUserDao implements UserDao {
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".JdbcUserDao");
 
+    /** MySQL "列已存在" 的驱动错误码（Duplicate column name） */
+    private static final int DUPLICATE_COLUMN_ERROR_CODE = 1060;
+
+    /** MySQL "列已存在" 的标准 SQLState；与错误码一起判断，任一命中即视为正常 */
+    private static final String DUPLICATE_COLUMN_SQL_STATE = "42S21";
+
     /** JDBC 连接地址 */
     private final String url;
 
@@ -82,6 +88,7 @@ public class JdbcUserDao implements UserDao {
         try {
             Class.forName(driverClass);
             createTableIfAbsent();
+            ensureAvatarColumn();
             LOGGER.info(() -> "用户数据存储已就绪: " + url);
             return true;
         } catch (ClassNotFoundException e) {
@@ -111,6 +118,9 @@ public class JdbcUserDao implements UserDao {
                 + "role VARCHAR(16) NOT NULL DEFAULT 'USER',"
                 + "create_time DATETIME NULL,"
                 + "last_login_time DATETIME NULL,"
+                // 头像存 PNG 的 Base64 文本，单张约 6-16KB，用 MEDIUMTEXT 留足余量。
+                // 允许 NULL：NULL 与空串都表示"未设置头像"，界面回落到默认剪影
+                + "avatar MEDIUMTEXT NULL,"
                 // 与 sql/schema.sql 保持逐项一致：运行期建表若漏建索引，
                 // 会出现"脚本建库查询快、程序自动建库查询慢"的隐蔽差异，
                 // 而 CREATE TABLE IF NOT EXISTS 不会为已存在的表补建索引
@@ -119,6 +129,36 @@ public class JdbcUserDao implements UserDao {
         try (Connection connection = openConnection();
              Statement statement = connection.createStatement()) {
             statement.execute(sql);
+        }
+    }
+
+    /**
+     * 为已存在的 {@code chat_user} 表补建 {@code avatar} 列（幂等）。
+     *
+     * <p><b>为什么建表之后还要单独做这一步</b>：{@code CREATE TABLE IF NOT EXISTS}
+     * 对已经存在的表<b>什么都不做</b>——它既不会补列，也不会报错。因此从上一版升级上来的
+     * 数据库不会有 avatar 列，而此后所有 {@code INSERT}/{@code UPDATE} 都会因为
+     * "Unknown column 'avatar'" 而失败，表现为"注册/登录都报数据库错误"。</p>
+     *
+     * <p>重复执行是正常路径而非异常：列已存在时 MySQL 返回错误码 1060
+     * （SQLState {@code 42S21}，Duplicate column name），这里直接放过。
+     * 采用"先执行再容错"而不是"先查元数据再决定"，是为了顺带覆盖两个服务端实例
+     * 同时启动的场景——查完再改的写法在那时会一起执行 ALTER，仍要靠 1060 兜底。</p>
+     *
+     * @throws SQLException 补列失败且原因不是"列已存在"时抛出
+     */
+    private void ensureAvatarColumn() throws SQLException {
+        String sql = "ALTER TABLE chat_user ADD COLUMN avatar MEDIUMTEXT NULL";
+        try (Connection connection = openConnection();
+             Statement statement = connection.createStatement()) {
+            statement.execute(sql);
+            LOGGER.info("已为 chat_user 补充 avatar 列");
+        } catch (SQLException e) {
+            if (e.getErrorCode() != DUPLICATE_COLUMN_ERROR_CODE
+                    && !DUPLICATE_COLUMN_SQL_STATE.equals(e.getSQLState())) {
+                throw e;
+            }
+            LOGGER.fine("avatar 列已存在，无需补充");
         }
     }
 
@@ -164,6 +204,7 @@ public class JdbcUserDao implements UserDao {
         user.setSalt(rs.getString("salt"));
         user.setPasswordHash(rs.getString("password_hash"));
         user.setRole(rs.getString("role"));
+        user.setAvatar(rs.getString("avatar"));
         Timestamp create = rs.getTimestamp("create_time");
         if (create != null) {
             user.setCreateTime(create.toLocalDateTime());
@@ -188,7 +229,7 @@ public class JdbcUserDao implements UserDao {
             return false;
         }
         String sql = "INSERT INTO chat_user(username, nickname, salt, password_hash, role, create_time, "
-                + "last_login_time) VALUES(?,?,?,?,?,?,?)";
+                + "last_login_time, avatar) VALUES(?,?,?,?,?,?,?,?)";
         try (Connection connection = openConnection();
              PreparedStatement ps = connection.prepareStatement(sql)) {
             fill(ps, entity);
@@ -211,7 +252,7 @@ public class JdbcUserDao implements UserDao {
             return false;
         }
         String sql = "UPDATE chat_user SET nickname=?, salt=?, password_hash=?, role=?, create_time=?, "
-                + "last_login_time=? WHERE username=?";
+                + "last_login_time=?, avatar=? WHERE username=?";
         try (Connection connection = openConnection();
              PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setString(1, entity.getNickname());
@@ -220,7 +261,8 @@ public class JdbcUserDao implements UserDao {
             ps.setString(4, entity.getRole());
             ps.setTimestamp(5, entity.getCreateTime() == null ? null : Timestamp.valueOf(entity.getCreateTime()));
             ps.setTimestamp(6, entity.getLastLoginTime() == null ? null : Timestamp.valueOf(entity.getLastLoginTime()));
-            ps.setString(7, entity.getUsername());
+            ps.setString(7, entity.getAvatar());
+            ps.setString(8, entity.getUsername());
             return ps.executeUpdate() > 0;
         } catch (SQLException e) {
             throw new ChatException("用户更新数据库失败: " + e.getMessage(), e);
@@ -242,6 +284,7 @@ public class JdbcUserDao implements UserDao {
         ps.setString(5, user.getRole());
         ps.setTimestamp(6, user.getCreateTime() == null ? null : Timestamp.valueOf(user.getCreateTime()));
         ps.setTimestamp(7, user.getLastLoginTime() == null ? null : Timestamp.valueOf(user.getLastLoginTime()));
+        ps.setString(8, user.getAvatar());
     }
 
     /**

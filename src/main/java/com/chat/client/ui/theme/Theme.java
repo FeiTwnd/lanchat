@@ -45,6 +45,15 @@ public final class Theme {
     /** 描边色 */
     public static final Color BORDER = new Color(0xD9E1E8);
 
+    /**
+     * 引用块的底色：比卡片略深一档的浅灰。
+     *
+     * <p>引用块画在气泡内部，而气泡本身是白卡片（自己的气泡则是主色），
+     * 因此它必须比卡片深、又比正文浅，才能靠"一块淡淡的底"表达
+     * "这段文字不是我说的话"而不喧宾夺主。</p>
+     */
+    public static final Color QUOTE_BG = new Color(0xF0F3F6);
+
     /** 正文颜色 */
     public static final Color TEXT = new Color(0x27374D);
 

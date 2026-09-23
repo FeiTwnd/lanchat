@@ -36,12 +36,42 @@ public final class ChatMessageFactory {
      * {@code com.chat.common}；字符串、包装类型与枚举依赖 {@code java.lang}；
      * 消息时间戳使用 {@code java.time}；{@code java.util} 当前报文并未直接使用，
      * 保留它是为了兼容既定的过滤器基线并给后续批量消息类扩展留出余量。
-     * 末尾的 {@code !*} 表示其余一律拒绝，从而阻断依赖链 gadget 类被加载；
-     * 深度、引用数、字节数与数组长度四项上限用于抵御"反序列化炸弹"造成的资源耗尽。</p>
+     * 末尾的 {@code !*} 表示其余一律拒绝，从而阻断依赖链 gadget 类被加载。</p>
+     *
+     * <p><b>关于 {@code maxbytes} 与 {@code maxrefs} 的语义（缺陷 D-22 / D-23 的修复点）</b>：
+     * 它们分别绑定 {@link java.io.ObjectInputFilter.FilterInfo#streamBytes()} 与
+     * {@link java.io.ObjectInputFilter.FilterInfo#references()}，都是同一个
+     * {@code ObjectInputStream} 上<b>累计</b>的量，<b>不是</b>单条消息的规模上限；
+     * 而且流里的 {@code TC_RESET}（由对端 {@code out.reset()} 写出）会把句柄表清空却
+     * <b>不清零这两个计数器</b>。</p>
+     *
+     * <p>两个取值都曾经小到会在正常使用中被打满，表现为"聊着聊着突然掉线"，
+     * 且日志记的是"反序列化被白名单拒绝"，把容量问题误报成了安全问题：</p>
+     * <ul>
+     *   <li>{@code maxbytes} 原为 4 MiB，而单文件上限就有
+     *       {@link Constants#MAX_FILE_SIZE}（200MB）——传完 4 MiB 之后整条连接作废（D-22）；</li>
+     *   <li>{@code maxrefs} 原为 1000，而本项目<b>每发一条消息都 {@code reset()}</b>
+     *       （见 {@code ChatClient.writeObject} 与 {@code ClientHandler.send}），
+     *       重置会让类描述符在每条消息里重发一遍，实测一条纯文本消息约耗 15 个引用，
+     *       于是<b>发到第 66 条就再也读不进任何消息</b>（D-23）。
+     *       这条比 D-22 更容易撞上：它不需要传大文件，正常聊天就能触发。</li>
+     * </ul>
+     *
+     * <p>现取值 {@code maxbytes=1GiB}、{@code maxrefs=50000000}：两者量级对齐
+     * （本项目最省引用的文本消息约 15 个引用/485 字节，5 千万引用对应约 1 GiB 流量），
+     * 因此不会出现"字节数还没到、引用数先耗尽"这种更难排查的假象，
+     * 而两个上限都仍留着一个天花板。</p>
+     *
+     * <p>真正抵御"反序列化炸弹"的是 {@code maxdepth}（嵌套深度）与
+     * {@code maxarray}（单个数组长度）两项：炸弹的危害在于<b>用小报文膨胀出巨大的对象图</b>，
+     * 而这两点卡的正是膨胀本身，且它们每次 {@code readObject} 都会重置、不随连接时长衰减。
+     * {@code maxbytes} 与 {@code maxrefs} 是累计量，攻击者要耗尽它们只能真的把那么多字节发过来，
+     * 并不构成放大效应，故不应指望它们来防炸弹——把它们设得极小并不会更安全，
+     * 只会先把自己的长连接掐断。</p>
      */
     private static final String SERIALIZATION_FILTER_PATTERN =
             "com.chat.common.*;java.lang.*;java.time.*;java.util.*;!*;"
-                    + "maxdepth=8;maxrefs=1000;maxbytes=4194304;maxarray=65536";
+                    + "maxdepth=8;maxrefs=50000000;maxbytes=1073741824;maxarray=65536";
 
     /** 私有构造，禁止实例化工具类 */
     private ChatMessageFactory() {
@@ -82,7 +112,28 @@ public final class ChatMessageFactory {
      *         或任一字段含非法控制字符时返回 null
      */
     public static String[] splitFields(String text) {
-        if (text == null || text.length() > Constants.MESSAGE_MAX_LENGTH) {
+        return splitFields(text, Constants.MESSAGE_MAX_LENGTH);
+    }
+
+    /**
+     * 按竖线切分控制报文正文，并指定正文长度上限。
+     *
+     * <p>为什么需要这个重载：{@link Constants#MESSAGE_MAX_LENGTH} 是<b>聊天正文</b>的上限，
+     * 并不天然适用于所有控制报文。头像变更请求就属于反例——它的载荷是图片的 Base64
+     * （上限 {@link Constants#AVATAR_MAX_LENGTH}，默认正文上限的两倍多），
+     * 若沿用 2000 字符的闸门，任何一张真头像都会被判为"字段非法"而拒绝，
+     * 表现为"选了图片却提示消息过长"。</p>
+     *
+     * <p>放宽的只是长度，字段数量上限与非法控制字符检查一字未动：
+     * 头像分支真正需要防的是"同一套校验被绕过"，而不是"限制放松了"。</p>
+     *
+     * @param text      报文正文，可为 null
+     * @param maxLength 正文长度上限
+     * @return 字段数组；正文为 null、超过给定长度上限、字段数超过 {@link #MAX_FIELD_COUNT}
+     *         或任一字段含非法控制字符时返回 null
+     */
+    public static String[] splitFields(String text, int maxLength) {
+        if (text == null || text.length() > maxLength) {
             return null;
         }
         String[] fields = text.split("\\|", -1);

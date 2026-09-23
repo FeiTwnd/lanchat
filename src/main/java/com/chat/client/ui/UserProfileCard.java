@@ -85,7 +85,8 @@ public final class UserProfileCard {
         content.setBackground(Theme.CARD);
         content.setBorder(BorderFactory.createEmptyBorder(18, 20, 12, 20));
 
-        JLabel avatar = new JLabel(AvatarFactory.avatar(online, user.isAdmin(), AVATAR_SIZE));
+        JLabel avatar = new JLabel(
+                AvatarFactory.avatar(user.getUsername(), online, user.isAdmin(), AVATAR_SIZE));
         avatar.setAlignmentX(Component.CENTER_ALIGNMENT);
         content.add(avatar);
         content.add(Box.createVerticalStrut(10));

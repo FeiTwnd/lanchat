@@ -178,6 +178,40 @@ public class UserDaoTest {
     }
 
     /**
+     * 用例 8：头像列可写入、可回读、可清空。
+     *
+     * <p>本轮为 {@code chat_user} 新增了 {@code avatar} 列（老库由
+     * {@code ensureAvatarColumn()} 自动补列）。这条用例断言的是"列真的接通了"——
+     * 建表语句加了列却漏在 {@code map()}/{@code save()}/{@code update()} 里接线，
+     * 表现就是头像永远存不上，界面看起来"改了个寂寞"。</p>
+     *
+     * @throws Exception 测试过程中出现异常
+     */
+    @Test("用户 DAO：头像可写入、回读与清空")
+    public void testAvatarColumn() throws Exception {
+        if (!TestDatabase.isAvailable()) {
+            TestRunner.skip(TestDatabase.unavailableReason());
+        }
+        JdbcUserDao dao = TestDatabase.userDao();
+        User user = buildUser("helen", "海伦");
+        String avatar = "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4"; // 前缀合法的占位文本
+        user.setAvatar(avatar);
+        TestRunner.assertTrue(dao.save(user), "带头像新增应成功");
+        TestRunner.assertEquals(avatar, dao.findByUsername("helen").getAvatar(), "头像应被完整回读");
+
+        // 整行更新路径：改昵称不能顺手把头像冲掉
+        user.setNickname("海伦2");
+        TestRunner.assertTrue(dao.update(user), "更新应成功");
+        TestRunner.assertEquals(avatar, dao.findByUsername("helen").getAvatar(),
+                "更新昵称后头像应保留");
+
+        // 清空头像：与"从未设置"共用同一种存储形态
+        user.setAvatar(null);
+        TestRunner.assertTrue(dao.update(user), "清空头像的更新应成功");
+        TestRunner.assertNull(dao.findByUsername("helen").getAvatar(), "清空后应为 null");
+    }
+
+    /**
      * 构造测试用用户对象。
      *
      * @param username 用户名

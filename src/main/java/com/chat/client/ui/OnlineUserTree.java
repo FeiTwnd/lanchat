@@ -2,6 +2,7 @@ package com.chat.client.ui;
 
 import com.chat.client.ui.theme.AvatarFactory;
 import com.chat.client.ui.theme.Badge;
+import com.chat.client.ui.theme.Glyphs;
 import com.chat.client.ui.theme.Theme;
 import com.chat.common.User;
 
@@ -269,22 +270,53 @@ public class OnlineUserTree extends JTree {
 
     /**
      * 依据当前数据与过滤条件重建节点树。
+     *
+     * <p>带过滤条件时换一套画法：空的分组不再挂出来，"管理员（0）""普通用户（0）"
+     * 这类空壳子在最需要看结果的时候占着位置；命中数为 0 时补一行说明。
+     * 这是搜索"看起来没反应"的主要来源——关键字没命中时，旧画法下的树
+     * （三个空分组 + 一行都没变的根节点）与搜索前几乎一模一样，
+     * 使用者只能判断成"搜索坏了"。根节点同时报出命中人数，
+     * 让"筛掉了多少"这件事有处可看。</p>
      */
     private void rebuild() {
         root.removeAllChildren();
+        boolean filtering = !filter.isEmpty();
         DefaultMutableTreeNode adminNode = new DefaultMutableTreeNode(GROUP_ADMIN);
         DefaultMutableTreeNode userNode = new DefaultMutableTreeNode(GROUP_USER);
         DefaultMutableTreeNode offlineNode = new DefaultMutableTreeNode(GROUP_OFFLINE);
-        fill(adminNode, online.values(), true, true);
-        fill(userNode, online.values(), false, true);
-        fill(offlineNode, offline.values(), false, false);
-        root.add(adminNode);
-        root.add(userNode);
-        root.add(offlineNode);
-        root.setUserObject("在线用户 " + online.size() + " 人");
+        int hits = 0;
+        hits += fill(adminNode, online.values(), true, true);
+        hits += fill(userNode, online.values(), false, true);
+        hits += fill(offlineNode, offline.values(), false, false);
+        if (!filtering) {
+            root.add(adminNode);
+            root.add(userNode);
+            root.add(offlineNode);
+        } else {
+            addIfNotEmpty(adminNode);
+            addIfNotEmpty(userNode);
+            addIfNotEmpty(offlineNode);
+            if (hits == 0) {
+                root.add(new DefaultMutableTreeNode(new Hint("没有匹配“" + filter + "”的用户")));
+            }
+        }
+        root.setUserObject(filtering
+                ? "在线用户 " + online.size() + " 人 · 命中 " + hits + " 人"
+                : "在线用户 " + online.size() + " 人");
         model.reload();
         for (int i = 0; i < getRowCount(); i++) {
             expandRow(i);
+        }
+    }
+
+    /**
+     * 挂上分组节点，但空分组不挂。
+     *
+     * @param node 分组节点
+     */
+    private void addIfNotEmpty(DefaultMutableTreeNode node) {
+        if (node.getChildCount() > 0) {
+            root.add(node);
         }
     }
 
@@ -295,9 +327,10 @@ public class OnlineUserTree extends JTree {
      * @param users   候选用户
      * @param admin   是否只收管理员
      * @param isOnline 是否为在线分组
+     * @return 实际挂上去的用户数
      */
-    private void fill(DefaultMutableTreeNode parent, java.util.Collection<User> users,
-                      boolean admin, boolean isOnline) {
+    private int fill(DefaultMutableTreeNode parent, java.util.Collection<User> users,
+                     boolean admin, boolean isOnline) {
         for (User user : users) {
             if (user.isAdmin() != admin || !matches(user)) {
                 continue;
@@ -305,6 +338,7 @@ public class OnlineUserTree extends JTree {
             parent.add(new DefaultMutableTreeNode(new Entry(user, isOnline)));
         }
         parent.setUserObject(parent.getUserObject() + "（" + parent.getChildCount() + "）");
+        return parent.getChildCount();
     }
 
     /**
@@ -319,6 +353,27 @@ public class OnlineUserTree extends JTree {
         }
         String nickname = user.getNickname() == null ? "" : user.getNickname().toLowerCase();
         return user.getUsername().toLowerCase().contains(filter) || nickname.contains(filter);
+    }
+
+    /**
+     * 过滤无结果时的说明行载荷。
+     *
+     * <p>单独用一个类型而不是直接塞字符串：渲染器要靠它把这一行与
+     * "管理员""普通用户"这类分组节点区分开——写成字符串就只能靠文字内容去猜。</p>
+     */
+    private static final class Hint {
+
+        /** 说明文字 */
+        private final String text;
+
+        /**
+         * 构造说明行。
+         *
+         * @param text 说明文字
+         */
+        Hint(String text) {
+            this.text = text;
+        }
     }
 
     /**
@@ -398,17 +453,29 @@ public class OnlineUserTree extends JTree {
                         ? user.getUsername() : user.getNickname();
                 String state = entry.online ? "在线" : "离线";
                 String role = user.isAdmin() ? "管理员" : "普通用户";
+                // 昵称与用户名都必须转义后再拼进富文本：它们都来自使用者输入，
+                // 一个叫 "<b>" 的昵称足以让整行渲染错乱，含 "<table>" 的更会把列表撑坏
                 setText("<html><body style='margin:0'>"
                         + "<font color='" + hex(entry.online ? Theme.TEXT : Theme.TEXT_WEAK) + "'>"
-                        + nickname + "</font><br>"
+                        + HtmlEscape.escape(nickname) + "</font><br>"
                         + "<font color='" + hex(entry.online ? Theme.TEXT_WEAK : Theme.OFFLINE) + "'>"
-                        + user.getUsername() + " · " + role + " · " + state + "</font></body></html>");
-                setIcon(AvatarFactory.avatar(entry.online, user.isAdmin(), 34));
+                        + HtmlEscape.escape(user.getUsername()) + " · " + role + " · " + state
+                        + "</font></body></html>");
+                setIcon(AvatarFactory.avatar(user.getUsername(), entry.online, user.isAdmin(), 34));
                 setToolTipText(nickname + "（" + user.getUsername() + "）· " + role + " · " + state);
                 // 未读只认树上的那份数据：渲染器自己不保存任何计数，避免与树的状态各记一份
                 if (tree instanceof OnlineUserTree) {
                     unreadCount = ((OnlineUserTree) tree).unreadCount(user.getUsername());
                 }
+            } else if (payload instanceof Hint) {
+                // 说明行按正文样式画，不套分组的粗体与群组头像：
+                // 它是一句提示，不是一个可以点开的分组
+                String hint = ((Hint) payload).text;
+                setText(hint);
+                setFont(Theme.fontBase());
+                setIcon(Glyphs.search(18, Theme.TEXT_WEAK));
+                setForeground(Theme.TEXT_WEAK);
+                setToolTipText(hint);
             } else {
                 setText(String.valueOf(payload));
                 setFont(Theme.fontBold());

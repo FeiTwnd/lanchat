@@ -78,6 +78,7 @@ public abstract class AbstractMessageHandler implements MessageHandler {
             case USER_OFFLINE:
             case USER_UPDATE:
             case PASSWORD_CHANGE:
+            case PROFILE_RESULT:
             case HISTORY_REQUEST:
             case HISTORY_RESULT:
             case EXPORT_REQUEST:

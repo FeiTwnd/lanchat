@@ -9,6 +9,7 @@ import javax.swing.Icon;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JTextArea;
+import javax.swing.Timer;
 import java.awt.BasicStroke;
 import java.awt.BorderLayout;
 import java.awt.Color;
@@ -36,18 +37,19 @@ import java.time.format.DateTimeFormatter;
  * {@code JLabel} 无法选中文本，聊天记录里"选中一段复制"是基本能力，
  * 而 {@code JTextArea} 只读模式下仍支持鼠标选择与 Ctrl+C，代价是需要自行控制换行宽度。</p>
  *
- * <p>头像的取舍：这里复用 {@link AvatarFactory#avatar(boolean, boolean, int)}，
- * 并固定按"在线、非管理员"绘制。原因是气泡渲染发生在聊天窗口内，
- * 而实时在线状态与角色标记属于好友树的数据，面板层拿不到也不应该反向依赖；
- * 统一按在线样式绘制可以保证头像外观稳定，代价是气泡头像不反映对方当前的上下线变化。</p>
+ * <p>头像由调用方查好后传入（见 {@code self}/{@code other} 的带 {@link Icon} 重载），
+ * 不传时回落到 {@link AvatarFactory#avatar(boolean, boolean, int)} 的默认剪影。
+ * 之所以不在本类里按昵称去查：实时在线状态与角色标记属于用户列表的数据，
+ * 面板层拿不到也不应该反向依赖，由掌握这份数据的主窗口统一查好再传进来更直接。</p>
  *
- * <p>为后续功能预留的结构（本轮只留位置，不接入协议）：</p>
+ * <p>为后续功能预留的结构：</p>
  * <ul>
  *   <li>{@link #setStatusText(String)}：气泡底部一行的发送状态文字（发送中/已送达/对方离线/发送失败），
  *       由第 2 轮的 ACK 状态驱动；未设置时该行不占高度。</li>
- *   <li>{@link #setQuoteText(String)}：正文上方的引用块，供引用回复展示被引用消息的摘要；
+ *   <li>{@link #setQuoteText(String, String)}：正文上方的引用块，按"谁：内容"展示被引用消息；
  *       未设置时该块不占高度。</li>
- *   <li>撤回后的占位文案：复用正文文本槽位，把正文替换为"对方撤回了一条消息"即可，
+ *   <li>{@link #flashHighlight()}：搜索结果跳转过来时短暂闪烁，用于把视线引到目标那一条。</li>
+ *   <li>撤回后的占位文案：复用正文文本槽位，把正文替换为 {@code [该消息已撤回]} 即可，
  *       无需新增组件，因此这里不再额外预留控件。</li>
  * </ul>
  *
@@ -78,8 +80,13 @@ public class MessageBubble extends JPanel {
     /** 气泡最小宽度，保证极短消息仍有正常的圆角外观 */
     private static final int MIN_BUBBLE_WIDTH = 120;
 
-    /** 头像边长 */
-    private static final int AVATAR_SIZE = 32;
+    /**
+     * 头像边长。
+     *
+     * <p>包内可见：聊天面板之外，主窗口在把"用户名 -> 头像"的查询交给面板时，
+     * 也要用同一个边长取值，两处各写一个数字迟早会不一致。</p>
+     */
+    static final int AVATAR_SIZE = 32;
 
     /** 气泡内边距，同时决定正文折行宽度的扣减量 */
     private static final int BUBBLE_PADDING = 10;
@@ -101,6 +108,12 @@ public class MessageBubble extends JPanel {
 
     /** 可用宽度尚不可知时的兜底值，仅影响首帧测量结果 */
     private static final int FALLBACK_AVAILABLE_WIDTH = 480;
+
+    /** 定位闪烁的半周期时长（毫秒）：亮/灭各一次为一个周期 */
+    private static final int FLASH_INTERVAL_MS = 220;
+
+    /** 定位闪烁的亮灭翻转次数，取偶数以保证结束时落在"灭"上，再统一恢复原状态 */
+    private static final int FLASH_TICKS = 6;
 
     /** 今天的时间格式 */
     private static final DateTimeFormatter TIME_TODAY = DateTimeFormatter.ofPattern("HH:mm");
@@ -146,6 +159,9 @@ public class MessageBubble extends JPanel {
     /** 当前可用宽度（消息列表的内容宽度），气泡宽度上限由它换算 */
     private int availableWidth = FALLBACK_AVAILABLE_WIDTH;
 
+    /** 定位闪烁的计时器；只在闪烁期间非空，结束后不再重建 */
+    private Timer flashTimer;
+
     /**
      * 构造一条自己发送的消息气泡。
      *
@@ -154,7 +170,19 @@ public class MessageBubble extends JPanel {
      * @return 气泡组件
      */
     public static MessageBubble self(String content, LocalDateTime time) {
-        return new MessageBubble(Kind.SELF, null, content, time, null, false);
+        return self(content, time, null);
+    }
+
+    /**
+     * 构造一条自己发送的消息气泡，并指定头像。
+     *
+     * @param content 正文
+     * @param time    消息时间，可为 null（此时头部不显示时间）
+     * @param avatar  头像图标；为 null 时使用默认头像
+     * @return 气泡组件
+     */
+    public static MessageBubble self(String content, LocalDateTime time, Icon avatar) {
+        return new MessageBubble(Kind.SELF, null, content, time, null, false, avatar);
     }
 
     /**
@@ -166,7 +194,24 @@ public class MessageBubble extends JPanel {
      * @return 气泡组件
      */
     public static MessageBubble other(String nickname, String content, LocalDateTime time) {
-        return new MessageBubble(Kind.OTHER, nickname, content, time, null, false);
+        return other(nickname, content, time, null);
+    }
+
+    /**
+     * 构造一条他人发送的消息气泡，并指定头像。
+     *
+     * <p>头像由调用方查好后传进来，而不是在这里按昵称去查：气泡只知道自己显示什么，
+     * 在线状态与角色属于"用户列表"的知识，那是面板与主窗口的职责。</p>
+     *
+     * @param nickname 发送者昵称
+     * @param content  正文
+     * @param time     消息时间，可为 null（此时头部不显示时间）
+     * @param avatar   头像图标；为 null 时使用默认头像
+     * @return 气泡组件
+     */
+    public static MessageBubble other(String nickname, String content, LocalDateTime time,
+                                      Icon avatar) {
+        return new MessageBubble(Kind.OTHER, nickname, content, time, null, false, avatar);
     }
 
     /**
@@ -177,7 +222,7 @@ public class MessageBubble extends JPanel {
      * @return 提示组件
      */
     public static MessageBubble system(String text, Color color) {
-        return new MessageBubble(Kind.SYSTEM, null, text, null, color, false);
+        return new MessageBubble(Kind.SYSTEM, null, text, null, color, false, null);
     }
 
     /**
@@ -190,7 +235,7 @@ public class MessageBubble extends JPanel {
      * @return 分隔行组件
      */
     public static MessageBubble timeSeparator(String text) {
-        return new MessageBubble(Kind.SYSTEM, null, text, null, Theme.TEXT_WEAK, true);
+        return new MessageBubble(Kind.SYSTEM, null, text, null, Theme.TEXT_WEAK, true, null);
     }
 
     /**
@@ -202,9 +247,10 @@ public class MessageBubble extends JPanel {
      * @param time        消息时间
      * @param systemColor 系统提示文字颜色
      * @param pill        系统提示是否使用胶囊底（时间分隔行）
+     * @param avatar      头像图标，仅消息类气泡使用；为 null 时用默认头像
      */
     private MessageBubble(Kind kind, String nickname, String content, LocalDateTime time,
-                          Color systemColor, boolean pill) {
+                          Color systemColor, boolean pill, Icon avatar) {
         super(new FlowLayout(alignmentOf(kind), ROW_GAP, 0));
         this.kind = kind;
         this.content = content == null ? "" : content;
@@ -232,13 +278,13 @@ public class MessageBubble extends JPanel {
             this.quotePanel = new QuotePanel();
             JPanel contentPane = buildContentPane(nickname, time);
             this.bubblePane = new BubblePane(contentPane, kind);
-            Icon avatar = AvatarFactory.avatar(true, false, AVATAR_SIZE);
+            Icon icon = avatar != null ? avatar : AvatarFactory.avatar(true, false, AVATAR_SIZE);
             if (kind == Kind.OTHER) {
-                add(new JLabel(avatar));
+                add(new JLabel(icon));
                 add(bubblePane);
             } else {
                 add(bubblePane);
-                add(new JLabel(avatar));
+                add(new JLabel(icon));
             }
         }
         applyBodySize();
@@ -280,6 +326,26 @@ public class MessageBubble extends JPanel {
     }
 
     /**
+     * 把气泡正文改写成"已撤回"占位文案。
+     *
+     * <p>为什么由气泡自己做而不是让调用方去组件树里翻正文文本区：正文就装在本类内部，
+     * "撤回后长什么样"（正文换成占位文字、颜色转灰、底部标注已撤回）是气泡自己的表现细节。
+     * 调用方按内容去猜哪一条是目标，还会在同会话出现两条相同正文时改错行。</p>
+     *
+     * <p>自己的气泡是主色底白字，占位文案同样保持白色：换成灰色在这块深色底上几乎看不清，
+     * 而"已撤回"恰恰是必须一眼看到的信息。</p>
+     *
+     * @param text 占位文案
+     */
+    public void markRecalled(String text) {
+        body.setText(text == null ? "" : text);
+        body.setForeground(kind == Kind.SELF ? Color.WHITE : Theme.TEXT_WEAK);
+        setStatusText("已撤回");
+        revalidate();
+        repaint();
+    }
+
+    /**
      * 设置发送状态文字（预留槽位，本轮不接入协议）。
      *
      * @param text 状态文字；为空表示不显示
@@ -318,6 +384,38 @@ public class MessageBubble extends JPanel {
     }
 
     /**
+     * 短暂闪烁高亮，用于把使用者的视线引到刚被定位到的那一条消息上。
+     *
+     * <p>用 {@link javax.swing.Timer} 驱动而不是自己开线程睡眠：本方法在事件分发线程上被调用，
+     * 任何形式的阻塞（{@code Thread.sleep}）都会把整个界面卡住这段时间，闪烁也就无从谈起了。</p>
+     *
+     * <p>收尾时恢复调用前的高亮状态，而不是简单地熄灭：被 @ 提及的气泡本身就带着持久高亮，
+     * 直接熄灭会把那个更重要的提示一并抹掉。</p>
+     */
+    public void flashHighlight() {
+        if (!(bubblePane instanceof BubblePane)) {
+            return;
+        }
+        if (flashTimer != null && flashTimer.isRunning()) {
+            flashTimer.stop();
+        }
+        final boolean previous = isHighlighted();
+        final int[] tick = {0};
+        final boolean[] on = {false};
+        flashTimer = new Timer(FLASH_INTERVAL_MS, event -> {
+            tick[0]++;
+            on[0] = !on[0];
+            setHighlighted(on[0]);
+            if (tick[0] >= FLASH_TICKS) {
+                ((Timer) event.getSource()).stop();
+                setHighlighted(previous);
+            }
+        });
+        flashTimer.setInitialDelay(0);
+        flashTimer.start();
+    }
+
+    /**
      * 设置引用块内容。
      *
      * @param text 引用摘要；为空表示不显示
@@ -325,6 +423,18 @@ public class MessageBubble extends JPanel {
     public void setQuoteText(String text) {
         if (quotePanel != null) {
             quotePanel.setQuoteText(text);
+        }
+    }
+
+    /**
+     * 设置引用块内容（含被引用者）。
+     *
+     * @param who      被引用消息的发送者显示名，可为 null（此时只显示摘要）
+     * @param summary  被引用消息的摘要；为空表示不显示整个引用块
+     */
+    public void setQuoteText(String who, String summary) {
+        if (quotePanel != null) {
+            quotePanel.setQuoteText(who, summary);
         }
     }
 
@@ -676,12 +786,29 @@ public class MessageBubble extends JPanel {
     }
 
     /**
-     * 预留的引用块：展示被引用消息的摘要，本轮不接入协议。
+     * 引用块：在主气泡正文上方展示被引用消息的"谁：内容"摘要。
+     *
+     * <p>为什么不用 {@code MatteBorder} 画左侧竖条：边框只能画直角矩形，
+     * 而引用块本身是一张圆角卡片，直角竖条会从圆角处探出去；改为在
+     * {@link #paintComponent} 里把圆角矩形当作裁剪区再画竖条，竖条自然跟着圆角收进去。</p>
+     *
+     * <p>内容一律经 {@link HtmlEscape#oneLine} 转义后再放进 HTML 标签：被引用的正文
+     * 是使用者输入的，含 {@code <}、{@code &} 时若不转义，轻则本行显示错乱，
+     * 重则把整个气泡的排版撑坏（Swing 的标签见到 {@code <html>} 就按富文本解析）。</p>
      */
     private static final class QuotePanel extends JPanel {
 
         /** 序列化版本号 */
         private static final long serialVersionUID = 20260924L;
+
+        /** 左侧竖条宽度 */
+        private static final int BAR_WIDTH = 3;
+
+        /** 摘要行的像素宽度预算：超出即截断为省略号，全文交给工具提示 */
+        private static final int SUMMARY_WIDTH = 250;
+
+        /** 截断标记 */
+        private static final String ELLIPSIS = "…";
 
         /** 摘要标签 */
         private final JLabel label = new JLabel();
@@ -691,11 +818,32 @@ public class MessageBubble extends JPanel {
             setOpaque(false);
             label.setFont(Theme.fontSmall());
             label.setForeground(Theme.TEXT_WEAK);
-            setBorder(BorderFactory.createCompoundBorder(
-                    BorderFactory.createMatteBorder(0, 3, 0, 0, Theme.BORDER),
-                    BorderFactory.createEmptyBorder(2, 6, 4, 6)));
+            // 左边让开自绘的竖条，右侧与上下留出与卡片圆角相称的呼吸空间
+            setBorder(BorderFactory.createEmptyBorder(3, BAR_WIDTH + 7, 4, 8));
             add(label, BorderLayout.CENTER);
             setVisible(false);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            int width = getWidth();
+            int height = getHeight();
+            if (width <= 0 || height <= 0) {
+                return;
+            }
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int arc = Math.min(8, height);
+            java.awt.Shape card = new java.awt.geom.RoundRectangle2D.Float(0, 0, width, height, arc, arc);
+            g2.setColor(Theme.QUOTE_BG);
+            g2.fill(card);
+            // 竖条裁剪在圆角之内：左边两端的圆角会把竖条自然地收细，
+            // 这正是它比"画一个直角矩形"更像成品界面的地方
+            g2.clip(card);
+            g2.setColor(Theme.PRIMARY);
+            g2.fillRect(0, 0, BAR_WIDTH, height);
+            g2.dispose();
+            super.paintComponent(g);
         }
 
         /**
@@ -704,10 +852,79 @@ public class MessageBubble extends JPanel {
          * @param text 摘要文本；为空表示隐藏整个引用块
          */
         void setQuoteText(String text) {
-            boolean show = text != null && !text.trim().isEmpty();
-            label.setText(show ? text : "");
-            setVisible(show);
+            setQuoteText(null, text);
+        }
+
+        /**
+         * 设置引用摘要（含被引用者）。
+         *
+         * @param who     被引用消息的发送者显示名，可为 null（此时只显示摘要）
+         * @param summary 被引用消息的摘要；为空表示隐藏整个引用块
+         */
+        void setQuoteText(String who, String summary) {
+            if (summary == null || summary.trim().isEmpty()) {
+                label.setText("");
+                setToolTipText(null);
+                setVisible(false);
+                revalidate();
+                return;
+            }
+            String head = who == null ? "" : who.trim();
+            String plain = head.isEmpty() ? summary.trim() : head + "：" + summary.trim();
+            // 工具提示也用 HTML 包裹：Swing 的工具提示同样会把以 <html> 开头的文本按富文本解析，
+            // 一个叫 "<html>" 的昵称足以让提示框渲染错乱；转义后它只是一段普通文字。
+            setToolTipText("<html>" + HtmlEscape.oneLine(plain) + "</html>");
+            StringBuilder html = new StringBuilder("<html>");
+            if (!head.isEmpty()) {
+                html.append("<b>").append(HtmlEscape.oneLine(head)).append("</b>：");
+            }
+            html.append(HtmlEscape.oneLine(ellipsize(head, summary.trim())));
+            label.setText(html.append("</html>").toString());
+            setVisible(true);
             revalidate();
+        }
+
+        /**
+         * 按像素宽度截断摘要，超出部分用省略号代替。
+         *
+         * <p>按字符数截断在中英文混排下长短悬殊（同样 20 个字符，汉字比字母宽近一倍），
+         * 因此改为用字体度量测量真实像素宽度；发送者名字按加粗后的宽度预留，
+         * 否则粗体比常规体宽出来的那一成会把摘要挤到卡片外。</p>
+         *
+         * @param head    发送者显示名，可为空
+         * @param summary 摘要原文
+         * @return 截断后的摘要
+         */
+        private String ellipsize(String head, String summary) {
+            FontMetrics fm = label.getFontMetrics(label.getFont());
+            int budget = SUMMARY_WIDTH;
+            if (!head.isEmpty()) {
+                FontMetrics boldFm = label.getFontMetrics(label.getFont().deriveFont(Font.BOLD));
+                budget -= boldFm.stringWidth(head + "：");
+            }
+            int ellipsisWidth = fm.stringWidth(ELLIPSIS);
+            if (budget <= ellipsisWidth) {
+                return ELLIPSIS;
+            }
+            if (fm.stringWidth(summary) <= budget) {
+                return summary;
+            }
+            StringBuilder sb = new StringBuilder();
+            int width = 0;
+            for (int i = 0; i < summary.length(); i++) {
+                char c = summary.charAt(i);
+                int charWidth = fm.charWidth(c);
+                if (width + charWidth > budget - ellipsisWidth) {
+                    break;
+                }
+                sb.append(c);
+                width += charWidth;
+            }
+            // 截断点可能正好落在代理对中间，留下半个字符会渲染成方框，干脆一并去掉
+            if (sb.length() > 0 && Character.isHighSurrogate(sb.charAt(sb.length() - 1))) {
+                sb.setLength(sb.length() - 1);
+            }
+            return sb.append(ELLIPSIS).toString();
         }
     }
 }

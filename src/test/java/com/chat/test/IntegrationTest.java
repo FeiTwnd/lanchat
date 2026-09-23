@@ -11,6 +11,7 @@ import com.chat.common.MessageType;
 import com.chat.common.Result;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
+import com.chat.common.UserListCodec;
 import com.chat.dao.JdbcUserDao;
 import com.chat.server.ChatServer;
 import com.chat.service.MessageService;
@@ -177,9 +178,14 @@ public class IntegrationTest {
                 test::testExceptionCases);
         failures += test.runSafely("集成测试 8：消息撤回（本人/时限/幂等/越权/占位替换）",
                 test::testRecall);
+        failures += test.runSafely("集成测试 9：长会话稳定性（150 条不断线，D-23 验证）",
+                test::testLongSession);
+        failures += test.runSafely("集成测试 10：群聊撤回广播与资料变更回执",
+                test::testGroupRecallAndProfile);
+        int total = 10;
         System.out.println("\n========== 集成测试汇总 ==========");
-        System.out.println("用例总数: 8");
-        System.out.println("通过: " + (8 - failures));
+        System.out.println("用例总数: " + total);
+        System.out.println("通过: " + (total - failures));
         System.out.println("失败: " + failures);
         System.out.println("结论: " + (failures == 0 ? "全部通过" : "存在失败用例"));
         test.shutdown();
@@ -520,6 +526,171 @@ public class IntegrationTest {
     }
 
     /**
+     * 用例 9：长会话稳定性（缺陷 D-23 的端到端验证）。
+     *
+     * <p>反序列化过滤器的 {@code maxrefs} 是连接级累计量，而本项目每发一条消息都会
+     * {@code reset()}，重置会让类描述符重发、引用消耗翻倍。修复前该值取 1000，
+     * 据此实测"发到第 66 条就再也读不进任何消息"，服务端随后关闭连接——
+     * 使用者看到的是"聊着聊着突然掉线"，且日志把容量问题记成了安全问题。</p>
+     *
+     * <p>本用例发送 150 条（约为修复前上限的两倍），断言最后一条仍然送达且两条连接都还在：
+     * 它是这条链路唯一的自动化证据，此前只能靠人手点到第 66 条才会碰上。</p>
+     *
+     * @throws Exception 测试异常
+     */
+    private void testLongSession() throws Exception {
+        prepareEnvironment();
+        startServer();
+        ChatClient alice = connectWithBuffer("alice01");
+        ChatClient bob = connectWithBuffer("bob01");
+        waitUntil(() -> ChatServer.getInstance().getUserManager().size() == 2, 3000, "两名用户应在线上");
+
+        int total = 150;
+        for (int i = 1; i <= total; i++) {
+            TestRunner.assertTrue(alice.sendPrivateText("bob01", "第 " + i + " 条长会话测试"),
+                    "第 " + i + " 条消息应能发出（连接可能已因累计上限被判 REJECTED 而关闭）");
+        }
+        Message last = bufferOf("bob01").await(message -> message.getType() == MessageType.TEXT_PRIVATE
+                && message.getSummary().contains("第 " + total + " 条长会话测试"), 15000);
+        TestRunner.assertNotNull(last, "第 " + total + " 条消息应送达："
+                + "修复前连接会在收到第 66 条左右被判 REJECTED 后关闭");
+        TestRunner.assertTrue(alice.isConnected(), "发完 " + total + " 条后发送方连接应仍然在线");
+        TestRunner.assertTrue(bob.isConnected(), "发完 " + total + " 条后接收方连接应仍然在线");
+
+        // 反向也要通：接收方回一条，证明这条连接的两个方向都还活着
+        TestRunner.assertTrue(bob.sendPrivateText("alice01", "回你一条"), "接收方回发应成功");
+        TestRunner.assertNotNull(bufferOf("alice01").await(message ->
+                        message.getType() == MessageType.TEXT_PRIVATE
+                                && message.getSummary().contains("回你一条"), 5000),
+                "长会话之后反向消息仍应送达");
+    }
+
+    /**
+     * 用例 10：群聊撤回广播与资料变更回执。
+     *
+     * <p>本轮两处服务端改动合在一起验证：</p>
+     * <ul>
+     *   <li>群聊撤回从"只回发起者"改为"广播给除发起者外的全体在线用户"——
+     *       只回发起者的话，群里其他人会一直看着一条服务端已经不存在的消息；</li>
+     *   <li>改昵称/改头像/改密码从 {@code SYSTEM} 改为专用回执 {@code PROFILE_RESULT}——
+     *       {@code SYSTEM} 同时承载"某人上线了"这类广播，客户端无法区分二者。</li>
+     * </ul>
+     *
+     * @throws Exception 测试异常
+     */
+    private void testGroupRecallAndProfile() throws Exception {
+        prepareEnvironment();
+        startServer();
+        ChatClient alice = connectWithBuffer("alice01");
+        connectWithBuffer("bob01");
+        connectWithBuffer("carol01");
+        waitUntil(() -> ChatServer.getInstance().getUserManager().size() == 3, 3000, "三名用户应在线上");
+
+        // 1. 群聊撤回：发起者拿到 OK 回执，另外两名在线用户都应收到对端撤回通知
+        String groupId = alice.sendGroupTextReturningId("这条群聊消息稍后会被撤回", null, null);
+        TestRunner.assertNotNull(groupId, "群聊发送应返回稳定消息标识");
+        for (String user : List.of("bob01", "carol01")) {
+            TestRunner.assertNotNull(bufferOf(user).await(message ->
+                            message.getType() == MessageType.TEXT_GROUP
+                                    && message.getSummary().contains("稍后会被撤回"), 5000),
+                    user + " 应先收到群聊原文");
+        }
+        TestRunner.assertTrue(alice.requestRecall(groupId), "群聊撤回请求应能发出");
+        TestRunner.assertNotNull(bufferOf("alice01").await(message ->
+                        message.getType() == MessageType.MSG_RECALL
+                                && ("OK|" + groupId).equals(payloadOf(message)), 5000),
+                "发起者应收到撤回成功回执");
+        for (String user : List.of("bob01", "carol01")) {
+            Message notice = bufferOf(user).await(message -> message.getType() == MessageType.MSG_RECALL
+                    && ("PEER|" + groupId + "|alice01").equals(payloadOf(message)), 5000);
+            TestRunner.assertNotNull(notice, user + " 应收到群聊撤回通知（群聊撤回需广播给全体）");
+        }
+
+        // 2. 改昵称：回执类型必须是 PROFILE_RESULT，且带分区标识
+        TestRunner.assertTrue(alice.requestNicknameChange("新的昵称"), "改昵称请求应能发出");
+        Message nick = bufferOf("alice01").await(message ->
+                message.getType() == MessageType.PROFILE_RESULT, 5000);
+        TestRunner.assertNotNull(nick, "改昵称应收到 PROFILE_RESULT 回执");
+        TestRunner.assertTrue(payloadOf(nick).startsWith("1|" + Constants.PROFILE_SECTION_NICK + "|"),
+                "改昵称回执应为 1|NICK|原因，实际: " + payloadOf(nick));
+
+        // 3. 改头像：回执成功，且随后的用户列表里能取到该头像
+        String avatar = sampleAvatar();
+        TestRunner.assertTrue(alice.requestAvatarChange(avatar), "改头像请求应能发出");
+        Message avatarResult = bufferOf("alice01").await(message ->
+                message.getType() == MessageType.PROFILE_RESULT
+                        && payloadOf(message).startsWith("1|" + Constants.PROFILE_SECTION_AVATAR + "|"), 5000);
+        TestRunner.assertNotNull(avatarResult, "改头像应收到成功回执，实际: "
+                + (avatarResult == null ? "未收到" : payloadOf(avatarResult)));
+        Message list = bufferOf("bob01").await(message -> message.getType() == MessageType.USER_LIST
+                && payloadOf(message).contains(avatar), 5000);
+        TestRunner.assertNotNull(list, "改头像后用户列表应携带新头像广播给其他在线用户");
+        User refreshed = UserListCodec.decode(payloadOf(list)).stream()
+                .filter(user -> "alice01".equals(user.getUsername())).findFirst().orElse(null);
+        TestRunner.assertNotNull(refreshed, "用户列表里应包含 alice01");
+        TestRunner.assertEquals(avatar, refreshed.getAvatar(), "用户列表里的头像应与上传的一致");
+
+        // 4. 改密码：原密码错误必须失败，正确时成功——两条都要有明显不同的回执
+        TestRunner.assertTrue(alice.requestPasswordChange("wrong-password", "1234567"),
+                "改密码请求应能发出");
+        Message badPassword = bufferOf("alice01").await(message ->
+                message.getType() == MessageType.PROFILE_RESULT
+                        && payloadOf(message).startsWith("0|" + Constants.PROFILE_SECTION_PASSWORD + "|"), 5000);
+        TestRunner.assertNotNull(badPassword, "原密码错误时改密码应失败并回执原因");
+        TestRunner.assertTrue(payloadOf(badPassword).contains("原密码"),
+                "失败原因应说明原密码不正确，实际: " + payloadOf(badPassword));
+
+        TestRunner.assertTrue(alice.requestPasswordChange("123456", "1234567"), "改密码请求应能发出");
+        TestRunner.assertNotNull(bufferOf("alice01").await(message ->
+                        message.getType() == MessageType.PROFILE_RESULT
+                                && payloadOf(message).startsWith("1|" + Constants.PROFILE_SECTION_PASSWORD + "|"), 5000),
+                "原密码正确时改密码应成功");
+
+        // 5. 非法头像被服务端拒绝（客户端闸门可以绕过，服务端必须自己复核）
+        TestRunner.assertTrue(alice.requestAvatarChange("这不是一张 PNG"), "请求应能发出");
+        Message badAvatar = bufferOf("alice01").await(message ->
+                message.getType() == MessageType.PROFILE_RESULT
+                        && payloadOf(message).startsWith("0|" + Constants.PROFILE_SECTION_AVATAR + "|"), 5000);
+        TestRunner.assertNotNull(badAvatar, "非法头像应被服务端拒绝");
+
+        // 6. 清空头像：空值代表"恢复默认头像"，也必须有明确回执而不是静默失败。
+        //    注意不能再用 await——它每次都从缓冲区头部扫描，会命中第 3 步那条旧回执，
+        //    断言就变成了空转；只能数条数。
+        int avatarReplies = countIn("alice01", message ->
+                message.getType() == MessageType.PROFILE_RESULT
+                        && payloadOf(message).startsWith("1|" + Constants.PROFILE_SECTION_AVATAR + "|"));
+        TestRunner.assertTrue(alice.requestAvatarChange(""), "清空头像的请求应能发出");
+        waitUntil(() -> countIn("alice01", message ->
+                        message.getType() == MessageType.PROFILE_RESULT
+                                && payloadOf(message).startsWith("1|" + Constants.PROFILE_SECTION_AVATAR + "|"))
+                        > avatarReplies,
+                5000, "清空头像应成功（空值表示恢复默认头像）");
+
+        // 7. 清空后广播出去的列表里该用户不再带头像
+        Message cleared = bufferOf("bob01").await(message -> message.getType() == MessageType.USER_LIST
+                && UserListCodec.decode(payloadOf(message)).stream()
+                .anyMatch(user -> "alice01".equals(user.getUsername()) && user.getAvatar() == null), 5000);
+        TestRunner.assertNotNull(cleared, "清空头像后用户列表里的该用户应不再带头像");
+    }
+
+    /**
+     * 造一段结构合法的最小 PNG 数据（魔数 + IHDR），用于头像链路测试。
+     *
+     * @return Base64 文本
+     */
+    private String sampleAvatar() {
+        byte[] data = new byte[32];
+        byte[] magic = {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+        System.arraycopy(magic, 0, data, 0, magic.length);
+        data[11] = 13;
+        System.arraycopy("IHDR".getBytes(Constants.CHARSET), 0, data, 12, 4);
+        // 96×96，大端序写入
+        data[19] = (byte) Constants.AVATAR_SIDE;
+        data[23] = (byte) Constants.AVATAR_SIDE;
+        return java.util.Base64.getEncoder().encodeToString(data);
+    }
+
+    /**
      * 用例 7：异常场景。
      *
      * @throws Exception 测试异常
@@ -604,7 +775,10 @@ public class IntegrationTest {
         try {
             JdbcUserDao dao = new JdbcUserDao(TestDatabase.driver(), TestDatabase.url(),
                     TestDatabase.user(), TestDatabase.password());
-            for (String username : new String[]{"alice01", "bob01"}) {
+            // carol01 只用于"群聊撤回广播给除发起者外的全体"这一条用例：
+            // 只有两个人在线时，"广播"与"发给对端"在观感上是一样的，断言没有区分力。
+            // 它只写库、不上线，因此不会进入在线用户列表，不影响其它用例的人数断言。
+            for (String username : new String[]{"alice01", "bob01", "carol01"}) {
                 User user = new User(username, username + "的昵称");
                 user.setSalt(com.chat.util.SecurityUtil.generateSalt());
                 user.setPasswordHash(com.chat.util.SecurityUtil.hashPassword("123456", user.getSalt()));

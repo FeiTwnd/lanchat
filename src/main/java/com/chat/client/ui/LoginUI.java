@@ -37,8 +37,12 @@ import java.util.concurrent.TimeUnit;
 /**
  * 登录窗口。
  *
- * <p>职责：程序入口界面。提供服务器地址填写（或自动发现）、登录、注册、
- * 修改密码等能力，登录成功后打开 {@link ClientUI} 主窗口。</p>
+ * <p>职责：程序入口界面。提供服务器地址填写（或自动发现）、登录、注册等能力，
+ * 登录成功后打开 {@link ClientUI} 主窗口。</p>
+ *
+ * <p>本窗口<b>不</b>提供修改密码：改密要求登录态，若在此实现就必须"短暂登录—改密—立刻断开"，
+ * 期间账号会以在线的幽灵会话挂在服务端。第 4 轮改动把改密并入主窗口的
+ * {@link SettingsUI}（登录后改密不掉线），此处不再保留入口。</p>
  *
  * <p>关键设计：</p>
  * <ul>
@@ -101,12 +105,6 @@ public class LoginUI extends BaseUI implements ChatListener {
 
     /** 注册结果说明 */
     private transient volatile String registerMessage = "";
-
-    /** 改密回执等待锁 */
-    private transient volatile CountDownLatch noticeLatch;
-
-    /** 是否正在等待改密回执（用于把下一条系统通知当作回执处理） */
-    private transient volatile boolean awaitingNotice;
 
     /** 当前客户端实例 */
     private transient ChatClient client;
@@ -171,9 +169,6 @@ public class LoginUI extends BaseUI implements ChatListener {
         buttons.add(loginButton);
         buttons.add(registerButton);
         buttons.add(discoverButton);
-        SkinButton passwordButton = new SkinButton("修改密码", SkinButton.Kind.GHOST);
-        passwordButton.addActionListener(e -> changePassword());
-        buttons.add(passwordButton);
 
         loginButton.addActionListener(e -> doLogin());
         registerButton.addActionListener(e -> doRegister());
@@ -520,134 +515,9 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 修改密码：先登录校验身份，再通过 PASSWORD_CHANGE 消息请求服务器改密。
-     *
-     * <p>服务器要求登录态才能改密，因此本流程会短暂登录：改密回执到达后立刻断开连接，
-     * 否则使用者的账号会以"只改了个密码"的方式挂在在线列表里，本人却看不到任何界面。</p>
-     */
-    private void changePassword() {
-        String host = hostField.getText().trim();
-        String name = usernameField.getText().trim();
-        String oldPassword = new String(passwordField.getPassword());
-        int port;
-        try {
-            port = Integer.parseInt(portField.getText().trim());
-        } catch (NumberFormatException e) {
-            showError("端口必须是数字");
-            return;
-        }
-        if (host.isEmpty() || name.isEmpty() || oldPassword.isEmpty()) {
-            showError("请先填写服务器地址、用户名与当前密码");
-            return;
-        }
-        String newPassword = JOptionPane.showInputDialog(this, "请输入新密码（"
-                + Constants.PASSWORD_MIN_LENGTH + "-" + Constants.PASSWORD_MAX_LENGTH + " 位）:",
-                "修改密码", JOptionPane.QUESTION_MESSAGE);
-        if (newPassword == null || newPassword.isEmpty()) {
-            return;
-        }
-        setBusy(true, "正在提交密码修改请求……");
-        awaitingNotice = false;
-        resetLoginState();
-        createClient();
-
-        new SwingWorker<Boolean, Void>() {
-            /**
-             * 后台连接、登录并等待登录结果。
-             *
-             * @return 是否已登录成功
-             */
-            @Override
-            protected Boolean doInBackground() {
-                if (!client.openConnection(host, port)) {
-                    return false;
-                }
-                client.login(name, oldPassword);
-                try {
-                    CountDownLatch latch = loginLatch;
-                    return latch != null && latch.await(6, TimeUnit.SECONDS) && loginSucceeded;
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-
-            /**
-             * 登录成功则发送改密请求并等待回执。
-             *
-             * @param loggedIn 是否已登录
-             */
-            @Override
-            protected void done() {
-                boolean loggedIn = false;
-                try {
-                    loggedIn = get();
-                } catch (Exception e) {
-                    loginFailure = "连接异常: " + e.getMessage();
-                }
-                if (!loggedIn) {
-                    String reason = loginFailure.isEmpty() ? "登录失败，无法修改密码" : loginFailure;
-                    setBusy(false, reason);
-                    showError(reason);
-                    cleanupClient();
-                    return;
-                }
-                awaitingNotice = true;
-                noticeLatch = new CountDownLatch(1);
-                TextMessage message = com.chat.common.ChatMessageFactory.text(name,
-                        Constants.SYSTEM_SENDER, oldPassword + "|" + newPassword, MessageType.TEXT_PRIVATE);
-                message.setType(MessageType.PASSWORD_CHANGE);
-                client.send(message);
-                ackPasswordChange();
-            }
-        }.execute();
-    }
-
-    /**
-     * 等待改密回执（服务器的系统通知）并断开临时连接。
-     */
-    private void ackPasswordChange() {
-        new SwingWorker<Boolean, Void>() {
-            /**
-             * 后台等待回执。
-             *
-             * @return 是否收到回执
-             */
-            @Override
-            protected Boolean doInBackground() {
-                try {
-                    CountDownLatch latch = noticeLatch;
-                    return latch != null && latch.await(6, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-
-            /**
-             * 无论是否收到回执都要断开连接，避免账号被临时登录态挂住。
-             *
-             * @param received 是否收到回执
-             */
-            @Override
-            protected void done() {
-                boolean received = false;
-                try {
-                    received = get();
-                } catch (Exception e) {
-                    received = false;
-                }
-                awaitingNotice = false;
-                cleanupClient();
-                setBusy(false, received ? "密码修改已处理，请查看提示" : "未收到服务器回执，请稍后用新密码尝试登录");
-            }
-        }.execute();
-    }
-
-    /**
      * 关闭上一个客户端连接（若有）。
      *
-     * <p>登录、注册、改密都会新建连接：若不先清理旧连接，旧连接会一直保持登录态，
+     * <p>登录与注册都会新建连接：若不先清理旧连接，旧连接会一直保持登录态，
      * 新连接再登录同一账号时会被服务器判定为"已在其它位置登录"。</p>
      */
     private void closePreviousClient() {
@@ -704,7 +574,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 处理服务器消息：分别唤醒登录、注册或改密等待线程。
+     * 处理服务器消息：分别唤醒登录与注册等待线程。
      *
      * @param message 消息
      */
@@ -729,10 +599,6 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         if (message.getType() == MessageType.SYSTEM || message.getType() == MessageType.ERROR) {
-            // 改密请求的回执是一条系统通知：此时唤醒等待线程，由它负责断开临时登录态
-            if (awaitingNotice && noticeLatch != null) {
-                noticeLatch.countDown();
-            }
             onEdt(() -> {
                 statusLabel.setText(message.getSummary());
                 if (message.getType() == MessageType.ERROR) {

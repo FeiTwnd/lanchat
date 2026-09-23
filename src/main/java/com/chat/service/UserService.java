@@ -1,5 +1,6 @@
 package com.chat.service;
 
+import com.chat.common.AvatarCodec;
 import com.chat.common.Config;
 import com.chat.common.Constants;
 import com.chat.common.Result;
@@ -344,6 +345,44 @@ public class UserService {
     }
 
     /**
+     * 修改头像。
+     *
+     * <p>无需管理员审核：头像属于个人展示资料，与昵称同级，改错了自己再改回来即可。</p>
+     *
+     * <p>校验交给 {@link AvatarCodec}：只验 PNG 文件头与尺寸范围，不在服务端解码图片
+     * （原因见该类注释）。空值表示恢复默认头像，与"从未设置过"共用数据库里的 NULL
+     * 这一种存储形态，不引入第二种"空"的表示。</p>
+     *
+     * <p>刻意不截断超长输入：Base64 一旦被截断，解出来的就不是图片而是坏数据，
+     * 与其存下一段必然显示不出来的垃圾，不如明确拒绝并回执原因。</p>
+     *
+     * @param username 用户名
+     * @param base64   头像 PNG 的 Base64 文本，传 null 或空串表示恢复默认头像
+     * @return 成功时携带脱敏后的用户副本
+     */
+    public Result<User> updateAvatar(String username, String base64) {
+        String reason = AvatarCodec.check(base64);
+        if (reason != null) {
+            return Result.fail(reason);
+        }
+        try {
+            User user = userDao.findByUsername(username);
+            if (user == null) {
+                return Result.fail("用户不存在: " + username);
+            }
+            user.setAvatar(base64);
+            if (!userDao.update(user)) {
+                return Result.fail("头像修改失败");
+            }
+            boolean cleared = !user.hasAvatar();
+            LOGGER.info(() -> "用户头像已更新: " + username + (cleared ? "（已恢复默认）" : ""));
+            return Result.ok(cleared ? "已恢复默认头像" : "头像修改成功", copyForTransfer(user));
+        } catch (ChatException e) {
+            return Result.fail("头像修改失败: " + e.getMessage());
+        }
+    }
+
+    /**
      * 修改密码。
      *
      * <p>安全要求：必须校验旧密码，防止会话被劫持后直接改密码。</p>
@@ -514,6 +553,10 @@ public class UserService {
         copy.setCreateTime(user.getCreateTime());
         copy.setLastLoginTime(user.getLastLoginTime());
         copy.setOnline(user.isOnline());
+        // 头像必须一并复制：登录成功后注册进 UserManager 的是这个副本，
+        // 漏掉这一行会让在线用户列表里所有人的头像恒为 null——
+        // 表现为"头像改了、数据库里也存了，但界面上就是不变"
+        copy.setAvatar(user.getAvatar());
         return copy;
     }
 }

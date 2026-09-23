@@ -16,6 +16,7 @@ import javax.swing.ActionMap;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
+import javax.swing.Icon;
 import javax.swing.InputMap;
 import javax.swing.JButton;
 import javax.swing.JComponent;
@@ -35,6 +36,7 @@ import javax.swing.SwingUtilities;
 import javax.swing.TransferHandler;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DefaultEditorKit;
 import java.awt.BorderLayout;
@@ -71,9 +73,12 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /**
  * 聊天面板抽象基类。
@@ -178,23 +183,30 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     private static final int MENTION_MAX = 12;
 
     /** 表情面板的列数 */
-    private static final int EMOJI_COLUMNS = 6;
+    private static final int KAOMOJI_COLUMNS = 6;
 
     /** 截图临时文件所在目录名 */
     private static final String SHOT_DIR = "lanchat-shots";
 
     /**
-     * 表情面板内容。
+     * 表情面板内容：颜文字，4 行 × 6 列。
      *
-     * <p>只用 Unicode 字符，不引入任何图片素材：这样既不需要资源文件，
-     * 也不会把第三方表情包带进课程设计。渲染效果取决于系统是否安装了彩色表情字体。</p>
+     * <p>为什么不再用 Unicode 彩色 emoji：主题字体是中文正文字体（微软雅黑/苹方），
+     * 这类字体不含彩色表情字形，选中后画出来是一个方框——使用者在真机上看到的就是
+     * "选完什么都没出现"。要显示彩色 emoji 必须引入表情字体或表情图片，
+     * 前者在没装该字体的机器上依旧是方框，后者会把第三方素材带进课程设计。</p>
+     *
+     * <p>因此改为拼字形的颜文字，字符集严格限定在 <b>GB2312 符号区</b>内
+     * （ASCII、Latin-1 的 {@code ° ¬}、全角符号 {@code ＾ ￣ ＿ ／}、
+     * 几何符号 {@code ⊙ ▽ ○ ● ★ ☆}、日文假名 {@code ノ ミ ツ}）——
+     * 中文字体对这一区域的覆盖是完整的，任何一台装得动中文界面的机器都不会缺字，
+     * 也就不需要再做字体探测。</p>
      */
-    private static final String[] EMOJIS = {
-            "😀", "😄", "😁", "😆", "😅", "😂",
-            "🙂", "😉", "😊", "😍", "😘", "😜",
-            "🤔", "😐", "😴", "😢", "😭", "😡",
-            "👍", "👎", "👌", "🙏", "💪", "👏",
-            "🎉", "🔥", "⭐", "✅", "❌", "❤"};
+    private static final String[] KAOMOJI = {
+            "(^_^)", "(^-^)", "(*^_^*)", "(^o^)", "(T_T)", "(>_<)",
+            "(￣▽￣)", "(⊙_⊙)", "(⊙▽⊙)", "(°▽°)", "(¬_¬)", "(＾▽＾)",
+            "(ノ^_^)ノ", "(づ￣￣)づ", "(=^.^=)", "(・_・)", "＼(^o^)／", "(￣_￣)",
+            "Orz", "OTZ", "☆彡", "(>﹏<)", "(＾＿＾)", "(°ー°)"};
 
     /** 输入框，多行、自动换行，高度在 1 到 6 行之间自适应 */
     protected final JTextArea inputArea = new JTextArea(1, 20);
@@ -246,6 +258,54 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      */
     private final Set<String> renderedKeys = ConcurrentHashMap.newKeySet();
 
+    /**
+     * 已渲染气泡的索引：消息标识 -> 气泡。
+     *
+     * <p>撤回要按标识改一条气泡、跳转要按标识定位一条气泡，两者都必须落到"确定的那一条"上。
+     * 此前主窗口是靠"正文文本 + 是否本人发送"在组件树里找，同一会话里出现两条相同正文时
+     * 会改错行；改成按标识索引后，这个问题从根上不成立。</p>
+     *
+     * <p>只在事件分发线程访问，因此用普通 {@link LinkedHashMap} 即可，
+     * 用插入顺序也只是为了让遍历顺序与界面顺序一致，便于排查。</p>
+     */
+    private final Map<String, MessageBubble> bubbleIndex = new LinkedHashMap<>();
+
+    /**
+     * 已渲染消息的模型索引：消息标识 -> 消息模型。
+     *
+     * <p>撤回时要把气泡换成一条"撤回提示"，而提示里的"重新编辑"需要拿回原文，
+     * 原文只存在于消息模型里——气泡本身记的是渲染后的样子。
+     * 与 {@link #bubbleIndex} 同生同灭，因此两者一起登记、一起移除。</p>
+     */
+    private final Map<String, Entry> entryIndex = new LinkedHashMap<>();
+
+    /**
+     * 已撤回消息的标识集合。
+     *
+     * <p>记在这里而不是只替换组件，是因为消息列表在补拉历史（{@link #renderAll()}）时
+     * 会按 {@link #entries} 整体重建：不记这一笔，撤回过的气泡会在窗口重建后
+     * 带着原文复活——比不撤回更糟，使用者会以为撤回失败甚至内容泄露。</p>
+     *
+     * <p>集合与文本分开存：前者只回答"这条是不是撤回过"，后者是撤回后要展示的提示语
+     * （本人撤回与对方撤回的措辞不同，由发起撤回的那一端决定）。</p>
+     */
+    private final Set<String> recalledIds = ConcurrentHashMap.newKeySet();
+
+    /** 撤回提示文本：消息标识 -> 提示语 */
+    private final Map<String, String> recallTexts = new ConcurrentHashMap<>();
+
+    /** 是否存在可发送文件的接收方；由主窗口在用户列表刷新后写入 */
+    private boolean sendTargetAvailable = true;
+
+    /**
+     * 头像提供者：用户名 -> 头像图标。
+     *
+     * <p>由主窗口注入。气泡需要的头像要带在线状态点与管理员环，而这两样都是"用户列表"的
+     * 知识，面板拿不到也不应该反向依赖主窗口或用户树；把查询整体注入进来，
+     * 面板就只需要知道自己要显示谁。未注入时按无自定义头像处理，回落到默认剪影。</p>
+     */
+    private transient Function<String, Icon> avatarProvider;
+
     /** 上一条消息的时间，用于判断是否需要插入时间分隔行 */
     private LocalDateTime lastMessageTime;
 
@@ -266,6 +326,9 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
 
     /** 待发送引用的摘要 */
     private String pendingQuoteSummary;
+
+    /** 待发送引用的被引用者显示名，随引用一起发给对方 */
+    private String pendingQuoteSender;
 
     /** 输入法是否正处于候选组合中 */
     private boolean composing;
@@ -361,9 +424,9 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         fileButton.setIcon(Glyphs.file(14, Theme.TEXT));
         fileButton.setIconTextGap(6);
         fileButton.addActionListener(e -> chooseAndSendFile());
-        clearButton.addActionListener(e -> clearHistory());
-        imageButton.addActionListener(e -> sendClipboardImage());
-        emojiButton.addActionListener(e -> showEmojiPicker());
+        clearButton.addActionListener(e -> confirmClearHistory());
+        imageButton.addActionListener(e -> showImageMenu());
+        emojiButton.addActionListener(e -> showKaomojiPicker());
 
         installInputBindings();
         installCompositionWatcher();
@@ -477,19 +540,138 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      *
      * <p>文件发送入口放在聊天窗口内而不是主窗口的用户列表上：聊天窗口本来就知道
      * "我在跟谁聊"，接收方不必再由使用者选一次。</p>
+     *
+     * <p>无接收方的判断放在打开选择框<b>之前</b>：先让人翻遍文件夹挑好文件、
+     * 关掉选择框才被告知"发不出去"，是纯粹的浪费——尤其群聊里没有其他人在线时，
+     * 这个结果在点按钮的那一刻就已经确定了。</p>
      */
     protected void chooseAndSendFile() {
-        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
-        chooser.setDialogTitle("选择要发送的文件");
-        chooser.setFileSelectionMode(javax.swing.JFileChooser.FILES_ONLY);
-        if (chooser.showOpenDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) {
+        if (!hasSendTarget()) {
+            reportNoTarget();
             return;
+        }
+        File file = chooseFile("选择要发送的文件", null);
+        if (file != null) {
+            sendFileTo(file);
+        }
+    }
+
+    /**
+     * 弹出图片选择框，选中后走与普通文件相同的传输通道发送。
+     *
+     * <p>为什么图片不另开一条协议：本项目已有的文件通道已经处理了分片、确认、进度与落盘，
+     * 图片只是"内容恰好是图片的文件"。再定义一套图片消息只会让服务端多一条需要维护的路径，
+     * 而使用者的体验没有任何区别。</p>
+     *
+     * <p>过滤器按 {@link Constants#IMAGE_EXTENSIONS} 限定常见图片类型，同时保留
+     * "所有文件"选项：使用者把 {@code .webp} 之类改名成 {@code .jpg} 时，
+     * 一刀切地拦下反而更让人困惑；真正的类型判断在接收端由打开图片的程序负责。</p>
+     */
+    protected void chooseAndSendImage() {
+        if (!hasSendTarget()) {
+            reportNoTarget();
+            return;
+        }
+        java.util.List<String> extensions = new ArrayList<>();
+        for (String extension : Constants.IMAGE_EXTENSIONS) {
+            extensions.add(extension);
+        }
+        String[] names = extensions.toArray(new String[0]);
+        File file = chooseFile("选择要发送的图片",
+                new FileNameExtensionFilter("图片文件 (" + String.join("、", names) + ")", names));
+        if (file != null) {
+            sendFileTo(file);
+        }
+    }
+
+    /**
+     * 弹出文件选择框。
+     *
+     * @param title  对话框标题
+     * @param filter 文件类型过滤器；为 null 表示不限制类型
+     * @return 选中的文件；取消或未选中文件时返回 null
+     */
+    private File chooseFile(String title, FileNameExtensionFilter filter) {
+        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+        chooser.setDialogTitle(title);
+        chooser.setFileSelectionMode(javax.swing.JFileChooser.FILES_ONLY);
+        if (filter != null) {
+            chooser.setFileFilter(filter);
+        }
+        if (chooser.showOpenDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) {
+            return null;
         }
         File file = chooser.getSelectedFile();
-        if (file == null || !file.isFile()) {
-            return;
-        }
-        sendFileTo(file);
+        return file != null && file.isFile() ? file : null;
+    }
+
+    /**
+     * 弹出"图片"按钮的二选一菜单。
+     *
+     * <p>本轮把"从文件夹选择图片"补成图片发送的主入口，但剪贴板入口必须保留：
+     * 截图之后直接粘贴是更快的做法，砍掉它等于用一个新功能换掉一个旧功能。</p>
+     */
+    protected void showImageMenu() {
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem fromFile = new JMenuItem("从文件选择…");
+        fromFile.addActionListener(e -> chooseAndSendImage());
+        JMenuItem fromClipboard = new JMenuItem("从剪贴板粘贴");
+        fromClipboard.addActionListener(e -> sendClipboardImage());
+        menu.add(fromFile);
+        menu.add(fromClipboard);
+        menu.show(imageButton, 0, imageButton.getHeight());
+    }
+
+    /**
+     * 当前会话是否存在可发送文件的接收方。
+     *
+     * <p>默认取主窗口在用户列表刷新时写入的状态；群聊面板覆写为按在线名单实时判断。</p>
+     *
+     * @return 有接收方返回 true
+     */
+    protected boolean hasSendTarget() {
+        return sendTargetAvailable;
+    }
+
+    /**
+     * 无接收方时的原因描述。
+     *
+     * @return 中文原因
+     */
+    protected String noTargetReason() {
+        return "当前没有其他在线用户，无法发送文件";
+    }
+
+    /**
+     * 记录本次用户列表刷新后是否存在接收方。
+     *
+     * <p>状态只用于"点下去时的预检"与鼠标悬停提示，<b>不再置灰按钮</b>。
+     * 置灰看起来是更体贴的提示，实际效果恰恰相反：灰按钮点下去不会有任何反馈，
+     * 使用者只能得出"这个按钮坏了"或者"点了没反应"的结论——而真实原因
+     * （对端离线 / 群里没有别人）本来一句话就能说清。保持可点，点下去由
+     * {@link #reportNoTarget()} 把原因讲出来，是更好的交代。</p>
+     *
+     * @param available 是否存在接收方
+     */
+    public void setSendTargetAvailable(boolean available) {
+        this.sendTargetAvailable = available;
+        String tip = available ? null : noTargetReason();
+        fileButton.setToolTipText(tip);
+        imageButton.setToolTipText(tip);
+    }
+
+    /**
+     * 报告"当前发不了文件"，并说明原因。
+     *
+     * <p>两条路同时给：聊天区留一行红字，另外弹一个提示框。只写聊天区是不够的——
+     * 使用者点了按钮，目光还在按钮附近，聊天区即使已经自动滚到底也未必被注意到；
+     * 只弹框也不行，聊天区里留不下这次操作失败的痕迹，翻记录时无从追溯。</p>
+     */
+    protected void reportNoTarget() {
+        String reason = noTargetReason();
+        appendLine("[系统] " + reason, COLOR_ERROR);
+        javax.swing.JOptionPane.showMessageDialog(this, reason, "无法发送",
+                javax.swing.JOptionPane.WARNING_MESSAGE);
     }
 
     /**
@@ -599,6 +781,22 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
          * @param messageId 稳定消息标识
          */
         void recall(String messageId);
+
+        /**
+         * 通知"界面上渲染出了一条带标识的消息"。
+         *
+         * <p>撤回的时限判断要读发送时刻，而发送时刻只有主窗口记录得到：
+         * 面板渲染历史补拉的气泡时并不知道这条消息是什么时候真正发出的，
+         * 它手上只有服务端给的发送时间。默认实现什么都不做，因此既有的两个方法
+         * 实现类（只关心能不能撤、撤哪一条）不需要改动。</p>
+         *
+         * @param messageId 稳定消息标识
+         * @param content   消息正文，供撤回候选列表指认"是哪一条"
+         * @param mine      是否本人发送
+         * @param time      消息时间；为 null 表示没有可用时刻
+         */
+        default void remember(String messageId, String content, boolean mine, LocalDateTime time) {
+        }
     }
 
     /**
@@ -620,11 +818,30 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     }
 
     /**
+     * 获取待发送引用的被引用者显示名。
+     *
+     * @return 被引用者显示名，没有引用时为 null
+     */
+    protected String getPendingQuoteSender() {
+        return pendingQuoteSender;
+    }
+
+    /**
+     * 注入头像提供者。
+     *
+     * @param provider 用户名 -> 头像图标；传 null 表示回落到默认头像
+     */
+    public void setAvatarProvider(Function<String, Icon> provider) {
+        this.avatarProvider = provider;
+    }
+
+    /**
      * 取消当前引用。
      */
     protected void clearPendingQuote() {
         pendingQuoteId = null;
         pendingQuoteSummary = null;
+        pendingQuoteSender = null;
         quoteLabel.setText("");
         quoteBar.setVisible(false);
         revalidate();
@@ -667,7 +884,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             return;
         }
         Entry entry = new Entry(null, text, false, true, null,
-                color == null ? COLOR_SYSTEM : color, null, null, false);
+                color == null ? COLOR_SYSTEM : color, null, null, null, false, null);
         runOnEdt(() -> {
             boolean stick = isAtBottom();
             entries.add(entry);
@@ -707,11 +924,68 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * @param messageId 稳定消息标识，没有时传 null
      */
     public void appendMessage(String prefix, String content, Color color, String messageId) {
-        String text = content == null ? "" : content;
-        appendEntry(new Entry(prefix, text, COLOR_SELF.equals(color),
+        appendMessage(prefix, content, color, messageId, null);
+    }
+
+    /**
+     * 向聊天记录追加一条带引用的消息气泡。
+     *
+     * <p>本地回显必须走这个重载：引用块与正文一样属于"这一条消息长什么样"，
+     * 少了它，发送方自己看不到自己发出的引用——对方却看得见，正是反馈里
+     * "引用过后发送出去没有任何不同"的直接原因。</p>
+     *
+     * @param prefix       前缀（发送者或提示）
+     * @param content      正文
+     * @param color        来源颜色
+     * @param messageId    稳定消息标识，没有时传 null
+     * @param quoteSummary 被引用消息摘要，没有引用时传 null
+     */
+    public void appendMessage(String prefix, String content, Color color, String messageId,
+                              String quoteSummary) {
+        appendMessage(prefix, content, color, messageId, quoteSummary, null);
+    }
+
+    /**
+     * 向聊天记录追加一条消息气泡，并显式指定头像归属者。
+     *
+     * <p>大多数情况下"气泡该显示谁的头像"可以由前缀推出来（本人看用户名、他人看发送者），
+     * 唯一推不出来的是离线补投：那里的前缀带着"（离线消息）"后缀，按前缀查头像必然查不到。
+     * 因此把归属者单独作为一个可空参数，只有这类特例才需要传。</p>
+     *
+     * @param prefix       前缀（发送者或提示）
+     * @param content      正文
+     * @param color        来源颜色
+     * @param messageId    稳定消息标识，没有时传 null
+     * @param quoteSummary 被引用消息摘要，没有引用时传 null
+     * @param avatarUser   头像归属者用户名；为 null 时按前缀推断
+     */
+    public void appendMessage(String prefix, String content, Color color, String messageId,
+                              String quoteSummary, String avatarUser) {
+        appendMessage(prefix, content, color, messageId, quoteSummary, null, avatarUser);
+    }
+
+    /**
+     * 向聊天记录追加一条消息气泡，并显式给出被引用者与头像归属者。
+     *
+     * <p>本地回显自己的引用消息时必须走这个重载：被引用者不在正文里，
+     * 只有发送方手上有一份（他刚在右键菜单里选中的那一条），不显式传进来，
+     * 自己看到的就是一个没有作者的引用块，而对方看到的却有作者。</p>
+     *
+     * @param prefix       前缀（发送者或提示）
+     * @param content      正文
+     * @param color        来源颜色
+     * @param messageId    稳定消息标识，没有时传 null
+     * @param quoteSummary 被引用消息摘要，没有引用时传 null
+     * @param quoteSender  被引用消息的发送者显示名，可为 null
+     * @param avatarUser   头像归属者用户名；为 null 时按前缀推断
+     */
+    public void appendMessage(String prefix, String content, Color color, String messageId,
+                              String quoteSummary, String quoteSender, String avatarUser) {
+        appendEntry(new Entry(prefix, content == null ? "" : content, COLOR_SELF.equals(color),
                 COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color),
                 LocalDateTime.now(), color,
-                messageId == null || messageId.isEmpty() ? null : messageId, null, false));
+                messageId == null || messageId.isEmpty() ? null : messageId,
+                quoteSummary, quoteSender, false, avatarUser));
     }
 
     /**
@@ -748,7 +1022,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             return;
         }
         Entry entry = new Entry(null, text, false, true, null,
-                color == null ? COLOR_SYSTEM : color, null, null, false);
+                color == null ? COLOR_SYSTEM : color, null, null, null, false, null);
         entries.add(0, entry);
         renderAll();
     }
@@ -773,7 +1047,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
                 continue;
             }
             prepared.add(new Entry(item.who(), item.content(), item.self(), false,
-                    item.time(), COLOR_OTHER, null, null, false));
+                    item.time(), COLOR_OTHER, item.messageId(), null, null, false, null));
         }
         if (prepared.isEmpty()) {
             return 0;
@@ -785,18 +1059,130 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     }
 
     /**
+     * 询问之后清空聊天记录显示区。
+     *
+     * <p>"清空"是一个按下就无法撤销的动作：面板里的内容只存在于内存，
+     * 清掉以后没有任何入口能把它们原样找回来。这种动作必须先问一句——
+     * 按钮就在发送键旁边，误触一次，整段对话当场消失。</p>
+     *
+     * <p>询问文案里点明"只清本窗口、服务器上的记录不受影响"，
+     * 是为了让人在犹豫时有个准确的判断依据，而不是靠猜。</p>
+     */
+    protected void confirmClearHistory() {
+        if (askConfirm("确定要清空当前聊天窗口的记录吗？\n\n"
+                + "只清空本窗口显示的内容，服务器上保存的历史记录不受影响。")) {
+            clearHistory();
+        }
+    }
+
+    /**
      * 清空聊天记录显示区，并恢复空状态占位。
      */
     public void clearHistory() {
         renderedKeys.clear();
         runOnEdt(() -> {
             entries.clear();
+            bubbleIndex.clear();
+            entryIndex.clear();
+            recalledIds.clear();
+            recallTexts.clear();
             lastMessageTime = null;
             messageList.removeAll();
             messageList.revalidate();
             messageList.repaint();
             updateEmptyState();
         });
+    }
+
+    /**
+     * 按消息标识就地替换一条气泡的正文，用于撤回。
+     *
+     * <p>替换成功后该标识从索引里移除：撤回不可重复，留在索引里只会让下一次
+     * 按标识定位又落到这条已经变成占位文案的气泡上。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @param newText   替换后的正文
+     * @return 找到并替换返回 true；该标识不在本面板中时返回 false
+     */
+    public boolean replaceMessage(String messageId, String newText) {
+        MessageBubble bubble = messageId == null ? null : bubbleIndex.remove(messageId);
+        if (bubble == null) {
+            return false;
+        }
+        Entry entry = entryIndex.remove(messageId);
+        recalledIds.add(messageId);
+        recallTexts.put(messageId, newText == null ? "" : newText);
+        runOnEdt(() -> swapWithNotice(bubble, entry, messageId));
+        return true;
+    }
+
+    /**
+     * 就地把一条气泡换成撤回提示行。
+     *
+     * <p>替换而不是"移除再追加"：撤回的提示必须留在原来那条消息的位置上，
+     * 追加到末尾会让它看起来像一条刚刚发生的新事件，与时间线对不上。</p>
+     *
+     * @param bubble    待替换的气泡
+     * @param entry     对应的消息模型，可为 null
+     * @param messageId 消息标识
+     */
+    private void swapWithNotice(MessageBubble bubble, Entry entry, String messageId) {
+        int index = messageList.getComponentZOrder(bubble);
+        if (index < 0) {
+            // 组件已经不在列表里（例如期间被清空过），退回到"改文字"这条老路上，
+            // 至少让使用者看到撤回的结果，而不是点了撤回却毫无变化
+            bubble.markRecalled(recallTexts.get(messageId));
+            return;
+        }
+        JComponent notice = buildRecallNotice(entry, recallTexts.get(messageId));
+        notice.setAlignmentX(Component.LEFT_ALIGNMENT);
+        messageList.remove(index);
+        messageList.add(notice, index);
+        messageList.revalidate();
+        messageList.repaint();
+    }
+
+    /**
+     * 直接追加一行撤回提示。
+     *
+     * <p>给"找不到目标气泡"的降级路径使用：会话窗口是后开的、或者那条消息已经不在
+     * 面板内存里时，至少把撤回这件事显示出来。与气泡替换的区别只是没有原位信息，
+     * 因此落在末尾。</p>
+     *
+     * @param text 提示文本
+     */
+    public void appendRecallNotice(String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        Entry entry = new Entry(null, text, false, true, null, COLOR_SYSTEM,
+                null, null, null, false, null);
+        runOnEdt(() -> {
+            boolean stick = isAtBottom();
+            entries.add(entry);
+            addRow(entry);
+            updateEmptyState();
+            scrollToBottomIf(stick);
+        });
+    }
+
+    /**
+     * 定位到某条消息并把视线引过去。
+     *
+     * <p>供"搜索/查询结果双击跳转"使用：滚动到该行并让其短暂闪烁，
+     * 否则跳转后使用者面对满屏气泡根本不知道刚才是哪一条。</p>
+     *
+     * @param messageId 稳定消息标识
+     * @return 定位成功返回 true；该消息不在本面板中时返回 false
+     */
+    public boolean locateMessage(String messageId) {
+        MessageBubble bubble = messageId == null ? null : bubbleIndex.get(messageId);
+        if (bubble == null) {
+            return false;
+        }
+        bubble.scrollRectToVisible(new Rectangle(0, 0, bubble.getWidth(), bubble.getHeight()));
+        bubble.flashHighlight();
+        return true;
     }
 
     /**
@@ -825,13 +1211,16 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /**
      * 设置待发送的引用并显示引用条。
      *
-     * @param messageId 被引用消息的稳定标识
-     * @param content   被引用消息的正文
+     * @param messageId   被引用消息的稳定标识
+     * @param quoteSender 被引用消息的发送者显示名，可为 null
+     * @param content     被引用消息的正文
      */
-    private void setPendingQuote(String messageId, String content) {
+    private void setPendingQuote(String messageId, String quoteSender, String content) {
         pendingQuoteId = messageId;
+        pendingQuoteSender = quoteSender;
         pendingQuoteSummary = abbreviate(content);
-        quoteLabel.setText("引用：" + pendingQuoteSummary);
+        quoteLabel.setText((quoteSender == null || quoteSender.isEmpty()
+                ? "引用：" : "引用 " + quoteSender + "：") + pendingQuoteSummary);
         quoteBar.setVisible(true);
         inputArea.requestFocusInWindow();
         revalidate();
@@ -853,7 +1242,9 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * 构建消息右键菜单。
      *
      * <p>两项都要求消息带稳定标识：引用需要它来指代被引用的那一条，撤回需要它来向服务端
-     * 指明撤哪一条，而历史记录响应里不带该标识，因此历史消息没有右键菜单。</p>
+     * 指明撤哪一条。服务端的历史与搜索响应自本轮起也带上标识（行格式末列之前的
+     * {@code messageId} 字段），因此补拉出来的历史消息同样有右键菜单；
+     * 只有升级前写入的老记录没有标识，那些行依旧不出现菜单。</p>
      *
      * <p>"撤回"只在本人发出的消息上出现，且是否真的可撤回交给 {@link RecallHandler} 裁决：
      * 时限与发送时刻只有掌握发送状态的主窗口知道，面板不重复记一份，避免两处判断互相矛盾。</p>
@@ -869,7 +1260,10 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         JPopupMenu menu = new JPopupMenu();
         if (isQuoteSupported()) {
             JMenuItem quote = new JMenuItem("引用");
-            quote.addActionListener(e -> setPendingQuote(messageId, entry.content()));
+            // 本人消息的显示名是"我"，直接发出去对方会看到"我："——指的是发送方自己，
+            // 于是这里改传用户名：跨端交流的内容不该带本机视角的称呼
+            quote.addActionListener(e -> setPendingQuote(messageId,
+                    entry.self() ? client.getUsername() : entry.prefix(), entry.content()));
             menu.add(quote);
         }
         if (entry.self() && recallHandler != null) {
@@ -939,6 +1333,12 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * 服务端与接收端都不需要为图片做任何额外适配。</p>
      */
     protected void sendClipboardImage() {
+        // 预检与另外两个入口一致：剪贴板里有没有图片、接收方在不在，
+        // 是两件互不相干的事，不能因为"这次是从剪贴板来的"就少查一样
+        if (!hasSendTarget()) {
+            reportNoTarget();
+            return;
+        }
         try {
             Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
             Transferable contents = clipboard.getContents(null);
@@ -995,21 +1395,26 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
 
     /**
      * 弹出表情面板，选中后插入到输入区光标处。
+     *
+     * <p>按钮不设固定尺寸，交给 {@link GridLayout} 按最宽的那一条统一分配：
+     * 颜文字的字符数在 4 到 9 之间不等，写死尺寸必然让长的那几条被裁成省略号，
+     * 而"看着像乱码的表情"正是这一轮要修掉的问题。</p>
      */
-    protected void showEmojiPicker() {
+    protected void showKaomojiPicker() {
         JPopupMenu menu = new JPopupMenu();
-        JPanel grid = new JPanel(new GridLayout(0, EMOJI_COLUMNS, 2, 2));
+        JPanel grid = new JPanel(new GridLayout(0, KAOMOJI_COLUMNS, 2, 2));
         grid.setBackground(Theme.CARD);
         grid.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-        for (String emoji : EMOJIS) {
-            JButton button = new JButton(emoji);
-            button.setFont(emojiFont());
-            button.setPreferredSize(new Dimension(36, 32));
+        for (String kaomoji : KAOMOJI) {
+            JButton button = new JButton(kaomoji);
+            // 用正文字体而不是表情字体：颜文字的每个字符都在中文字体的覆盖范围内，
+            // 且与气泡正文同源，不会出现"面板里能看、发出去变方框"的落差
+            button.setFont(Theme.font(13, Font.PLAIN));
+            button.setMargin(new Insets(2, 4, 2, 4));
             button.setFocusable(false);
-            button.setBorder(BorderFactory.createEmptyBorder());
             button.setContentAreaFilled(false);
             button.addActionListener(e -> {
-                insertEmoji(emoji);
+                insertKaomoji(kaomoji);
                 menu.setVisible(false);
                 inputArea.requestFocusInWindow();
             });
@@ -1022,42 +1427,15 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     }
 
     /**
-     * 选择能显示表情的字体。
+     * 把颜文字插入到输入区光标处。
      *
-     * <p>主题字体是中文正文用字，通常不含彩色表情字形；直接用它画表情只会得到方框。
-     * 这里按平台常见表情字体依次探测，都不可用时退回主题字体：此时表情字符仍能被插入并随消息发出，
-     * 只是本机显示为缺字方框，接收端装了表情字体就能正常显示。</p>
-     *
-     * @return 表情字体
+     * @param kaomoji 颜文字
      */
-    private static Font emojiFont() {
-        String[] candidates = {"Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
-                "Noto Emoji", "Symbola", "Segoe UI Symbol"};
-        try {
-            java.util.Set<String> available = new java.util.HashSet<>(java.util.Arrays.asList(
-                    java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
-                            .getAvailableFontFamilyNames()));
-            for (String candidate : candidates) {
-                if (available.contains(candidate)) {
-                    return new Font(candidate, Font.PLAIN, 18);
-                }
-            }
-        } catch (RuntimeException e) {
-            System.err.println("表情字体探测失败: " + e.getMessage());
-        }
-        return Theme.font(18, Font.PLAIN);
-    }
-
-    /**
-     * 把表情插入到输入区光标处。
-     *
-     * @param emoji 表情字符
-     */
-    protected void insertEmoji(String emoji) {
-        if (emoji == null || emoji.isEmpty()) {
+    protected void insertKaomoji(String kaomoji) {
+        if (kaomoji == null || kaomoji.isEmpty()) {
             return;
         }
-        inputArea.replaceSelection(emoji);
+        inputArea.replaceSelection(kaomoji);
     }
 
     /**
@@ -1322,9 +1700,11 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         String text = content == null ? "" : content;
         String messageId = message == null ? null : message.getMessageId();
         String quote = message instanceof TextMessage ? ((TextMessage) message).getQuoteSummary() : null;
+        String quoteSender = message instanceof TextMessage
+                ? ((TextMessage) message).getQuoteSender() : null;
         appendEntry(new Entry(prefix, text, COLOR_SELF.equals(color),
                 COLOR_SYSTEM.equals(color) || COLOR_ERROR.equals(color),
-                LocalDateTime.now(), color, messageId, quote, mention));
+                LocalDateTime.now(), color, messageId, quote, quoteSender, mention, null));
     }
 
     /**
@@ -1351,6 +1731,8 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      */
     private void renderAll() {
         messageList.removeAll();
+        bubbleIndex.clear();
+        entryIndex.clear();
         lastMessageTime = null;
         for (Entry entry : entries) {
             addRow(entry);
@@ -1373,16 +1755,23 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         if (!entry.system()) {
             lastMessageTime = entry.time();
         }
+        if (isRecalled(entry)) {
+            // 撤回过的消息不再是气泡：按 QQ 的样式换成一行居中的"××撤回了一条消息"。
+            // 走这条分支而不是"画个气泡再改文字"，是因为气泡的底色、对齐、头像都在
+            // 表达"这是一条正常消息"，只换文字的话整条消息看上去仍然是发出去的样子
+            addRowComponent(buildRecallNotice(entry, recallTexts.get(entry.messageId())));
+            return;
+        }
         MessageBubble bubble;
         if (entry.system()) {
             bubble = MessageBubble.system(entry.content(), entry.color());
         } else if (entry.self()) {
-            bubble = MessageBubble.self(entry.content(), entry.time());
+            bubble = MessageBubble.self(entry.content(), entry.time(), avatarOf(entry));
         } else {
-            bubble = MessageBubble.other(entry.prefix(), entry.content(), entry.time());
+            bubble = MessageBubble.other(entry.prefix(), entry.content(), entry.time(), avatarOf(entry));
         }
         if (entry.quoteSummary() != null && !entry.quoteSummary().isEmpty()) {
-            bubble.setQuoteText(entry.quoteSummary());
+            bubble.setQuoteText(entry.quoteSender(), entry.quoteSummary());
         }
         if (entry.highlight()) {
             bubble.setHighlighted(true);
@@ -1394,6 +1783,122 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
         bubble.setAvailableWidth(messageList.getWidth() > 0
                 ? messageList.getWidth() : FALLBACK_LIST_WIDTH);
         addRowComponent(bubble);
+        rememberBubble(entry, bubble);
+    }
+
+    /**
+     * 登记气泡索引，并告知撤回策略"界面上多了一条带标识的消息"。
+     *
+     * <p>两条来源缺一不可：实时消息的标识在 {@code onMessageState(SENDING)} 阶段被登记过，
+     * 但历史补拉出来的气泡没有经过那一步；反过来，历史补拉的气泡是走本方法渲染的。
+     * 只依赖前一条路径，正是"撤回时而可用时而消失"的根因之一——
+     * 关掉窗口再打开，历史里的本人消息右键就没有撤回项了。</p>
+     *
+     * @param entry  消息模型
+     * @param bubble 渲染出的气泡
+     */
+    private void rememberBubble(Entry entry, MessageBubble bubble) {
+        String messageId = entry.messageId();
+        if (messageId == null || messageId.isEmpty()) {
+            return;
+        }
+        bubbleIndex.put(messageId, bubble);
+        entryIndex.put(messageId, entry);
+        if (recallHandler != null) {
+            recallHandler.remember(messageId, entry.content(), entry.self(), entry.time());
+        }
+    }
+
+    /**
+     * 判断某条消息模型是否已被撤回。
+     *
+     * @param entry 消息模型
+     * @return 已撤回返回 true
+     */
+    private boolean isRecalled(Entry entry) {
+        String messageId = entry.messageId();
+        return messageId != null && !messageId.isEmpty() && recalledIds.contains(messageId);
+    }
+
+    /**
+     * 构建一行撤回提示。
+     *
+     * <p>样式对齐主流即时通讯软件：居中的浅灰小字，后面跟一个"重新编辑"。
+     * 只在本人撤回时给出"重新编辑"——把对方撤回的内容重新编辑再发一遍毫无意义，
+     * 而且原文对对方而言已经是"不该再出现"的东西。</p>
+     *
+     * @param entry 被撤回消息的模型，可为 null（拿不到时按对方撤回处理）
+     * @param text  提示语，可为 null
+     * @return 提示行组件
+     */
+    private JComponent buildRecallNotice(Entry entry, String text) {
+        boolean mine = entry != null && entry.self();
+        String notice = text == null || text.isEmpty()
+                ? (mine ? "你撤回了一条消息" : "对方撤回了一条消息") : text;
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.CENTER, 6, 2));
+        row.setOpaque(false);
+        JLabel message = new JLabel(notice);
+        message.setFont(Theme.fontSmall());
+        message.setForeground(Theme.TEXT_WEAK);
+        row.add(message);
+        if (mine && entry != null && entry.content() != null && !entry.content().isEmpty()) {
+            row.add(buildReeditLink(entry.content()));
+        }
+        return row;
+    }
+
+    /**
+     * 构建"重新编辑"链接。
+     *
+     * <p>点击后把原文放回输入框并聚焦：这是撤回之后最常见的一步——发现写错了字、
+     * 想说给错的人，撤回之后紧接着就是改一改再发。原文只从界面内存里取，
+     * 服务端已经不再回传已撤回消息的正文。</p>
+     *
+     * @param original 原文
+     * @return 链接标签
+     */
+    private JLabel buildReeditLink(String original) {
+        JLabel link = new JLabel("重新编辑");
+        link.setFont(Theme.fontSmall());
+        link.setForeground(Theme.PRIMARY);
+        link.setCursor(java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR));
+        link.setToolTipText("把这条消息的原文放回输入框");
+        link.addMouseListener(new java.awt.event.MouseAdapter() {
+
+            /**
+             * 点击后回填输入框。
+             *
+             * @param event 鼠标事件
+             */
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent event) {
+                inputArea.setText(original);
+                inputArea.setCaretPosition(inputArea.getDocument().getLength());
+                inputArea.requestFocusInWindow();
+            }
+        });
+        return link;
+    }
+
+    /**
+     * 解析一条消息该显示谁的头像。
+     *
+     * <p>归属规则：气泡里的"昵称"在本项目里从来就是用户名（私聊传对端、群聊传发送者），
+     * 本人的消息则用当前登录用户名；唯一推不出来的是离线补投，那里的前缀带
+     * "（离线消息）"后缀，因此由调用方通过 {@link Entry#avatarUser()} 显式指定。</p>
+     *
+     * @param entry 消息模型
+     * @return 头像图标；无法确定归属或未注入提供者时返回 null（由气泡回落到默认头像）
+     */
+    private Icon avatarOf(Entry entry) {
+        if (avatarProvider == null) {
+            return null;
+        }
+        String username = entry.avatarUser();
+        if (username == null || username.isEmpty()) {
+            username = entry.self() ? client.getUsername() : entry.prefix();
+        }
+        return username == null || username.isEmpty() ? null : avatarProvider.apply(username);
     }
 
     /**
@@ -1528,12 +2033,14 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /**
      * 补拉历史记录时的单条数据。
      *
-     * @param who     发送者显示名
-     * @param content 正文
-     * @param self    是否本人发送
-     * @param time    消息时间
+     * @param who       发送者显示名
+     * @param content   正文
+     * @param self      是否本人发送
+     * @param time      消息时间
+     * @param messageId 跨端稳定消息标识；服务端在新版行格式里给出，旧版服务端或升级前的老记录为 null
      */
-    protected record HistoryEntry(String who, String content, boolean self, LocalDateTime time) {
+    protected record HistoryEntry(String who, String content, boolean self, LocalDateTime time,
+                                  String messageId) {
     }
 
     /**
@@ -1545,13 +2052,16 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * @param system       是否系统提示
      * @param time         消息时间，系统提示为 null
      * @param color        系统提示文字颜色
-     * @param messageId    跨端稳定消息标识，仅实时收到的消息有，用于引用
+     * @param messageId    跨端稳定消息标识，仅实时收到的消息有，用于引用与撤回
      * @param quoteSummary 被引用消息摘要，无引用时为 null
+     * @param quoteSender  被引用消息的发送者显示名；本地回显自己发的引用时为空
      * @param highlight    是否高亮（被 @ 提及）
+     * @param avatarUser   头像归属者用户名；为 null 时按前两者推断
      */
     private record Entry(String prefix, String content, boolean self, boolean system,
                          LocalDateTime time, Color color, String messageId,
-                         String quoteSummary, boolean highlight) {
+                         String quoteSummary, String quoteSender, boolean highlight,
+                         String avatarUser) {
     }
 
     /**

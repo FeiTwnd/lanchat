@@ -66,6 +66,20 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
+     * 群聊里"能发文件"等价于"除自己外还有人在线"。
+     *
+     * <p>覆写为按在线名单实时判断而不是用主窗口写入的状态：群聊的接收方集合会随着
+     * 任何人上下线而变，名单是唯一权威来源，而状态是主窗口刷新的快照。
+     * 两者本来同源，实时判断只是让"点下去的那一刻"与判断结果一致。</p>
+     *
+     * @return 有其他在线用户返回 true
+     */
+    @Override
+    protected boolean hasSendTarget() {
+        return onlineUsers.get().stream().anyMatch(name -> !name.equals(client.getUsername()));
+    }
+
+    /**
      * 群发文件：向当前在线且不是自己的每个用户各发起一次独立的文件传输。
      *
      * <p>本项目没有"群"实体，群聊本身就是全员广播，因此群文件的语义就是逐个发给每个在线用户：
@@ -78,8 +92,10 @@ public class GroupChatPanel extends BaseChatPanel {
         List<String> targets = onlineUsers.get().stream()
                 .filter(name -> !name.equals(client.getUsername()))
                 .toList();
+        // 兜底：打开选择框前的预检已经拦过一次，但文件也可以从主窗口直接拖进来，
+        // 那条路径不经过任何按钮，这里是它唯一的判断点
         if (targets.isEmpty()) {
-            appendLine("[系统] 当前没有其他在线用户，无法发送文件", COLOR_ERROR);
+            appendLine("[系统] " + noTargetReason(), COLOR_ERROR);
             return;
         }
         if (!askConfirm("将把文件 " + file.getName() + " 发送给当前在线的 "
@@ -144,9 +160,13 @@ public class GroupChatPanel extends BaseChatPanel {
             appendLine("[系统] 消息过长，最多 " + Constants.MESSAGE_MAX_LENGTH + " 个字符", COLOR_ERROR);
             return false;
         }
-        String messageId = client.sendGroupTextReturningId(content, quoteId, quoteSummary);
+        String quoteSender = getPendingQuoteSender();
+        String messageId = client.sendGroupTextReturningId(content, quoteId, quoteSummary, quoteSender);
         if (messageId != null) {
-            appendMessage("我", content, COLOR_SELF, messageId);
+            // 本地回显同样要带上引用块与头像归属：引用是自己写这条消息时的上下文，
+            // 发送方看不到它，就会以为引用压根没有发出去
+            appendMessage("我", content, COLOR_SELF, messageId, quoteSummary, quoteSender,
+                    client.getUsername());
         } else {
             appendLine("[系统] 消息发送失败，请检查网络连接", COLOR_ERROR);
         }

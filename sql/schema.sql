@@ -40,6 +40,7 @@ CREATE TABLE chat_user
     role            VARCHAR(16)  NOT NULL DEFAULT 'USER' COMMENT '角色：ADMIN 管理员 / USER 普通用户',
     create_time     DATETIME     NULL COMMENT '注册时间',
     last_login_time DATETIME     NULL COMMENT '最近一次登录时间',
+    avatar          MEDIUMTEXT   NULL COMMENT '自定义头像：PNG 图片的 Base64 文本（约 6-16KB）；NULL 或空串表示未设置，界面显示默认头像',
     PRIMARY KEY (username),
     KEY idx_chat_user_nickname (nickname),
     KEY idx_chat_user_role (role)
@@ -97,6 +98,9 @@ CREATE TABLE chat_message
 -- 建议先备份（mysqldump -u root -p lanchat > backup.sql）再执行。
 -- ---------------------------------------------------------------------------
 -- ALTER TABLE chat_user MODIFY COLUMN password_hash VARCHAR(128) NOT NULL;
+-- 头像列：程序启动时会自行补建（见 JdbcUserDao#ensureAvatarColumn），
+-- 因此手工升级不是必须的，重复执行会报 1060 Duplicate column 属正常现象
+-- ALTER TABLE chat_user ADD COLUMN avatar MEDIUMTEXT NULL COMMENT '自定义头像：PNG 图片的 Base64 文本（约 6-16KB）；NULL 或空串表示未设置，界面显示默认头像';
 -- ALTER TABLE chat_message
 --     ADD COLUMN message_id VARCHAR(36)  NULL,
 --     ADD COLUMN delivered  TINYINT      NOT NULL DEFAULT 0,

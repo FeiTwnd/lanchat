@@ -102,6 +102,16 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     private static final String HISTORY_CURSOR_PREFIX = "#beforeId=";
 
     /**
+     * 历史 / 搜索响应头部携带的行格式版本标记。
+     *
+     * <p>{@code v2} 指记录行为 {@code 时间|发送者|接收者|消息标识|内容} 五段。
+     * 之所以把版本写在头部而不是让客户端"数段数"猜：正文本身可以含竖线，
+     * 升级前的老记录也不带标识（该字段为空），两种情况下"段数"都不可靠，
+     * 显式标记才能让客户端确定地按新老格式分别解析。</p>
+     */
+    private static final String HISTORY_ROW_VERSION = "v2";
+
+    /**
      * 本连接已下发、等待客户端确认的离线消息标识。
      *
      * <p>只有确实由本连接补投出去的消息才允许被标记为已送达：否则任何登录用户都能拿别人的
@@ -443,8 +453,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             rejectFileMessage(fileMessage, "文件传输编号非法：不能为空且长度不超过 " + MAX_TRANSFER_ID_LENGTH);
             return;
         }
-        if (!isValidPeer(receiver)) {
-            rejectFileMessage(fileMessage, "文件消息接收者非法：格式不正确或指向本人");
+        if (!isValidFilePeer(receiver)) {
+            rejectFileMessage(fileMessage, "文件消息接收者非法：用户名格式不正确");
             return;
         }
         switch (fileMessage.getType()) {
@@ -490,6 +500,22 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      */
     private boolean isValidPeer(String peer) {
         return peer != null && !peer.equals(username) && USERNAME_PATTERN.matcher(peer).matches();
+    }
+
+    /**
+     * 校验用户名是否为可用的文件接收方（允许指向本人）。
+     *
+     * <p>与 {@link #isValidPeer(String)} 的唯一区别是不排除本人：给自己发文件是一个明确
+     * 允许的用法（把手机传来的图存进 data/received 留档、跨机器给自己递文件），
+     * 服务端中继同样按用户名投递，本人在线时这条链路与发给别人完全一致。
+     * 文本消息并没有"不能发给自己"的限制，文件消息此前单独拦一道，
+     * 反而成了唯一一个"自己不能给自己"的功能。</p>
+     *
+     * @param peer 待校验用户名
+     * @return 格式合法返回 true
+     */
+    private boolean isValidFilePeer(String peer) {
+        return peer != null && USERNAME_PATTERN.matcher(peer).matches();
     }
 
     /**
@@ -781,7 +807,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 }
                 break;
             case EXPORT_REQUEST:
-                handleExportRequest(socket);
+                if (message instanceof TextMessage text) {
+                    handleExportRequest(socket, text);
+                } else {
+                    handleExportRequest(socket, null);
+                }
                 break;
             default:
                 // 已登录用户发来服务器专属类型（如各 RESULT、HEARTBEAT_ACK）属于协议异常，
@@ -1077,26 +1107,51 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         if (!requireLogin()) {
             return;
         }
-        String[] parts = ChatMessageFactory.splitFields(message.getContent());
+        String content = message.getContent();
+        // 先用宽松上限切分：头像分支的载荷是图片 Base64，天然超过聊天正文的 2000 字符上限。
+        // 切完拿到命令名后，再对非头像分支补回严格上限（见下方 hasValidLength）
+        String[] parts = ChatMessageFactory.splitFields(content,
+                Constants.AVATAR_MAX_LENGTH + 64);
         if (parts == null) {
             send(ChatMessageFactory.error(username, "用户资料变更请求格式错误"));
             return;
         }
         String command = parts.length > 0 ? parts[0] : "";
         String argument = parts.length > 1 ? parts[1] : "";
+        if (!"CHANGE_AVATAR".equals(command) && content.length() > Constants.MESSAGE_MAX_LENGTH) {
+            // 放宽上限只为头像开口子，其它命令仍按聊天正文的上限把关，
+            // 避免"闸门写 2000、实际放行 32KB"这种名不副实的校验
+            send(ChatMessageFactory.error(username, "用户资料变更请求格式错误"));
+            return;
+        }
         UserService userService = server.getUserService();
         if ("CHANGE_NICK".equals(command)) {
             Result<User> result = userService.updateNickname(username, argument);
-            send(ChatMessageFactory.system(username, result.getMessage()));
+            sendProfileResult(Constants.PROFILE_SECTION_NICK, result.isSuccess(), result.getMessage());
             if (result.isSuccess()) {
-                // 昵称属于用户列表展示字段，修改后必须广播新列表，否则各客户端显示不一致
+                // 昵称属于用户列表展示字段，修改后必须更新在线缓存并广播新列表，
+                // 否则各客户端显示的仍是登录时的旧昵称
+                server.getUserManager().updateProfile(result.getData());
                 server.getUserManager().broadcastUserList();
                 server.notify(ServerObserver.EventType.LOGIN, username + " 修改昵称为 " + argument);
             }
             return;
         }
+        if ("CHANGE_AVATAR".equals(command)) {
+            Result<User> result = userService.updateAvatar(username, argument);
+            sendProfileResult(Constants.PROFILE_SECTION_AVATAR, result.isSuccess(), result.getMessage());
+            if (result.isSuccess()) {
+                // 与改名同理：头像也在用户列表里下发，不广播则对方看到的一直是旧头像
+                server.getUserManager().updateProfile(result.getData());
+                server.getUserManager().broadcastUserList();
+                server.notify(ServerObserver.EventType.LOGIN, username + " 更新了头像");
+            }
+            return;
+        }
         if ("DELETE_USER".equals(command)) {
             Result<Boolean> result = userService.deleteUser(username, argument);
+            // 刻意保持 SYSTEM 而非 PROFILE_RESULT：删除用户的结果展示在主窗口状态栏，
+            // 改类型会让既有的删除反馈一起失效
             send(ChatMessageFactory.system(username, result.getMessage()));
             if (result.isSuccess()) {
                 server.notify(ServerObserver.EventType.LOGIN, username + " 删除了用户 " + argument);
@@ -1104,6 +1159,26 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         send(ChatMessageFactory.error(username, "不支持的用户操作: " + command));
+    }
+
+    /**
+     * 下发个人资料变更结果。
+     *
+     * <p>正文格式：{@code 成败|分区|原因}，分区取值见
+     * {@link Constants#PROFILE_SECTION_NICK} 等常量。请求方据此把结果贴到
+     * 发起该请求的那个设置分区上，不会与别人的上下线通知混淆。</p>
+     *
+     * @param section 分区标识
+     * @param success 是否成功
+     * @param reason  中文原因
+     */
+    private void sendProfileResult(String section, boolean success, String reason) {
+        TextMessage message = ChatMessageFactory.text(Constants.SYSTEM_SENDER,
+                username == null ? "" : username,
+                (success ? "1" : "0") + "|" + section + "|" + (reason == null ? "" : reason),
+                MessageType.TEXT_PRIVATE);
+        message.setType(MessageType.PROFILE_RESULT);
+        send(message);
     }
 
     /**
@@ -1123,7 +1198,7 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         Result<Boolean> result = server.getUserService().updatePassword(username, parts[0], parts[1]);
-        send(ChatMessageFactory.system(username, result.getMessage()));
+        sendProfileResult(Constants.PROFILE_SECTION_PASSWORD, result.isSuccess(), result.getMessage());
         if (result.isSuccess()) {
             server.notify(ServerObserver.EventType.LOGIN, username + " 修改了密码");
         }
@@ -1236,11 +1311,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             sendHistoryError("会话对象用户名非法");
             return;
         }
-        if (username.equals(peer)) {
-            LOGGER.warning(() -> "历史查询会话对象为本人，已拒绝: " + username);
-            sendHistoryError("会话对象不能是本人");
-            return;
-        }
+        // 与自己聊天是合法会话（见 handleTextMessage 对本人收发的处理），因此不再拒绝
+        // 会话对象为本人：接收方与发送者都是本连接的用户名，查询范围天然只有自己的记录，
+        // 不存在越权问题。
         // 分页字段是本轮新增的，旧客户端只发四段：缺省即"最新一页 + 默认条数"
         String cursorField = parts.length > 4 ? parts[4].trim() : "";
         Long beforeId = null;
@@ -1275,7 +1348,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         try {
             // 分页下推到 SQL：历史记录总量大，先全量查回再截断既慢又浪费内存
             List<Message> messages = messageService.queryPage(target, peer, from, to, beforeId, limit);
-            builder.append('1').append('|').append(messages.size()).append('|').append(peer);
+            builder.append('1').append('|').append(messages.size()).append('|').append(peer)
+                    .append('|').append(HISTORY_ROW_VERSION);
             // 游标行恒定占一行（无记录时值为空），使客户端解析位置固定，不必做分支判断；
             // 取值用本页最小主键，与 DAO 的 id < 游标 语义对应，翻页时不会漏记录或重复
             builder.append('\n').append(HISTORY_CURSOR_PREFIX)
@@ -1284,7 +1358,9 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
                 builder.append('\n')
                         .append(DateUtil.format(item.getTimestamp())).append('|')
                         .append(item.getSender()).append('|')
-                        .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver()).append('|')
+                        .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver())
+                        .append('|').append(item.getMessageId() == null ? "" : item.getMessageId())
+                        .append('|')
                         .append(MessageExporter.contentOf(item));
             }
         } catch (ChatException e) {
@@ -1367,12 +1443,15 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             builder.append('0').append('|').append(result.getMessage());
         } else {
             List<Message> messages = result.getData();
-            builder.append('1').append('|').append(messages.size());
+            builder.append('1').append('|').append(messages.size())
+                    .append('|').append(HISTORY_ROW_VERSION);
             for (Message item : messages) {
                 builder.append('\n')
                         .append(DateUtil.format(item.getTimestamp())).append('|')
                         .append(item.getSender()).append('|')
-                        .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver()).append('|')
+                        .append(item.isBroadcast() ? Constants.BROADCAST_TAG : item.getReceiver())
+                        .append('|').append(item.getMessageId() == null ? "" : item.getMessageId())
+                        .append('|')
                         .append(MessageExporter.contentOf(item));
             }
         }
@@ -1444,6 +1523,13 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
      * <p>对端离线时直接跳过：历史查询对已撤回记录返回的是占位文本，
      * 对端下次上线补拉历史看到的就是"已撤回"，通知并非必需，也不必为此缓存待发通知。</p>
      *
+     * <p>群聊记录（接收者为空）改为广播给除发起者外的全体在线用户：
+     * 群里每个人界面上都有这一条，只回发起者的话，其他人会一直看着一条
+     * 已经不存在于服务端的消息，直到重启客户端才会从历史里消失。</p>
+     *
+     * <p>与自己聊天的记录（收发双方都是本人）跳过通知：发起者界面上已经由
+     * 撤回回执改好了那一条，再发一条"对方撤回了一条消息"只会凭空多出一行。</p>
+     *
      * @param messageId 已撤回消息的稳定标识
      */
     private void notifyRecallPeer(String messageId) {
@@ -1458,8 +1544,18 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         String peer = original.getReceiver();
-        // 群聊记录接收者为空，没有单一对端，本轮只回发起者
-        if (peer == null || peer.isEmpty() || !server.getUserManager().isOnline(peer)) {
+        if (original.isBroadcast() || peer == null || peer.isEmpty()) {
+            TextMessage groupNotice = ChatMessageFactory.text(Constants.SYSTEM_SENDER, "",
+                    "PEER|" + messageId + "|" + username, MessageType.TEXT_GROUP);
+            groupNotice.setType(MessageType.MSG_RECALL);
+            for (String name : server.getUserManager().onlineNames()) {
+                if (!username.equals(name)) {
+                    server.getUserManager().sendTo(name, groupNotice);
+                }
+            }
+            return;
+        }
+        if (username.equals(peer) || !server.getUserManager().isOnline(peer)) {
             return;
         }
         TextMessage notice = ChatMessageFactory.text(Constants.SYSTEM_SENDER, peer,
@@ -1495,34 +1591,89 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /**
      * 处理聊天记录导出请求。
      *
-     * <p>正文为空：导出对象恒为发起者本人，不需要参数。导出必须由服务端查库、客户端落盘——
-     * 客户端没有数据库连接，只有与数据库同机的那台能直连，其余机器要么报连接失败，
-     * 要么在本机空库里查出 0 条（本项目正是踩过这个坑才改成现在这条链路）。</p>
+     * <p>正文是导出范围，取值见 {@link #filterExportScope}：空串为本人全部记录，
+     * {@code @ALL} 为群聊大厅，{@code @用户名} 为与该用户的私聊。导出对象恒为发起者本人，
+     * 范围只能在这个前提下收窄，永远不可能导出别人的会话。</p>
+     *
+     * <p>导出必须由服务端查库、客户端落盘——客户端没有数据库连接，只有与数据库同机的那台
+     * 能直连，其余机器要么报连接失败，要么在本机空库里查出 0 条（本项目正是踩过这个坑
+     * 才改成现在这条链路）。</p>
      *
      * <p>响应正文格式：成功为 {@code 1|条数} 换行后接渲染好的导出文本；失败为 {@code 0|原因}。
      * 导出文本里的"数据来源"取连接的本端地址，即客户端实际连上的那台服务器。</p>
      *
-     * @param socket 发起导出的连接，用于取本端地址作为数据来源
+     * @param socket  发起导出的连接，用于取本端地址作为数据来源
+     * @param request 携带导出范围的请求消息，可为 null（视为导出全部）
      */
-    private void handleExportRequest(Socket socket) {
+    private void handleExportRequest(Socket socket, TextMessage request) {
         if (!requireLogin()) {
             return;
         }
+        String scope = request == null || request.getContent() == null
+                ? "" : request.getContent().trim();
         Result<List<Message>> result = server.getMessageService()
                 .queryHistory(username, (LocalDateTime) null, null);
         String content;
         if (!result.isSuccess()) {
             content = "0|" + result.getMessage();
-        } else if (result.getData().isEmpty()) {
-            content = "0|没有可导出的记录";
         } else {
-            content = "1|" + result.getData().size() + "\n"
-                    + MessageExporter.render(result.getData(), localAddressOf(socket));
+            List<Message> rows = filterExportScope(result.getData(), scope);
+            if (rows.isEmpty()) {
+                content = "0|" + (scope.isEmpty() ? "没有可导出的记录" : "这个会话里还没有可导出的记录");
+            } else {
+                content = "1|" + rows.size() + "\n"
+                        + MessageExporter.render(rows, localAddressOf(socket));
+            }
         }
         TextMessage response = ChatMessageFactory.text(Constants.SYSTEM_SENDER, username,
                 content, MessageType.TEXT_PRIVATE);
         response.setType(MessageType.EXPORT_RESULT);
         send(response);
+    }
+
+    /**
+     * 按导出范围筛出该范围内的记录。
+     *
+     * <p>范围写在正文里：空串表示"本人全部记录"（旧版客户端的语义，保持不变），
+     * {@code @ALL} 表示群聊大厅，{@code @用户名} 表示与该用户的私聊。
+     * 用 {@code @} 作前缀而不是直接写用户名，是为了把"群聊"这个目标与真有可能
+     * 叫这个名字的账号区分开——用户名允许出现的字符里没有 {@code @}，
+     * 也就不存在二义性。</p>
+     *
+     * <p>筛选放在已查回的本人记录上做，而不是另加一条带条件的 SQL：可见范围
+     * （本人收发 + 广播）是越权防线，只应该在数据层写一次；在这里再拼一个
+     * {@code AND} 条件等于把同一条安全规则抄成两份，抄错一份就是越权查询。</p>
+     *
+     * @param rows  本人可见的全部记录
+     * @param scope 导出范围
+     * @return 该范围内的记录，保持原有时间顺序
+     */
+    private List<Message> filterExportScope(List<Message> rows, String scope) {
+        if (rows == null || rows.isEmpty() || scope == null || scope.isEmpty()) {
+            return rows == null ? List.of() : rows;
+        }
+        boolean group = Constants.BROADCAST_SCOPE.equals(scope);
+        String peer = group ? null : scope.substring(1);
+        List<Message> filtered = new java.util.ArrayList<>();
+        for (Message row : rows) {
+            if (row.isBroadcast()) {
+                if (group) {
+                    filtered.add(row);
+                }
+                continue;
+            }
+            if (group) {
+                continue;
+            }
+            String sender = row.getSender() == null ? "" : row.getSender();
+            String receiver = row.getReceiver() == null ? "" : row.getReceiver();
+            // 私聊的方向是双向的：与本人的往来两个方向都算同一个会话
+            if ((username.equals(sender) && peer.equals(receiver))
+                    || (username.equals(receiver) && peer.equals(sender))) {
+                filtered.add(row);
+            }
+        }
+        return filtered;
     }
 
     /**

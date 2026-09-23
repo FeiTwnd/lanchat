@@ -18,6 +18,12 @@ import java.awt.RenderingHints;
  * <p>所有图标都在 {@code [0, size)} 的正方形坐标系内绘制，绘制前已配置抗锯齿与描边样式，
  * 因此每个图标的绘制代码只需关注几何形状。</p>
  *
+ * <p>关于"暂时没有调用点的图标"：{@link #user(int, Color)} 与 {@link #lock(int, Color)}
+ * 原本服务于主窗口功能面板上的"修改昵称…"与"修改密码…"两个入口，这两条入口在第 4 轮改动中
+ * 并入了统一的"设置…"窗口，图标改用 {@link #settings(int, Color)}。
+ * 两者作为本工厂的公开能力予以保留（同 {@code SkinButton#withIcon}）：删掉它们既不会让
+ * 界面变好，反而让下一个需要"用户""密码锁"图形的地方重新画一遍。</p>
+ *
  * @author Java 课程设计
  * @version 1.0
  */
@@ -318,6 +324,39 @@ public final class Glyphs {
             g.drawLine((int) (s * 0.46), (int) (s * 0.50), (int) (s * 0.86), (int) (s * 0.50));
             g.drawLine((int) (s * 0.68), (int) (s * 0.34), (int) (s * 0.86), (int) (s * 0.50));
             g.drawLine((int) (s * 0.68), (int) (s * 0.66), (int) (s * 0.86), (int) (s * 0.50));
+        });
+    }
+
+    /**
+     * 设置图标：齿轮。
+     *
+     * <p>画法：一个圆环当轮盘，环外再画 8 根等角分布的短径向线当齿，中心一个小圆当轴孔。
+     * 用"环 + 放射线"而不是逐个画梯形齿，是因为图标边长常小到 16~18 像素，
+     * 每个齿只有两三个像素宽，画梯形齿只会糊成一团，放射线在小尺寸下反而更清晰。</p>
+     *
+     * @param size  边长
+     * @param color 颜色
+     * @return 图标
+     */
+    public static Icon settings(final int size, final Color color) {
+        return of(size, color, (g, s) -> {
+            double center = s / 2.0;
+            int ring = Math.max(2, Math.round(s * 0.28f));
+            int teeth = Math.max(ring + 1, Math.round(s * 0.44f));
+            int hole = Math.max(1, Math.round(s * 0.11f));
+            g.drawOval(Math.round((float) center - ring), Math.round((float) center - ring),
+                    ring * 2, ring * 2);
+            g.drawOval(Math.round((float) center - hole), Math.round((float) center - hole),
+                    hole * 2, hole * 2);
+            for (int i = 0; i < 8; i++) {
+                double angle = Math.PI * i / 4.0;
+                double cos = Math.cos(angle);
+                double sin = Math.sin(angle);
+                g.drawLine(Math.round((float) (center + ring * cos)),
+                        Math.round((float) (center + ring * sin)),
+                        Math.round((float) (center + teeth * cos)),
+                        Math.round((float) (center + teeth * sin)));
+            }
         });
     }
 

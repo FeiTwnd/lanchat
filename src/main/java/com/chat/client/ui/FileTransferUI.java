@@ -67,6 +67,19 @@ public class FileTransferUI extends BaseUI {
     /** 接收方输入框（仅发送场景可编辑） */
     private final JTextField receiverField = new JTextField(12);
 
+    /** 顶部操作行：接收方 + 选择文件 + 发送 */
+    private transient JPanel topPanel;
+
+    /**
+     * 本次传输是否由聊天窗口发起。
+     *
+     * <p>由聊天窗口发起时，接收方与文件在进入本窗口之前就已确定，
+     * 顶部那一行"接收方 / 选择文件 / 发送"既用不上、又会造成误解
+     * （窗口里明明已经收到文件了，却还摆着一个"选择文件"按钮和一句"尚未选择文件"），
+     * 因此这种情形下整行隐藏，本窗口只当进度与日志控制台用。</p>
+     */
+    private transient boolean chatInitiated;
+
     /** 文件路径显示 */
     private final JLabel fileLabel = new JLabel("尚未选择文件");
 
@@ -148,6 +161,7 @@ public class FileTransferUI extends BaseUI {
         SkinButton sendButton = new SkinButton("发送", SkinButton.Kind.PRIMARY);
         sendButton.addActionListener(e -> startSend());
         top.add(sendButton);
+        this.topPanel = top;
 
         JPanel center = new JPanel(new BorderLayout(4, 4));
         center.setBackground(Theme.BG);
@@ -198,14 +212,17 @@ public class FileTransferUI extends BaseUI {
             showError("请填写接收方用户名");
             return;
         }
-        if (receiver.equals(client.getUsername())) {
-            showError("不能给自己发送文件");
-            return;
-        }
-        String transferId = client.sendFile(receiver, selectedFile);
+        // 不再拦"发给自己"：给自己发文件是一个正当用法（把图片存进本机的 data/received
+        // 留档、跨机器给自己递文件），服务端按用户名中继，本人在线时这条链路与发给别人一致
+        File sending = selectedFile;
+        String transferId = client.sendFile(receiver, sending);
         if (transferId == null) {
             progressLabel.setText("发送失败");
             appendLog("发送失败：文件不合法或连接异常");
+            // 只在日志里写一句是不够的：日志区在窗口底部，使用者刚点完按钮，
+            // 视线还在文件那一行，很可能把这次失败整个错过。
+            // 弹窗同时保证"文件没发出去"这件事不会被误认为已经发出
+            showError("发送失败：文件不合法或连接异常（" + sending.getName() + "）");
             return;
         }
         TRANSFER_OWNERS.put(transferId, this);
@@ -214,7 +231,10 @@ public class FileTransferUI extends BaseUI {
         appendLog("已向 " + receiver + " 发起文件传输请求，编号 "
                 + transferId.substring(0, 8));
         selectedFile = null;
-        fileLabel.setText("尚未选择文件");
+        // 不清成"尚未选择文件"：那行字会让人以为还得再选一次文件才能发，
+        // 而这次传输其实已经在路上了；显示刚发出去的文件名才是这一刻的事实
+        fileLabel.setText("已发送: " + sending.getName()
+                + "（" + FileUtil.humanSize(sending.length()) + "）");
     }
 
     /**
@@ -263,11 +283,21 @@ public class FileTransferUI extends BaseUI {
      */
     public void handleIncomingRequest(FileMessage request) {
         registerTransfer(request.getTransferId());
+        // 发给自己时不必再问一遍"是否接收"：请求本来就是自己刚点出去的，
+        // 服务端原样中继回来只是这条链路的实现细节，弹窗会让一次自发送变成两次确认
+        boolean selfSend = request.getSender() != null
+                && request.getSender().equals(client.getUsername());
         onEdt(() -> {
             appendLog("收到来自 " + request.getSender() + " 的文件: " + request.getSummary());
             progressBar.setValue(0);
-            progressLabel.setText("等待确认: " + request.getFileName());
+            progressLabel.setText(selfSend
+                    ? "正在接收: " + request.getFileName() : "等待确认: " + request.getFileName());
         });
+        if (selfSend) {
+            client.respondFileRequest(request, true, "");
+            appendLog("这是发给自己的一份副本，已自动接收");
+            return;
+        }
         boolean accepted = confirm("用户 " + request.getSender() + " 想发送文件\n\n"
                 + "文件名: " + request.getFileName() + "\n"
                 + "大小: " + FileUtil.humanSize(request.getFileSize()) + "\n\n是否接收？");
@@ -427,10 +457,22 @@ public class FileTransferUI extends BaseUI {
      * <p>聊天窗口内的"发送文件"按钮已经知道接收方是谁（私聊窗口是对端、群聊窗口是全部在线用户），
      * 因此选择文件后可以直接发起，不需要再让使用者回到本窗口点一次"发送"。</p>
      *
+     * <p>这条路径同时也是"聊天窗口已经成为唯一入口"的体现：从聊天窗口发文件时
+     * 顶部那行选择控件会被收起来，本窗口只剩进度条与日志。窗口随 {@link #WINDOWS}
+     * 按对端复用，因此同一次会话里第二次发文件也不会又冒出一个要求选文件的界面。</p>
+     *
      * @param file 待发送文件
      */
     public void sendNow(File file) {
         selectedFile = file;
+        chatInitiated = true;
+        if (topPanel != null && topPanel.isVisible()) {
+            // 接收方与文件都已确定，收掉那一行选择控件：留着它，使用者会以为
+            // 还得再选一次文件、再点一次发送（截图里那句"为什么还是需要选择文件"就是这么来的）
+            topPanel.setVisible(false);
+            topPanel.getParent().revalidate();
+            topPanel.getParent().repaint();
+        }
         fileLabel.setText("已选择: " + file.getName() + "（" + FileUtil.humanSize(file.length()) + "）");
         startSend();
     }

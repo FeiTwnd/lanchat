@@ -100,6 +100,7 @@ public final class TestRunner {
             targets.add(UserServiceTest.class);
             targets.add(MessageServiceTest.class);
             targets.add(FileServiceTest.class);
+            targets.add(ProtocolTest.class);
         }
         System.out.println("========== 单元测试开始 ==========");
         for (Class<?> target : targets) {
