@@ -12,6 +12,7 @@ import com.chat.common.TextMessage;
 import com.chat.common.User;
 import com.chat.common.UserListCodec;
 import com.chat.exception.ChatException;
+import com.chat.service.AiAssistantService;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
 import com.chat.util.DateUtil;
@@ -299,6 +300,10 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             send(ChatMessageFactory.error(username, "私聊消息缺少接收者"));
             return;
         }
+        // 收件人是智能体小助手时整条转交异步问答，不再走下面的投递与落库流程
+        if (handOffToAiAssistant(text, receiver)) {
+            return;
+        }
         // 判重必须排在投递与落库之前：网络重发会把同一条消息再次送到这里，
         // 命中后既不能再转发（接收方会重复看到一条），也不能再落库（message_id 唯一索引会插入失败）
         String messageId = text.ensureMessageId();
@@ -345,6 +350,52 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         send(echo);
         server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
                 username + " -> " + receiver + ": " + text.getSummary());
+    }
+
+    /**
+     * 判断这条私聊是否发给智能体小助手，是则转交异步问答并返回 true。
+     *
+     * <p><b>为什么拦在落库之前</b>：小助手不是真账号，回答由外部平台生成，
+     * 对话本身没有留存价值（使用者明确要求不入库），因此这里既不查重也不写
+     * {@code chat_message}。这个位置在判重与落库之前，正好整段跳过。</p>
+     *
+     * <p><b>为什么要先发回执与本地回显</b>：与小助手对话在界面上必须与和真人聊天
+     * 完全一致——消息发出去要立刻显示、状态要变成已送达。回答本身要等外部平台，
+     * 但"我发出去了"这件事不需要等。</p>
+     *
+     * <p><b>为什么还要检查 {@code isOnline}</b>：用户名规则要求至少 3 位，
+     * {@link Constants#AI_USERNAME} 取的是两位的 {@code ai}，正常不可能撞号。
+     * 这一条是兜底：万一将来用户名规则放宽，或真有一个同名账号在线，
+     * 宁可把它当普通用户投递，也绝不把发给真人的消息劫给机器人。</p>
+     *
+     * @param text     私聊文本消息
+     * @param receiver 接收者用户名
+     * @return 已转交小助手返回 true；不是发给小助手的返回 false，由调用方继续按普通私聊处理
+     */
+    private boolean handOffToAiAssistant(TextMessage text, String receiver) {
+        if (!Constants.AI_USERNAME.equals(receiver)) {
+            return false;
+        }
+        AiAssistantService assistant = server.getAiAssistant();
+        if (assistant == null || !assistant.isEnabled()) {
+            return false;
+        }
+        if (server.getUserManager().isOnline(receiver)) {
+            LOGGER.warning(() -> "存在与小助手同名的在线账号，本条消息按普通私聊投递: " + receiver);
+            return false;
+        }
+        sendAck(text, ACK_DELIVERED, "");
+        // 回显给发送方，使其界面确认消息已发出；发送方会自行忽略这条（收发都是本人）
+        TextMessage echo = ChatMessageFactory.text(username, username, text.getSummary(),
+                MessageType.TEXT_PRIVATE);
+        send(echo);
+        // 先给一句"正在思考"：外部平台通常要等数秒，没有它使用者面对的是一片安静
+        send(ChatMessageFactory.text(Constants.AI_USERNAME, username,
+                Constants.AI_THINKING_TEXT, MessageType.TEXT_PRIVATE));
+        server.askAi(username, text.getContent());
+        server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
+                username + " -> " + receiver + ": " + text.getSummary());
+        return true;
     }
 
     /**

@@ -171,6 +171,44 @@ public final class Constants {
     /** 管理员角色标识 */
     public static final String ROLE_ADMIN = "ADMIN";
 
+    // ==================== 智能体小助手 ====================
+
+    /**
+     * 智能体小助手的用户名。
+     *
+     * <p>固定在代码里而不是做成配置项：它同时是"这条私聊该不该转给机器人"的判定依据，
+     * 值一旦可改，配置与客户端界面之间就不再有单一的对应关系。取 {@code ai} 这个两位名
+     * 是刻意为之——{@link #USERNAME_PATTERN} 要求用户名至少 3 位，因此真实账号
+     * 不可能是这个名字，机器人不会与真人撞号。</p>
+     */
+    public static final String AI_USERNAME = "ai";
+
+    /**
+     * 智能体小助手在好友树里显示的昵称。
+     *
+     * <p>刻意不从配置文件读取：{@link Config} 用 {@code Properties.load(InputStream)}
+     * 加载配置，而它按 ISO-8859-1 解码，中文昵称写进 properties 会变成乱码。
+     * 改昵称请直接改这里的字面量——源码是 UTF-8，中文字面量不经过那一步解码。</p>
+     */
+    public static final String AI_DISPLAY_NAME = "AI小助手";
+
+    /** 智能体平台的开放接口地址：一问一答的非流式接口，一次请求直接拿到回答 */
+    public static final String AI_API_URL = "https://api.coze.cn/open_api/v2/chat";
+
+    /** 与智能体平台的建连超时（毫秒），明显短于问答总超时，连不上时不必白等 */
+    public static final int AI_CONNECT_TIMEOUT_MS = 5_000;
+
+    /** 单次问答的总超时（毫秒）：超过即放弃，并如实告知提问者 */
+    public static final long AI_REQUEST_TIMEOUT_MS = 30_000L;
+
+    /**
+     * 提问后立刻回给提问者的提示语。
+     *
+     * <p>必须有这一句：外部平台的回答通常要等几秒到十几秒，没有它，提问者看到的是
+     * 自己那条消息发出去之后的一片安静，无从判断"到底发出去没有"。</p>
+     */
+    public static final String AI_THINKING_TEXT = "正在思考，请稍候……";
+
     // ==================== 业务校验规则 ====================
 
     /** 用户名合法格式：3-16 位字母、数字或下划线，必须以字母开头 */

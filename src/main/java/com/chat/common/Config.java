@@ -225,6 +225,43 @@ public final class Config {
     }
 
     /**
+     * 获取智能体小助手的智能体编号（bot_id）。
+     *
+     * <p>取值位置是智能体开发页地址栏 {@code .../bot/} 之后的那串数字。</p>
+     *
+     * @return 智能体编号；未配置时返回空字符串
+     */
+    public static String aiBotId() {
+        return override("lanchat.ai.bot.id", get("ai.bot.id", ""));
+    }
+
+    /**
+     * 获取智能体接口地址。
+     *
+     * <p>取值优先级：系统属性 {@code lanchat.ai.url} > 配置文件 {@code ai.api.url}。
+     * 提供覆盖是为了让自动化测试能把请求打到本地桩上，从而不必真的出网。</p>
+     *
+     * @return 接口地址，默认 {@link Constants#AI_API_URL}
+     */
+    public static String aiApiUrl() {
+        return override("lanchat.ai.url", get("ai.api.url", Constants.AI_API_URL));
+    }
+
+    /**
+     * 获取智能体平台的个人访问令牌。
+     *
+     * <p>取值优先级：系统属性 {@code lanchat.ai.token} > 配置文件 {@code ai.api.token}。
+     * 提供系统属性覆盖与数据库口令同理——演示或排查时可以完全不把令牌落到磁盘上。</p>
+     *
+     * <p>该令牌等同于密码：只用于请求头，不得写进日志、异常信息或任何回执正文。</p>
+     *
+     * @return 访问令牌；未配置时返回空字符串（此时小助手不启用）
+     */
+    public static String aiApiToken() {
+        return override("lanchat.ai.token", get("ai.api.token", ""));
+    }
+
+    /**
      * 读取系统属性覆盖值。
      *
      * @param property      系统属性名

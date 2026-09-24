@@ -74,6 +74,34 @@ public class UserManager {
     }
 
     /**
+     * 注册一名虚拟成员（智能体小助手）。
+     *
+     * <p><b>为什么单独开一个方法而不是复用 {@link #register}</b>：虚拟成员没有连接，
+     * 也就没有 {@link ClientHandler} 可放。硬造一个"什么都不做的 handler"塞进
+     * {@link #onlineUsers} 会让 {@link #broadcast} 每次都给一个不存在的对端写一遍字节，
+     * 还会让 {@link #isOnline} 对机器人返回 true，从而给机器人开启文件传输、
+     * 离线补投等一整条并不成立的路径。这里只写资料表，语义上就是"名单里有这个人，
+     * 但没有连接"。</p>
+     *
+     * <p><b>由此产生的可见取舍</b>：{@link #isOnline} 对虚拟成员返回 false，
+     * 因此给机器人发文件会被既有的"接收方不在线"校验拒绝。这是合理行为——
+     * 机器人收不了文件。</p>
+     *
+     * <p>用 {@code put} 而不是 {@code putIfAbsent}：服务器重启或重复调用时应当幂等覆盖，
+     * 而不是因为"已经有一份资料"就静默跳过，导致改过的昵称不生效。</p>
+     *
+     * @param user 虚拟成员的资料（应已脱敏），用户名为空时忽略
+     */
+    public void registerVirtualUser(User user) {
+        if (user == null || user.getUsername() == null || user.getUsername().isEmpty()) {
+            return;
+        }
+        user.setOnline(true);
+        userProfiles.put(user.getUsername(), user);
+        LOGGER.info(() -> "虚拟成员已注册: " + user.getDisplayName());
+    }
+
+    /**
      * 注销用户（下线）。
      *
      * @param username 用户名
@@ -179,10 +207,15 @@ public class UserManager {
     /**
      * 在线人数。
      *
-     * @return 在线用户数量
+     * <p>统计口径是"在线成员数"而不是"活跃连接数"：{@link #registerVirtualUser}
+     * 注册的虚拟成员没有连接，但它在好友树与服务器控制台的名单里都是一名成员。
+     * 若按连接数统计，同一时刻的局域网发现应答、服务器控制台与客户端好友树
+     * 会给出三个互不相同的数字，而这种不一致只能靠读代码才能解释。</p>
+     *
+     * @return 在线成员数量
      */
     public int size() {
-        return onlineUsers.size();
+        return userProfiles.size();
     }
 
     /**

@@ -1,7 +1,12 @@
 package com.chat.server;
 
+import com.chat.common.ChatMessageFactory;
 import com.chat.common.Config;
 import com.chat.common.Constants;
+import com.chat.common.MessageType;
+import com.chat.common.TextMessage;
+import com.chat.common.User;
+import com.chat.service.AiAssistantService;
 import com.chat.service.FileLogService;
 import com.chat.service.MessageService;
 import com.chat.service.UserService;
@@ -11,6 +16,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -113,6 +119,14 @@ public final class ChatServer {
     /** 文件传输日志服务（延迟初始化，原因同上） */
     private FileLogService fileLogService;
 
+    /**
+     * 智能体小助手服务（延迟初始化，原因同上）。
+     *
+     * <p>未配置令牌与 bot_id 时它依然会被创建，只是 {@code isEnabled()} 为 false，
+     * 服务器行为与接入前完全一致：不注册虚拟成员，也不拦截任何私聊。</p>
+     */
+    private AiAssistantService aiAssistant;
+
     /** 已建立的连接处理器，用于停止服务器时统一关闭 */
     private final List<ClientHandler> handlers = new ArrayList<>();
 
@@ -177,6 +191,7 @@ public final class ChatServer {
                         + fileLogService.storageFailureReason());
             }
             userService.initAdminIfAbsent();
+            registerAiAssistant();
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);
             // 采用「按需创建、空闲回收」的线程池：每个连接的处理线程会一直阻塞在读取消息上，
@@ -238,6 +253,7 @@ public final class ChatServer {
         connectionPool = null;
         shutdownPool(heartbeatScanner);
         heartbeatScanner = null;
+        shutdownAiAssistant();
         notify(ServerObserver.EventType.SERVER_STOP, "服务器已停止");
         LOGGER.info("服务器已停止");
     }
@@ -257,6 +273,7 @@ public final class ChatServer {
             discoveryResponder.shutdown();
             discoveryResponder = null;
         }
+        shutdownAiAssistant();
     }
 
     /**
@@ -469,6 +486,60 @@ public final class ChatServer {
     }
 
     /**
+     * 获取智能体小助手服务。
+     *
+     * @return 小助手服务；服务器尚未启动时返回 null
+     */
+    public AiAssistantService getAiAssistant() {
+        return aiAssistant;
+    }
+
+    /**
+     * 把一条提问转交智能体小助手，回答就绪后异步回投给提问者。
+     *
+     * <p>本方法立即返回：等待外部平台响应发生在小助手自己的线程池里，
+     * 绝不能占用调用方那条连接的读取线程（详见
+     * {@link AiAssistantService}的异步说明）。</p>
+     *
+     * @param asker    提问者用户名
+     * @param question 提问正文
+     */
+    public void askAi(String asker, String question) {
+        AiAssistantService service = aiAssistant;
+        if (service == null || !service.isEnabled()) {
+            return;
+        }
+        service.ask(asker, question, this::deliverAiReply);
+    }
+
+    /**
+     * 投递小助手的答复。
+     *
+     * <p>按用户名现查在线表而不是沿用提问时那条连接：问答是异步的，
+     * 等待期间提问者可能已经断线重连，只有现查才能把回答投到当前连接上；
+     * 确实已经离线时静默放弃——把回答存进离线队列只会让使用者下次登录时
+     * 收到一条早已过时的独角戏。</p>
+     *
+     * <p>本方法由问答线程池的线程调用，因此只做构造消息与投递，
+     * 不触碰任何界面对象。</p>
+     *
+     * @param asker 提问者用户名
+     * @param text  小助手要回复的正文
+     */
+    private void deliverAiReply(String asker, String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        TextMessage reply = ChatMessageFactory.text(Constants.AI_USERNAME, asker, text,
+                MessageType.TEXT_PRIVATE);
+        if (userManager.sendTo(asker, reply)) {
+            LOGGER.info(() -> "智能体已回答: " + asker);
+        } else {
+            LOGGER.info(() -> "智能体答复未能投递，提问者已不在线: " + asker);
+        }
+    }
+
+    /**
      * 签发会话令牌，供客户端断线重连时恢复登录态。
      *
      * <p>为什么令牌不落库：它的唯一用途是让客户端不必在内存中长期保留明文口令，
@@ -570,6 +641,39 @@ public final class ChatServer {
         this.userService = new UserService();
         this.messageService = new MessageService();
         this.fileLogService = new FileLogService();
+        this.aiAssistant = new AiAssistantService();
+    }
+
+    /**
+     * 注册智能体小助手为一名虚拟成员，使其出现在所有客户端的好友树里。
+     *
+     * <p>未配置令牌或 bot_id 时直接跳过：小助手不出现在成员列表里，
+     * 使用者也就不会点到一个永远不回话的名字。</p>
+     */
+    private void registerAiAssistant() {
+        if (aiAssistant == null || !aiAssistant.isEnabled()) {
+            LOGGER.info("智能体小助手未启用：未配置 ai.api.token 或 ai.bot.id，跳过注册");
+            return;
+        }
+        User assistant = new User(Constants.AI_USERNAME, Constants.AI_DISPLAY_NAME);
+        assistant.setRole(Constants.ROLE_USER);
+        assistant.setCreateTime(LocalDateTime.now());
+        userManager.registerVirtualUser(assistant);
+        LOGGER.info(() -> "智能体小助手已上线: " + assistant.getDisplayName()
+                + "，接口 " + aiAssistant.getApiUrl());
+    }
+
+    /**
+     * 关闭智能体小助手服务。
+     *
+     * <p>停止与回滚两条路径都要调用：回滚发生在启动中途失败时，
+     * 此时线程池已经建好，不关就留下一个永远不会再被使用的出网线程池。</p>
+     */
+    private void shutdownAiAssistant() {
+        if (aiAssistant != null) {
+            aiAssistant.shutdown();
+            aiAssistant = null;
+        }
     }
 
     /**
