@@ -36,6 +36,17 @@ import java.util.Map;
  */
 public final class JsonCodec {
 
+    /**
+     * 允许的最大嵌套层数。
+     *
+     * <p>解析器是递归下降实现，层数直接对应 Java 栈深度，而"层数"完全由外部输入决定。
+     * 不设上限时，一段几 KB 的深层嵌套就能把栈耗尽并抛出 {@link StackOverflowError}——
+     * 它是 {@link Error} 而不是 {@link Exception}，调用方按 {@code RuntimeException}
+     * 捕获根本拦不住，线程会直接死亡。真实接口返回的报文只有两三层，
+     * 64 层对正常报文毫无影响，却把攻击面从"任意深度"压到栈绝对撑不住的程度以下。</p>
+     */
+    private static final int MAX_NESTING_DEPTH = 64;
+
     /** 私有构造，禁止实例化工具类 */
     private JsonCodec() {
     }
@@ -202,6 +213,9 @@ public final class JsonCodec {
         /** 当前读取位置 */
         private int pos;
 
+        /** 当前已进入的容器嵌套层数，用于把递归深度挡在栈溢出之前 */
+        private int depth;
+
         /**
          * 构造解析器。
          *
@@ -286,26 +300,31 @@ public final class JsonCodec {
          */
         private Map<String, Object> parseObject() {
             expect('{');
-            Map<String, Object> result = new LinkedHashMap<>();
-            skipWhitespace();
-            if (peek() == '}') {
-                pos++;
-                return result;
-            }
-            while (true) {
+            enterContainer();
+            try {
+                Map<String, Object> result = new LinkedHashMap<>();
                 skipWhitespace();
-                String key = parseString();
-                skipWhitespace();
-                expect(':');
-                result.put(key, parseValue());
-                skipWhitespace();
-                char c = next();
-                if (c == '}') {
+                if (peek() == '}') {
+                    pos++;
                     return result;
                 }
-                if (c != ',') {
-                    throw error("对象的成员之间应为逗号，实际读到 '" + c + "'");
+                while (true) {
+                    skipWhitespace();
+                    String key = parseString();
+                    skipWhitespace();
+                    expect(':');
+                    result.put(key, parseValue());
+                    skipWhitespace();
+                    char c = next();
+                    if (c == '}') {
+                        return result;
+                    }
+                    if (c != ',') {
+                        throw error("对象的成员之间应为逗号，实际读到 '" + c + "'");
+                    }
                 }
+            } finally {
+                depth--;
             }
         }
 
@@ -316,22 +335,40 @@ public final class JsonCodec {
          */
         private List<Object> parseArray() {
             expect('[');
-            List<Object> result = new ArrayList<>();
-            skipWhitespace();
-            if (peek() == ']') {
-                pos++;
-                return result;
-            }
-            while (true) {
-                result.add(parseValue());
+            enterContainer();
+            try {
+                List<Object> result = new ArrayList<>();
                 skipWhitespace();
-                char c = next();
-                if (c == ']') {
+                if (peek() == ']') {
+                    pos++;
                     return result;
                 }
-                if (c != ',') {
-                    throw error("数组的元素之间应为逗号，实际读到 '" + c + "'");
+                while (true) {
+                    result.add(parseValue());
+                    skipWhitespace();
+                    char c = next();
+                    if (c == ']') {
+                        return result;
+                    }
+                    if (c != ',') {
+                        throw error("数组的元素之间应为逗号，实际读到 '" + c + "'");
+                    }
                 }
+            } finally {
+                depth--;
+            }
+        }
+
+        /**
+         * 进入一层容器并校验嵌套深度。
+         *
+         * <p>在真正递归下去之前就判定，而不是等栈耗尽：只有提前抛
+         * {@link IllegalArgumentException}，调用方才有可能把它当作普通解析失败处理。</p>
+         */
+        private void enterContainer() {
+            depth++;
+            if (depth > MAX_NESTING_DEPTH) {
+                throw error("嵌套层数超过上限 " + MAX_NESTING_DEPTH);
             }
         }
 
@@ -341,6 +378,13 @@ public final class JsonCodec {
          * <p>{@code \\uXXXX} 转义按 UTF-16 码元追加：成对出现的两个转义
          * （如 emoji 的 {@code \\uD83D\\uDE00}）会自动拼成正确的代理对，
          * 无需额外处理。</p>
+         *
+         * <p><b>为什么对转义和控制字符一样严格</b>：{@code \\u} 后面若交给
+         * {@link Integer#parseInt(String, int)}，它会连正负号一起收下，
+         * 于是 {@code "\\u+041"} 会静默解析成 {@code 'A'}、{@code "\\u-041"}
+         * 会静默解析成一个毫不相干的字符。错得毫无征兆比直接报错危险得多，
+         * 因此这里只接受恰好 4 个 ASCII 十六进制字符；字符串内出现未转义的
+         * {@code 0x20} 以下字符同样按 JSON 规范拒绝，而不是悄悄放进正文。</p>
          *
          * @return 字符串内容
          */
@@ -356,6 +400,12 @@ public final class JsonCodec {
                     return builder.toString();
                 }
                 if (c != '\\') {
+                    if (c < 0x20) {
+                        // 回退一位，让错误位置指向这个非法字符本身而不是它后面
+                        pos--;
+                        throw error("字符串内出现未转义的控制字符 U+"
+                                + String.format("%04X", (int) c));
+                    }
                     builder.append(c);
                     continue;
                 }
@@ -389,16 +439,7 @@ public final class JsonCodec {
                         builder.append('\t');
                         break;
                     case 'u':
-                        if (pos + 4 > text.length()) {
-                            throw error("\\u 转义不足 4 位");
-                        }
-                        String hex = text.substring(pos, pos + 4);
-                        try {
-                            builder.append((char) Integer.parseInt(hex, 16));
-                        } catch (NumberFormatException e) {
-                            throw error("\\u 转义不是合法的十六进制: " + hex);
-                        }
-                        pos += 4;
+                        builder.append((char) readUnicodeEscape());
                         break;
                     default:
                         throw error("无法识别的转义符: \\" + escaped);
@@ -407,34 +448,104 @@ public final class JsonCodec {
         }
 
         /**
+         * 读取 {@code \\u} 之后的 4 位十六进制转义。
+         *
+         * @return 解析出的 UTF-16 码元
+         */
+        private int readUnicodeEscape() {
+            if (pos + 4 > text.length()) {
+                throw error("\\u 转义不足 4 位");
+            }
+            for (int i = 0; i < 4; i++) {
+                if (!isHexDigit(text.charAt(pos + i))) {
+                    throw error("\\u 转义必须紧跟 4 位十六进制字符: "
+                            + text.substring(pos, Math.min(text.length(), pos + 4)));
+                }
+            }
+            int code = Integer.parseInt(text.substring(pos, pos + 4), 16);
+            pos += 4;
+            return code;
+        }
+
+        /**
+         * 判断是否为 ASCII 十六进制数字。
+         *
+         * <p>刻意不用 {@link Character#digit(char, int)}：后者按 Unicode 数字属性判定，
+         * 连全角数字与阿拉伯-印度数字都算数，比 JSON 规范宽得多。</p>
+         *
+         * @param c 待判定的字符
+         * @return 是 {@code 0-9 a-f A-F} 之一返回 true
+         */
+        private static boolean isHexDigit(char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }
+
+        /**
+         * 判断是否为 ASCII 十进制数字。
+         *
+         * @param c 待判定的字符
+         * @return 是 {@code 0-9} 之一返回 true
+         */
+        private static boolean isDigit(char c) {
+            return c >= '0' && c <= '9';
+        }
+
+        /**
          * 解析一个数值。
          *
-         * <p>先按 JSON 数值的文法扫描出一段子串，再交给
-         * {@link Double#parseDouble} 转换：直接依赖后者会把 {@code NaN}、
-         * {@code Infinity}、十六进制等 JSON 不允许的形式也放进来。</p>
+         * <p>严格按 JSON 数值文法扫描：可选的 {@code -}、整数部分
+         * （{@code 0} 或 {@code [1-9][0-9]*}）、可选的小数部分与指数部分。
+         * 不自己扫描而直接把一段子串丢给 {@link Double#parseDouble}，
+         * 会连 {@code +1}、{@code .5}、{@code 007} 这些 JSON 不允许的形式一起收下，
+         * {@code 1e400} 还会静默变成 {@code Infinity}——后续任何比较与展示都会跟着失真。</p>
          *
          * @return 数值
          */
         private Double parseNumber() {
             int start = pos;
-            if (peek() == '-' || peek() == '+') {
+            if (peek() == '-') {
                 pos++;
             }
-            while (!atEnd()) {
-                char c = text.charAt(pos);
-                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E'
-                        || c == '+' || c == '-') {
+            char first = peek();
+            if (first == '0') {
+                pos++;
+                if (isDigit(peek())) {
+                    throw error("JSON 数值不允许多余的前导零");
+                }
+            } else if (first >= '1' && first <= '9') {
+                while (isDigit(peek())) {
                     pos++;
-                } else {
-                    break;
+                }
+            } else {
+                throw error("不是合法的 JSON 数值: 整数部分应以 0 或非零数字开头");
+            }
+            if (peek() == '.') {
+                pos++;
+                if (!isDigit(peek())) {
+                    throw error("JSON 数值的小数点后缺少数字");
+                }
+                while (isDigit(peek())) {
+                    pos++;
+                }
+            }
+            if (peek() == 'e' || peek() == 'E') {
+                pos++;
+                if (peek() == '+' || peek() == '-') {
+                    pos++;
+                }
+                if (!isDigit(peek())) {
+                    throw error("JSON 数值的指数部分缺少数字");
+                }
+                while (isDigit(peek())) {
+                    pos++;
                 }
             }
             String literal = text.substring(start, pos);
-            try {
-                return Double.valueOf(literal);
-            } catch (NumberFormatException e) {
-                throw error("不是合法的 JSON 数值: " + literal);
+            double value = Double.parseDouble(literal);
+            if (!Double.isFinite(value)) {
+                throw error("JSON 数值超出可表示范围: " + literal);
             }
+            return value;
         }
 
         /**
