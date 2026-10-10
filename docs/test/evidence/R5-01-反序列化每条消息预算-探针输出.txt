@@ -1,0 +1,10 @@
+验证对象：common.MessageFilter（每条消息独立预算的反序列化防护，D-22 / D-23 的根治）与服务端读取路径
+探针路径：/tmp/filterprobe/FilterProbe.java（探针在 /tmp 下独立编译运行，不进仓库、不属于交付源码）
+运行命令：javac -encoding UTF-8 -cp /tmp/lanchat-classes -d /tmp/filterprobe /tmp/filterprobe/FilterProbe.java && java -cp /tmp/lanchat-classes:/tmp/filterprobe FilterProbe
+运行日期：2026-10-10
+结论：3 项断言全部通过——长会话不再被累计上限误杀、合法文件分块正常、回引用放大攻击被拒
+================================================================================
+
+用例1 长会话(3000 条, 累计 1483894 字节, 单条预算 1MiB) -> 全部通过  判定=PASS
+用例2 65536 字节文件分块（流 66127 字节）-> 通过  判定=PASS
+用例3 LinkedList 100 万个回引用元素（流仅 5000047 字节）-> 被拒绝  判定=PASS

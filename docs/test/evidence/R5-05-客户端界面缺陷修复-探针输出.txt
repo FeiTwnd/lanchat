@@ -1,0 +1,41 @@
+验证对象：client.ui.ClientUI（右键/中键不弹资料卡、最小化计入未读、系统通知不计未读、未读表按用户表口径裁剪）与 client.ui.OnlineUserTree（工具提示转义）
+探针路径：/tmp/fixB-probe/probe/ProbeFixB.java（探针在 /tmp 下独立编译运行，不进仓库、不属于交付源码；探针只读取未随仓库提供的 config/chat.properties 时会在输出中打一条警告，已按纯日志噪声剔除）
+运行命令：javac -encoding UTF-8 -cp /tmp/lanchat-classes -d /tmp/fixB-probe/out /tmp/fixB-probe/probe/ProbeFixB.java && java -Duser.dir=/tmp/fixB-probe -cp /tmp/lanchat-classes:/tmp/fixB-probe/out ProbeFixB
+运行日期：2026-10-10
+结论：12 项断言全部通过（输出以“-> PASS”标记，无 FAIL）
+================================================================================
+
+准备：bob01 行号=3，行边界=java.awt.Rectangle[x=48,y=142,width=197,height=46]
+
+===== 1. 单击用户行的按键判定 =====
+1a 右键单击后 UserProfileCard.openCard=null（期望 null）-> PASS
+1b 中键单击后 openCard=null（期望 null）-> PASS
+1c 左键单击后 openCard=（已弹出资料卡）（期望非 null，回归检查）-> PASS
+
+===== 2. 私聊窗口最小化期间收消息 =====
+2a 打开窗口后 isVisible=true isShowing=true extendedState=0
+2b 最小化后 isVisible=true isShowing=true extendedState=1（ICONIFIED=1）
+2c 最小化期间来一条 -> unreadPrivate={dave=1}，标题角标=1 -> PASS
+2d 还原并打开窗口 -> unreadPrivate={}（期望清空）-> PASS
+2e 正常显示时再来一条 -> unreadPrivate={}（期望仍为空，既有口径保留）-> PASS
+
+===== 3. 离线补投气泡的右键菜单 =====
+3a erin 窗口：消息气泡=1，其中无菜单=0 -> PASS
+3b 明细：消息气泡正文=离线补投的正文，菜单=[引用]
+3c erin 未读={erin=1}，标题角标=1
+
+===== 4. 系统通知是否计入群聊未读 =====
+4a 清零后 群聊未读=0，私聊={}，标题角标=0
+4b 两条上下线系统通知 -> 群聊未读=0，标题角标=0（期望 0/0）-> PASS
+4c 一条真实群聊消息 -> 群聊未读=1，标题角标=1（期望 1，既有行为不破坏）-> PASS
+
+===== 5. 未读表与用户表口径统一 =====
+5a 名单收敛后：carol 在线=true，frank 认识=true（在离线分组），ghost 认识=false
+5b 三人各来一条私聊后 unreadPrivate={carol=1, frank=1, ghost=1}，标题角标=4
+5c 再推一次同一份名单后 unreadPrivate={carol=1, frank=1}，好友树 ghost=0，标题角标=3（ghost 应被裁掉，carol 在线 / frank 离线都应保留）-> PASS
+
+===== 6. 好友树工具提示的转义 =====
+6 bob99 工具提示=<html>&lt;html&gt;&lt;b&gt;坏昵称（bob99）· 普通用户 · 在线</html> -> PASS
+6 carol99 工具提示=<html>Carol（carol99）· 普通用户 · 在线</html> -> PASS
+
+DONE
