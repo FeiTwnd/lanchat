@@ -30,7 +30,7 @@ public final class ChatMessageFactory {
     public static final int MAX_FIELD_COUNT = 16;
 
     /**
-     * 反序列化白名单过滤器串。
+     * 反序列化白名单与结构限制过滤器串。
      *
      * <p>只放行协议真正会用到的类型：本项目消息类与服务端下发的业务类位于
      * {@code com.chat.common}；字符串、包装类型与枚举依赖 {@code java.lang}；
@@ -38,40 +38,30 @@ public final class ChatMessageFactory {
      * 保留它是为了兼容既定的过滤器基线并给后续批量消息类扩展留出余量。
      * 末尾的 {@code !*} 表示其余一律拒绝，从而阻断依赖链 gadget 类被加载。</p>
      *
-     * <p><b>关于 {@code maxbytes} 与 {@code maxrefs} 的语义（缺陷 D-22 / D-23 的修复点）</b>：
-     * 它们分别绑定 {@link java.io.ObjectInputFilter.FilterInfo#streamBytes()} 与
-     * {@link java.io.ObjectInputFilter.FilterInfo#references()}，都是同一个
-     * {@code ObjectInputStream} 上<b>累计</b>的量，<b>不是</b>单条消息的规模上限；
-     * 而且流里的 {@code TC_RESET}（由对端 {@code out.reset()} 写出）会把句柄表清空却
-     * <b>不清零这两个计数器</b>。</p>
+     * <p>{@code maxdepth} 与 {@code maxarray} 是这里的结构限制：前者限制嵌套深度，
+     * 后者限制单个数组的长度（{@code byte[]} 这类基本类型数组不受类名白名单约束，
+     * 只能靠它兜底）。</p>
      *
-     * <p>两个取值都曾经小到会在正常使用中被打满，表现为"聊着聊着突然掉线"，
-     * 且日志记的是"反序列化被白名单拒绝"，把容量问题误报成了安全问题：</p>
+     * <p><b>这里刻意不再设置 {@code maxbytes} 与 {@code maxrefs}</b>（缺陷 D-22 / D-23 及其后续）：
+     * 它们绑定的是同一个 {@code ObjectInputStream} 上的<b>累计</b>量，而不是单条消息的规模
+     * （{@link java.io.ObjectInputFilter.FilterInfo#streamBytes()} 与
+     * {@link java.io.ObjectInputFilter.FilterInfo#references()}），且流里的 {@code TC_RESET}
+     * （由对端 {@code out.reset()} 写出）会清空句柄表却<b>不清零</b>这两个计数器。于是：</p>
      * <ul>
-     *   <li>{@code maxbytes} 原为 4 MiB，而单文件上限就有
-     *       {@link Constants#MAX_FILE_SIZE}（200MB）——传完 4 MiB 之后整条连接作废（D-22）；</li>
-     *   <li>{@code maxrefs} 原为 1000，而本项目<b>每发一条消息都 {@code reset()}</b>
-     *       （见 {@code ChatClient.writeObject} 与 {@code ClientHandler.send}），
-     *       重置会让类描述符在每条消息里重发一遍，实测一条纯文本消息约耗 15 个引用，
-     *       于是<b>发到第 66 条就再也读不进任何消息</b>（D-23）。
-     *       这条比 D-22 更容易撞上：它不需要传大文件，正常聊天就能触发。</li>
+     *   <li>取小了会在正常使用中被打满——例如 {@code maxrefs=1000} 时，本项目每条消息都
+     *       {@code reset()}，实测一条纯文本消息约耗 15 个引用，<b>发到第 67 条整条连接作废</b>（D-23）；
+     *       {@code maxbytes=4MiB} 则在传完 4MiB 文件后作废（D-22）；</li>
+     *   <li>把取值抬到 1GiB / 5000 万，又等于把未认证连接变成堆耗尽入口：白名单里的
+     *       {@code java.util.LinkedList} 并不受 {@code maxarray} 约束，攻击者只要把报文里
+     *       元素个数改成 1500 万（约 71MB 流量），就能让服务端分配几百 MB 的节点并在小堆下 OOM。</li>
      * </ul>
      *
-     * <p>现取值 {@code maxbytes=1GiB}、{@code maxrefs=50000000}：两者量级对齐
-     * （本项目最省引用的文本消息约 15 个引用/485 字节，5 千万引用对应约 1 GiB 流量），
-     * 因此不会出现"字节数还没到、引用数先耗尽"这种更难排查的假象，
-     * 而两个上限都仍留着一个天花板。</p>
-     *
-     * <p>真正抵御"反序列化炸弹"的是 {@code maxdepth}（嵌套深度）与
-     * {@code maxarray}（单个数组长度）两项：炸弹的危害在于<b>用小报文膨胀出巨大的对象图</b>，
-     * 而这两点卡的正是膨胀本身，且它们每次 {@code readObject} 都会重置、不随连接时长衰减。
-     * {@code maxbytes} 与 {@code maxrefs} 是累计量，攻击者要耗尽它们只能真的把那么多字节发过来，
-     * 并不构成放大效应，故不应指望它们来防炸弹——把它们设得极小并不会更安全，
-     * 只会先把自己的长连接掐断。</p>
+     * <p>正确的做法是"每条消息独立预算"，由 {@link MessageFilter} 承担：
+     * 类型白名单与结构限制仍由本串负责，字节数与引用数的预算改成按消息计算。</p>
      */
     private static final String SERIALIZATION_FILTER_PATTERN =
             "com.chat.common.*;java.lang.*;java.time.*;java.util.*;!*;"
-                    + "maxdepth=8;maxrefs=50000000;maxbytes=1073741824;maxarray=65536";
+                    + "maxdepth=8;maxarray=65536";
 
     /** 私有构造，禁止实例化工具类 */
     private ChatMessageFactory() {
@@ -189,7 +179,11 @@ public final class ChatMessageFactory {
      * 文件数据块因此可以正常传输，而 {@code java.io.File}、{@code java.util.concurrent.*}
      * 等非协议类型会被拒绝。</p>
      *
-     * @return 可直接绑定到 {@code ObjectInputStream} 的过滤器实例
+     * <p><b>本方法只提供类型与结构限制</b>；实际绑到 {@code ObjectInputStream} 上的是
+     * {@link MessageFilter#forServerInput()} / {@link MessageFilter#forClientInput()}，
+     * 它们在白名单之外还按消息计算预算。需要"只有白名单"的场景（例如单元测试）才直接用它。</p>
+     *
+     * @return 过滤器实例，可直接绑定到 {@code ObjectInputStream}
      */
     public static ObjectInputFilter serializationFilter() {
         return ObjectInputFilter.Config.createFilter(SERIALIZATION_FILTER_PATTERN);

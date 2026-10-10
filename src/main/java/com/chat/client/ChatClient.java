@@ -143,6 +143,15 @@ public class ChatClient {
     /** 对象输入流 */
     private ObjectInputStream in;
 
+    /**
+     * 反序列化过滤器（带每条消息独立预算）。
+     *
+     * <p>保留引用是为了在每次 {@code readObject} 之前调用 {@link com.chat.common.MessageFilter#beginMessage()}
+     * 重置预算基线：不重置的话预算会退化成"整条连接累计上限"，长会话会被误判成攻击
+     * （正是缺陷 D-23 的表现）。</p>
+     */
+    private com.chat.common.MessageFilter inputFilter;
+
     /** 接收线程 */
     private Thread receiverThread;
 
@@ -359,9 +368,11 @@ public class ChatClient {
             ObjectOutputStream newOut = new ObjectOutputStream(newSocket.getOutputStream());
             newOut.flush();
             ObjectInputStream newIn = new ObjectInputStream(newSocket.getInputStream());
-            // 绑定反序列化白名单必须紧跟在创建之后：服务器返回的第一帧就可能携带恶意类型，
-            // 任意一次 readObject 之前都必须完成绑定，否则过滤器形同虚设
-            newIn.setObjectInputFilter(ChatMessageFactory.serializationFilter());
+            // 绑定反序列化过滤器必须紧跟在创建之后：服务器返回的第一帧就可能携带恶意类型，
+            // 任意一次 readObject 之前都必须完成绑定，否则过滤器形同虚设。
+            // 每次建流都新建一份，顺带让预算基线归零
+            inputFilter = com.chat.common.MessageFilter.forClientInput();
+            newIn.setObjectInputFilter(inputFilter);
             socket = newSocket;
             out = newOut;
             in = newIn;
@@ -474,6 +485,8 @@ public class ChatClient {
     private void receiveLoop() {
         try {
             while (connected) {
+                // 每条消息单独计预算：必须在 readObject 之前重置基线
+                inputFilter.beginMessage();
                 Object received = in.readObject();
                 if (received instanceof Message) {
                     handleIncoming((Message) received);

@@ -10,6 +10,8 @@ import com.chat.common.TextMessage;
 import com.chat.common.User;
 import com.chat.common.UserListCodec;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -180,7 +182,7 @@ public class ProtocolTest {
     /**
      * 头像校验的拒绝路径逐条覆盖。
      */
-    @Test("头像校验：非 PNG、截断、超大尺寸与非法 Base64 均被拒绝")
+    @Test("头像校验：非 PNG、截断、像素超限、伪文件头与非法 Base64 均被拒绝")
     public void testAvatarCodecRejectsBadInput() {
         // 用 JPEG 魔数开头：能通过 Base64 解码，但过不了 PNG 签名
         byte[] jpeg = new byte[64];
@@ -197,6 +199,10 @@ public class ProtocolTest {
         TestRunner.assertNotNull(AvatarCodec.check(
                         pngBase64(Constants.AVATAR_IMAGE_MAX_SIDE + 1, 128)),
                 "超过源图边长上限的图片应被拒绝");
+        // 边长都在上限内、只有像素总量超限：512×512 = 262144 > AVATAR_MAX_PIXELS，
+        // 这张图在只查边长的旧校验下会被放行，正是本次修复要挡的"小体积、大像素"图
+        TestRunner.assertNotNull(AvatarCodec.check(pngBase64(512, 512)),
+                "边长合规但像素总量超过上限的图片应被拒绝");
         TestRunner.assertNotNull(AvatarCodec.check("这不是 Base64!!"), "非法 Base64 应被拒绝");
         TestRunner.assertNotNull(AvatarCodec.check("A".repeat(Constants.AVATAR_MAX_LENGTH + 4)),
                 "超过长度上限的文本应被拒绝");
@@ -210,6 +216,24 @@ public class ProtocolTest {
         TestRunner.assertNotNull(AvatarCodec.check(
                         java.util.Base64.getEncoder().encodeToString(noIhdr)),
                 "缺少 IHDR 图像头的数据应被拒绝");
+
+        // 手工拼的"纯文件头"：魔数 + 块长 13 + IHDR + 96×96，没有 CRC 也没有 IDAT
+        byte[] fakeHeader = new byte[24];
+        System.arraycopy(new byte[]{(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
+                0, fakeHeader, 0, 8);
+        fakeHeader[11] = 13;
+        System.arraycopy("IHDR".getBytes(Constants.CHARSET), 0, fakeHeader, 12, 4);
+        fakeHeader[19] = (byte) Constants.AVATAR_SIDE;
+        fakeHeader[23] = (byte) Constants.AVATAR_SIDE;
+        TestRunner.assertNotNull(AvatarCodec.check(
+                        java.util.Base64.getEncoder().encodeToString(fakeHeader)),
+                "24 字节的伪 PNG 头（IHDR 块与 CRC 都不完整）应被拒绝");
+
+        // 补到 36 字节后长度这一关能过，但数据里仍没有 IDAT 图像数据，必须照样拒绝
+        byte[] fakeNoData = Arrays.copyOf(fakeHeader, 36);
+        TestRunner.assertNotNull(AvatarCodec.check(
+                        java.util.Base64.getEncoder().encodeToString(fakeNoData)),
+                "只有文件头、没有 IDAT 图像数据的数据应被拒绝");
     }
 
     /**
@@ -378,38 +402,29 @@ public class ProtocolTest {
     }
 
     /**
-     * 造一段结构合法的最小 PNG 数据（魔数 + IHDR 头 + 4 字节占位）。
+     * 造一张真实的 PNG 图片数据（Base64）。
      *
-     * <p>不含真实的图像数据：{@link AvatarCodec} 只读文件头，这正是它"不做像素级校验"
-     * 这一取舍的直接体现——被它接受的伪造数据最终只是客户端画不出来的一张图。</p>
+     * <p>为什么必须用 {@code ImageIO} 真编码，而不是手工拼一段"魔数 + IHDR + 宽高"的字节：
+     * 客户端上传的本来就是 {@code ImageIO} 编码出来的 PNG，手工拼的数据只有文件头、
+     * 既没有 IHDR 的 CRC 也没有 IDAT 图像数据，根本解码不出任何像素。拿它当"合法 PNG"
+     * 会让夹具与真实客户端行为脱节，也会让 {@link AvatarCodec} 的结构完整性校验
+     * （长度下限、块长、IDAT 存在性）失去验证对象。需要伪造或截断数据的用例，
+     * 请在那个用例里自行构造字节，不要退回手工拼接。</p>
      *
      * @param width  宽
      * @param height 高
      * @return Base64 文本
      */
     private String pngBase64(int width, int height) {
-        byte[] data = new byte[32];
-        byte[] magic = {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
-        System.arraycopy(magic, 0, data, 0, magic.length);
-        // 块长度固定写 13（IHDR 的正文长度），块类型 IHDR
-        data[11] = 13;
-        System.arraycopy("IHDR".getBytes(Constants.CHARSET), 0, data, 12, 4);
-        writeInt(data, 16, width);
-        writeInt(data, 20, height);
-        return java.util.Base64.getEncoder().encodeToString(data);
-    }
-
-    /**
-     * 按大端序写入 4 字节整数。
-     *
-     * @param data   目标数组
-     * @param offset 起始偏移
-     * @param value  写入值
-     */
-    private void writeInt(byte[] data, int offset, int value) {
-        data[offset] = (byte) ((value >>> 24) & 0xFF);
-        data[offset + 1] = (byte) ((value >>> 16) & 0xFF);
-        data[offset + 2] = (byte) ((value >>> 8) & 0xFF);
-        data[offset + 3] = (byte) (value & 0xFF);
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try {
+            if (!ImageIO.write(image, "png", buffer)) {
+                throw new IllegalStateException("运行环境缺少 PNG 编码器");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("生成测试用 PNG 失败", e);
+        }
+        return java.util.Base64.getEncoder().encodeToString(buffer.toByteArray());
     }
 }

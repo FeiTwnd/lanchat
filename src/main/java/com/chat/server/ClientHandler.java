@@ -5,6 +5,7 @@ import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.FileTransferCodec;
 import com.chat.common.Message;
+import com.chat.common.MessageFilter;
 import com.chat.common.MessageType;
 import com.chat.common.Result;
 import com.chat.common.SystemMessage;
@@ -103,6 +104,15 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     private static final String HISTORY_CURSOR_PREFIX = "#beforeId=";
 
     /**
+     * 服务端回填引用摘要时的长度上限（字符数）。
+     *
+     * <p>摘要由服务端从真实记录生成而不是采信客户端提交值：不设上限的话，
+     * 一条两千字的正文会被原样塞进引用块，之后每转发一次都多带一份完整正文。
+     * 取 100 与客户端引用条的展示宽度大致匹配（客户端自己的待引用条也是截断显示的）。</p>
+     */
+    private static final int QUOTE_SUMMARY_MAX_LENGTH = 100;
+
+    /**
      * 历史 / 搜索响应头部携带的行格式版本标记。
      *
      * <p>{@code v2} 指记录行为 {@code 时间|发送者|接收者|消息标识|内容} 五段。
@@ -141,6 +151,14 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
     /** 对象输出流，向客户端发送消息 */
     private ObjectOutputStream out;
 
+    /**
+     * 反序列化过滤器（带每条消息独立预算）。
+     *
+     * <p>保留引用是为了在每次 {@code readObject} 之前调用 {@link MessageFilter#beginMessage()}
+     * 重置预算基线：不重置的话预算会退化成"整条连接累计上限"，长会话仍会被误杀。</p>
+     */
+    private MessageFilter inputFilter;
+
     /** 发送锁 */
     private final Object sendLock = new Object();
 
@@ -178,6 +196,8 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             initStreams();
             send(ChatMessageFactory.system("", "已连接聊天服务器，请先登录。"));
             while (!closed) {
+                // 每条消息单独计预算：必须在 readObject 之前重置基线
+                inputFilter.beginMessage();
                 Object received = in.readObject();
                 if (!(received instanceof Message)) {
                     LOGGER.warning("收到非消息对象，已忽略");
@@ -216,8 +236,11 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         out.flush();
         in = new ObjectInputStream(socket.getInputStream());
         // 绑定反序列化白名单必须紧跟在创建之后：连接建立后的第一帧就可能携带恶意类型，
-        // 任何一次 readObject 之前都必须完成绑定
-        in.setObjectInputFilter(ChatMessageFactory.serializationFilter());
+        // 任何一次 readObject 之前都必须完成绑定。
+        // 用带"每条消息独立预算"的 MessageFilter 而不是只有白名单的 serializationFilter()：
+        // 后者缺少单条报文的规模上限，一个声明了上千万元素的集合就能把服务端堆撑爆
+        inputFilter = MessageFilter.forServerInput();
+        in.setObjectInputFilter(inputFilter);
         out.reset();
     }
 
@@ -287,31 +310,34 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         text.setSender(username);
-        if (text.getType() == MessageType.TEXT_GROUP) {
-            text.setReceiver("");
-            server.getUserManager().broadcastText(text);
-            saveOrWarn(text, "(群聊)");
+        // 引用三字段完全由客户端自填，必须按库里的真实记录重建后才允许转发与落库；
+        // 引用不合法时只清空引用，正文本身仍是有效聊天内容，不整条拒绝
+        TextMessage outgoing = sanitizeQuote(text);
+        if (outgoing.getType() == MessageType.TEXT_GROUP) {
+            outgoing.setReceiver("");
+            server.getUserManager().broadcastText(outgoing);
+            saveOrWarn(outgoing, "(群聊)");
             server.notify(ServerObserver.EventType.GROUP_MESSAGE,
-                    username + " 群发: " + text.getSummary());
+                    username + " 群发: " + outgoing.getSummary());
             return;
         }
-        String receiver = text.getReceiver();
+        String receiver = outgoing.getReceiver();
         if (receiver == null || receiver.isEmpty()) {
             send(ChatMessageFactory.error(username, "私聊消息缺少接收者"));
             return;
         }
         // 收件人是智能体小助手时整条转交异步问答，不再走下面的投递与落库流程
-        if (handOffToAiAssistant(text, receiver)) {
+        if (handOffToAiAssistant(outgoing, receiver)) {
             return;
         }
         // 判重必须排在投递与落库之前：网络重发会把同一条消息再次送到这里，
         // 命中后既不能再转发（接收方会重复看到一条），也不能再落库（message_id 唯一索引会插入失败）
-        String messageId = text.ensureMessageId();
+        String messageId = outgoing.ensureMessageId();
         try {
             if (server.getMessageService().existsByMessageId(messageId)) {
                 LOGGER.info(() -> "私聊消息重复，按幂等回执处理: " + username + " -> " + receiver
                         + " - " + messageId);
-                sendAck(text, ACK_DUPLICATE, "该消息此前已处理过");
+                sendAck(outgoing, ACK_DUPLICATE, "该消息此前已处理过");
                 return;
             }
         } catch (ChatException e) {
@@ -319,23 +345,23 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             // 只能回 FAILED 交由客户端重试，而不是硬着头皮转发造成重复
             LOGGER.warning(() -> "私聊消息判重失败: " + username + " -> " + receiver
                     + " - " + e.getMessage());
-            sendAck(text, ACK_FAILED, "服务器无法校验消息标识：" + e.getMessage());
+            sendAck(outgoing, ACK_FAILED, "服务器无法校验消息标识：" + e.getMessage());
             return;
         }
-        boolean delivered = server.getUserManager().sendTo(receiver, text);
+        boolean delivered = server.getUserManager().sendTo(receiver, outgoing);
         // 入库不再以“送达成功”为前提：接收方离线时这条记录正是补投的唯一依据
-        Result<Boolean> saved = server.getMessageService().saveMessage(text);
+        Result<Boolean> saved = server.getMessageService().saveMessage(outgoing);
         if (!saved.isSuccess()) {
             // 送达与入库必须同时成立才算成功。只送达而未入库时，接收方事后补拉历史会看不到这条，
             // 因此按契约回 FAILED（即便消息实际已被转发出去），由客户端重试
             LOGGER.warning(() -> "私聊消息入库失败: " + username + " -> " + receiver
                     + "，实际已送达=" + delivered + " - " + saved.getMessage());
-            sendAck(text, ACK_FAILED, "服务器未能写入聊天记录：" + saved.getMessage());
+            sendAck(outgoing, ACK_FAILED, "服务器未能写入聊天记录：" + saved.getMessage());
             return;
         }
         if (!delivered) {
             LOGGER.info(() -> "私聊消息接收方离线，已入库待补投: " + username + " -> " + receiver);
-            sendAck(text, ACK_OFFLINE, "接收方不在线，消息将在其上线后补投");
+            sendAck(outgoing, ACK_OFFLINE, "接收方不在线，消息将在其上线后补投");
             // 保留这条可见错误提示：旧版客户端不认识 MSG_ACK，只能靠它得知消息没有立即送达；
             // 文案同步改为“已存入离线队列”，否则会与 OFFLINE 回执的语义自相矛盾
             send(ChatMessageFactory.error(username,
@@ -343,13 +369,86 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         markDeliveredQuietly(messageId, receiver);
-        sendAck(text, ACK_DELIVERED, "");
+        sendAck(outgoing, ACK_DELIVERED, "");
         // 回执给发送方，使其界面确认消息已发出
-        TextMessage echo = ChatMessageFactory.text(username, username, text.getSummary(),
+        TextMessage echo = ChatMessageFactory.text(username, username, outgoing.getSummary(),
                 MessageType.TEXT_PRIVATE);
         send(echo);
         server.notify(ServerObserver.EventType.PRIVATE_MESSAGE,
-                username + " -> " + receiver + ": " + text.getSummary());
+                username + " -> " + receiver + ": " + outgoing.getSummary());
+    }
+
+    /**
+     * 用库里的真实记录重建客户端提交的引用信息。
+     *
+     * <p><b>为什么必须重建</b>：{@code quoteId}、{@code quoteSummary}、{@code quoteSender}
+     * 三个字段全部由发送方填写，服务端此前只覆盖了 sender。于是任何人都能构造一条
+     * "引用了某内容"的消息，把与自己无关的话挂到别人名下（例如谎称某人说过某句话），
+     * 而这两个文本字段既没有长度上限、也没有对应的数据库列可供事后核对。</p>
+     *
+     * <p><b>为什么是新建对象而不是回填</b>：{@link TextMessage} 的三个引用字段都是 final
+     * （类注释明确写着"构造后不可修改、可安全跨线程传递引用"），只能在构造时给定。
+     * 因此这里新建一个对象，并把可变的报文字段（编号、稳定标识、类型、时间戳）原样搬过去，
+     * 保持消息在客户端侧的定位与去重行为不变。</p>
+     *
+     * <p><b>可见性判定</b>：被引用消息必须是请求者参与过的——本人发送、发给本人，
+     * 或广播（群聊）消息也可引。查不到、越权或缺少标识时一律<b>清空引用</b>，
+     * 而不是放行客户端给的文本；此时整条消息照常转发，不会因为引用不合法而拒收正文。</p>
+     *
+     * <p><b>回填取值</b>：摘要取自真实消息正文（压成单行后按
+     * {@link #QUOTE_SUMMARY_MAX_LENGTH} 截断），发送者取库里的用户名而不是昵称——
+     * 昵称可被本人随时修改，用户名才是这条记录里不可伪造的身份。</p>
+     *
+     * <p>没有引用时原样返回同一个实例，不改变既有行为。</p>
+     *
+     * @param source 客户端提交的文本消息（sender 已由服务端覆盖为登录用户名）
+     * @return 引用已核实的消息；无引用或引用不合法时返回不带引用的消息
+     */
+    private TextMessage sanitizeQuote(TextMessage source) {
+        if (!source.hasQuote()) {
+            return source;
+        }
+        String quoteId = source.getQuoteId();
+        Message original = null;
+        if (!quoteId.isEmpty()) {
+            try {
+                original = server.getMessageService().findByMessageId(quoteId);
+            } catch (ChatException e) {
+                LOGGER.warning(() -> "引用校验查询原消息失败，本次引用已清空: " + username
+                        + " - " + quoteId + " - " + e.getMessage());
+            }
+        }
+        boolean quotable = original != null
+                && (username.equals(original.getSender())
+                || username.equals(original.getReceiver())
+                || original.isBroadcast());
+        TextMessage rebuilt;
+        if (quotable) {
+            rebuilt = new TextMessage(source.getSender(), source.getReceiver(), source.getContent(),
+                    quoteId, quoteSummaryOf(original), original.getSender());
+        } else {
+            LOGGER.info(() -> "引用未通过服务端校验，已清空: " + username + " - " + quoteId);
+            rebuilt = new TextMessage(source.getSender(), source.getReceiver(), source.getContent());
+        }
+        // 编号、稳定标识与时间戳必须照搬：客户端靠它们给本地那条消息定位、去重与装右键菜单
+        rebuilt.setId(source.getId());
+        rebuilt.setMessageId(source.getMessageId());
+        rebuilt.setType(source.getType());
+        rebuilt.setTimestamp(source.getTimestamp());
+        return rebuilt;
+    }
+
+    /**
+     * 生成引用摘要：取真实消息的正文，压成单行后截断。
+     *
+     * @param original 已通过可见性校验的原始消息
+     * @return 单行摘要，最长 {@link #QUOTE_SUMMARY_MAX_LENGTH} 个字符
+     */
+    private static String quoteSummaryOf(Message original) {
+        // 复用导出渲染用的正文提取：它已处理文本/文件/系统三类消息，并把换行折成空格
+        String text = MessageExporter.contentOf(original);
+        return text.length() <= QUOTE_SUMMARY_MAX_LENGTH
+                ? text : text.substring(0, QUOTE_SUMMARY_MAX_LENGTH);
     }
 
     /**
@@ -497,6 +596,13 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
         String receiver = fileMessage.getReceiver();
         if (receiver == null || receiver.isEmpty()) {
             send(ChatMessageFactory.error(username, "文件消息缺少接收者"));
+            return;
+        }
+        // 虚拟成员（小助手）的用户名是两位，不满足真人用户名规则，走到下面会被报成
+        // "用户名格式不正确"——那是协议层的措辞，使用者看到只会一头雾水。
+        // 这里先给出明确原因，拒绝的结论保持不变：机器人没有连接，也收不了文件。
+        if (Constants.AI_USERNAME.equals(receiver)) {
+            rejectFileMessage(fileMessage, "小助手只支持文字问答，不能接收文件");
             return;
         }
         if (fileMessage.getTransferId() == null || fileMessage.getTransferId().isEmpty()
@@ -1357,7 +1463,13 @@ public class ClientHandler extends AbstractMessageHandler implements Runnable {
             return;
         }
         String peer = parts.length > 3 ? parts[3].trim() : "";
-        if (!peer.isEmpty() && !USERNAME_PATTERN.matcher(peer).matches()) {
+        // 虚拟成员（小助手）的用户名是两位，本就不符合真人账号的用户名规则，却是合法的会话对端：
+        // 客户端一打开它的会话窗口就会自动补拉历史、翻页时也会再查一次，若在这里按真人规则拒绝，
+        // 使用者每开一次窗口都会收到一个"会话对象用户名非法"的弹窗。
+        // 放行是安全的：查询范围始终被限制在"本人收发的记录"内，而与小助手的对话根本不会入库，
+        // 因此放行的结果只是一页空记录。
+        boolean virtualMember = Constants.AI_USERNAME.equals(peer);
+        if (!peer.isEmpty() && !virtualMember && !USERNAME_PATTERN.matcher(peer).matches()) {
             LOGGER.warning(() -> "历史查询会话对象非法，已拒绝: " + username + " - " + peer);
             sendHistoryError("会话对象用户名非法");
             return;
