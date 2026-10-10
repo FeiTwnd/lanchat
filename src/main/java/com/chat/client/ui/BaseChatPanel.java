@@ -36,7 +36,6 @@ import javax.swing.SwingUtilities;
 import javax.swing.TransferHandler;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
-import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DefaultEditorKit;
 import java.awt.BorderLayout;
@@ -563,22 +562,19 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
      * 图片只是"内容恰好是图片的文件"。再定义一套图片消息只会让服务端多一条需要维护的路径，
      * 而使用者的体验没有任何区别。</p>
      *
-     * <p>过滤器按 {@link Constants#IMAGE_EXTENSIONS} 限定常见图片类型，同时保留
-     * "所有文件"选项：使用者把 {@code .webp} 之类改名成 {@code .jpg} 时，
-     * 一刀切地拦下反而更让人困惑；真正的类型判断在接收端由打开图片的程序负责。</p>
+     * <p>扩展名按 {@link Constants#IMAGE_EXTENSIONS} 限定常见图片类型，选到别的类型会提示后放弃：
+     * 系统原生对话框在 Windows 下无法按类型过滤（见 {@link NativeFileDialog}），只能事后把关，
+     * 否则"发送图片"按钮选出一个文档并把它当图片发出去，使用者只会觉得莫名其妙。</p>
+     *
+     * <p>只校验扩展名、不校验真实格式：使用者把 {@code .webp} 之类改名成 {@code .jpg} 时
+     * 仍能发出去，真正能不能显示由接收端打开图片的程序负责——一刀切地按内容拦下反而更让人困惑。</p>
      */
     protected void chooseAndSendImage() {
         if (!hasSendTarget()) {
             reportNoTarget();
             return;
         }
-        java.util.List<String> extensions = new ArrayList<>();
-        for (String extension : Constants.IMAGE_EXTENSIONS) {
-            extensions.add(extension);
-        }
-        String[] names = extensions.toArray(new String[0]);
-        File file = chooseFile("选择要发送的图片",
-                new FileNameExtensionFilter("图片文件 (" + String.join("、", names) + ")", names));
+        File file = chooseFile("选择要发送的图片", Constants.IMAGE_EXTENSIONS);
         if (file != null) {
             sendFileTo(file);
         }
@@ -587,21 +583,15 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     /**
      * 弹出文件选择框。
      *
-     * @param title  对话框标题
-     * @param filter 文件类型过滤器；为 null 表示不限制类型
+     * <p>走系统原生对话框（见 {@link NativeFileDialog}），初始目录交给系统决定：
+     * 聊天窗口的使用者上一次发文件可能在任何一个目录，主窗口没有理由替他指定一个。</p>
+     *
+     * @param title      对话框标题
+     * @param extensions 允许的扩展名；为 null 表示不限制类型
      * @return 选中的文件；取消或未选中文件时返回 null
      */
-    private File chooseFile(String title, FileNameExtensionFilter filter) {
-        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
-        chooser.setDialogTitle(title);
-        chooser.setFileSelectionMode(javax.swing.JFileChooser.FILES_ONLY);
-        if (filter != null) {
-            chooser.setFileFilter(filter);
-        }
-        if (chooser.showOpenDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) {
-            return null;
-        }
-        File file = chooser.getSelectedFile();
+    private File chooseFile(String title, String[] extensions) {
+        File file = NativeFileDialog.open(this, title, null, extensions);
         return file != null && file.isFile() ? file : null;
     }
 

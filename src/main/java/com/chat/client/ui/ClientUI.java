@@ -20,7 +20,6 @@ import com.chat.util.MessageExporter;
 
 import javax.swing.BorderFactory;
 import javax.swing.JDialog;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -77,7 +76,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>未读提示：</p>
  * <ul>
- *   <li>私聊与群聊都遵循"窗口没打开就只累计未读、不主动弹窗"，否则未读永远来不及累计；</li>
+ *   <li>私聊与群聊都遵循"窗口没打开（含已最小化）就只累计未读、不主动弹窗"，
+ *       否则未读永远来不及累计；</li>
  *   <li>私聊未读画在好友树对应用户行的右端，群聊未读写在群聊入口按钮上；</li>
  *   <li>两者的合计画在标题栏角标上，打开对应窗口即清零。</li>
  * </ul>
@@ -297,12 +297,18 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         userTree.addMouseListener(new MouseAdapter() {
 
             /**
-             * 单击查看资料卡，双击打开私聊窗口。
+             * 左键单击查看资料卡，左键双击打开私聊窗口。
+             *
+             * <p>只认左键：右键与中键在这里既不是"看看这个人是谁"，也不是"打开会话"，
+             * 一并处理的话，使用者按键做别的动作时会被一张自己没要的卡片或窗口打断。</p>
              *
              * @param e 鼠标事件
              */
             @Override
             public void mouseClicked(MouseEvent e) {
+                if (e.getButton() != MouseEvent.BUTTON1) {
+                    return;
+                }
                 if (e.getClickCount() == 2) {
                     // 双击的第一下已经排了一个待弹的资料卡，这里必须先撤掉，
                     // 否则"双击打开私聊"会顺带弹出一张停在屏幕上的资料卡
@@ -652,6 +658,9 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
      * 与 {@link #openGroupWindow(boolean)} 的语义完全一致：不主动弹出窗口打扰使用者，
      * 否则私聊未读永远来不及累计就会被"消息一到就置顶窗口"抹平。</p>
      *
+     * <p>"没在看"的判据是"未显示<b>或</b>已最小化"：最小化之后 {@code isVisible()} 依然为 true，
+     * 只判可见与否会把最小化的窗口当成"使用者正盯着这个会话"，对方连发的消息便都不计未读。</p>
+     *
      * @param username 对方用户名
      * @param show     是否显示并置顶窗口
      * @return 私聊窗口
@@ -686,7 +695,11 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                 window.setVisible(true);
             }
             window.toFront();
-        } else if (!window.isVisible()) {
+        } else if (!window.isShowing()
+                || (window.getExtendedState() & java.awt.Frame.ICONIFIED) != 0) {
+            // 判据不能只看 isVisible()：AWT 里窗口最小化后它仍然为 true，
+            // 于是"开着私聊窗口最小化去干别的"会被当成"使用者正在看这个会话"，
+            // 对方连发的消息一条都不计未读，界面毫无变化
             addPrivateUnread(username);
         }
         // 会话窗口可能在两次用户列表刷新之间被创建，新建时必须按当前名单补一次可发送状态，
@@ -825,6 +838,15 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             // 群聊同样有"导出这一段对话"的需求，但群聊没有历史补拉通道（服务端不提供
             // 群聊分页），因此这条工具条上只有导出
             groupWindow.getPanel().add(buildConversationTools(null, true), BorderLayout.NORTH);
+            // 最小化的群聊窗口同样计未读（见 groupPanel），因此必须有"使用者回到窗口"
+            // 这条路来清零：直接在任务栏点开窗口不经过本方法，只靠按钮清零会让角标一直挂着
+            groupWindow.addWindowFocusListener(new java.awt.event.WindowAdapter() {
+                @Override
+                public void windowGainedFocus(java.awt.event.WindowEvent event) {
+                    unreadGroupCount = 0;
+                    updateGroupButtonText();
+                }
+            });
         }
         if (show) {
             unreadGroupCount = 0;
@@ -838,18 +860,36 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
     }
 
     /**
-     * 获取群聊面板，窗口未打开时只把消息缓存进面板并累计未读条数。
+     * 获取计入未读的群聊面板：窗口未打开时只把消息缓存进面板并累计未读条数。
+     *
+     * <p>只有真正的群聊文本消息（{@code TEXT_GROUP}）才走这里。系统通知与错误提示走
+     * {@link #groupPanelNoUnread()}：它们不是"有人对你说话"，若一并计成未读，
+     * 局域网里任意一次上线/下线都会把"群聊大厅（N 条未读）"和标题栏的合计角标顶起来，
+     * 而使用者翻遍群聊也找不到对应的内容，只能靠反复开关窗口消除。</p>
      *
      * <p>本方法必须在事件分发线程调用（调用点均已通过 {@link BaseUI#onEdt(Runnable)} 调度）。</p>
      *
      * @return 群聊面板
      */
     private GroupChatPanel groupPanel() {
-        openGroupWindow(false);
-        if (!groupWindow.isVisible()) {
+        GroupChatPanel panel = groupPanelNoUnread();
+        // 判据与私聊窗口一致（见 privateWindowFor）：窗口最小化时 isVisible() 仍为 true，
+        // 只靠它判断会让"把群聊窗口最小化去干别的"这段时间的消息一条都不计未读
+        if (!groupWindow.isShowing()
+                || (groupWindow.getExtendedState() & java.awt.Frame.ICONIFIED) != 0) {
             unreadGroupCount++;
             updateGroupButtonText();
         }
+        return panel;
+    }
+
+    /**
+     * 获取不计未读的群聊面板：消息照常缓存进面板，但不改变群聊未读条数。
+     *
+     * @return 群聊面板
+     */
+    private GroupChatPanel groupPanelNoUnread() {
+        openGroupWindow(false);
         return groupWindow.getPanel();
     }
 
@@ -1268,16 +1308,17 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
     /**
      * 询问导出文件保存到哪个目录、叫什么名字。
      *
-     * <p>JFileChooser 自带的保存对话框既能改文件名也能换目录，正是"存到哪、叫什么都由我决定"
-     * 需要的两件事，不必自己再拼一个输入框。选中已存在的文件时会先问一句是否覆盖：
-     * 覆盖是不可逆的，而文件选择器本身不会替我们拦这一下。</p>
+     * <p>用系统原生的保存对话框（见 {@link NativeFileDialog}）：它既能改文件名也能换目录，
+     * 正是"存到哪、叫什么都由我决定"需要的两件事，不必自己再拼一个输入框。
+     * 保存前会先问一句是否覆盖已有文件：覆盖是不可逆的，
+     * 而文件选择器只负责选路径，不会替我们拦这一下。</p>
      *
-     * <p>对话框的宿主传 null 而不是主窗口：发起导出的是聊天窗口，
+     * <p>对话框的宿主刻意传 null 而不是主窗口：发起导出的是聊天窗口，
      * 主窗口可能被它挡在后面，把对话框挂在主窗口上会连对话框一起藏到后面去，
-     * 使用者看到的就是"点了导出没反应"。无宿主的对话框由系统居中显示，不会藏。</p>
+     * 使用者看到的就是"点了导出没反应"。无宿主的对话框由系统自己挑宿主并居中显示，不会藏。</p>
      *
      * @param label 会话名称，用于标题与默认文件名
-     * @return 目标文件；使用者取消或选择覆盖时返回 null
+     * @return 目标文件；使用者取消或选择不覆盖时返回 null
      */
     private File chooseExportTarget(String label) {
         // 默认文件名带上会话标识与时间戳：导出一段对话可能连做几次，
@@ -1294,14 +1335,7 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             LOGGER.log(java.util.logging.Level.FINE, "创建导出目录失败: " + dir, e);
             dir = new File(System.getProperty("user.home", "."));
         }
-        JFileChooser chooser = new JFileChooser(dir);
-        chooser.setDialogTitle("保存" + label + "到");
-        chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
-        chooser.setSelectedFile(new File(dir, suggested));
-        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) {
-            return null;
-        }
-        File target = chooser.getSelectedFile();
+        File target = NativeFileDialog.save(null, "保存" + label + "到", dir, suggested);
         if (target == null) {
             return null;
         }
@@ -1446,6 +1480,12 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                 AvatarFactory.putAvatar(user.getUsername(), user.getAvatar());
             }
             int count = userTree.update(users);
+            // 未读表必须按"树上认识谁"（在线 ∪ 离线）裁剪：被服务器删掉、或从未出现在任何一份
+            // 名单里的用户名既画不出红点，又会被 refreshUnreadBadges 整份灌回树里并计入标题栏合计，
+            // 让角标长期虚高且清不掉。真正生效的裁剪在这里，树内部那次清理只保证自己那份副本不残留
+            if (unreadPrivate.keySet().removeIf(username -> userTree.findUser(username) == null)) {
+                refreshUnreadBadges();
+            }
             boolean admin = isAdmin();
             refreshSelfHeader();
             headerMeta.setText((admin ? "管理员" : "普通用户")
@@ -1516,7 +1556,9 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                 break;
             case SYSTEM:
                 onEdt(() -> {
-                    groupPanel().onMessage(message);
+                    // 上下线、删除用户结果这类通知只进群聊窗口与状态栏，不计未读：
+                    // 未读应该表示"有你没看到的聊天内容"，而不是"名单动过"
+                    groupPanelNoUnread().onMessage(message);
                     statusLabel.setText(message.getSummary());
                     // 删除用户是唯一由设置窗口发起、结果走系统消息回来的操作，
                     // 结果也贴回发起它的那个窗口，否则使用者点完删除只能盯着主窗口状态栏
@@ -1528,7 +1570,8 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                 break;
             case ERROR:
                 onEdt(() -> {
-                    groupPanel().onMessage(message);
+                    // 与系统通知同理：错误提示不是群聊内容，不计未读，避免标题角标挂上清不掉的数字
+                    groupPanelNoUnread().onMessage(message);
                     statusLabel.setText(message.getSummary());
                     // 发送方界面上消息已经回显，若把"未送达"之类的错误只写进状态栏，
                     // 使用者会误以为对方收到了，因此这里必须弹窗明确提示
@@ -2083,18 +2126,6 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
     }
 
     /**
-     * 登记一个刚发生的气泡，供撤回时定位。
-     *
-     * @param messageId 稳定消息标识
-     * @param peer      对端用户名
-     * @param content   消息正文
-     * @param mine      是否本人发送
-     */
-    private void rememberBubble(String messageId, String peer, String content, boolean mine) {
-        rememberBubbleAt(messageId, peer, false, content, mine, null);
-    }
-
-    /**
      * 登记一个气泡，供撤回时定位。
      *
      * <p>时刻来源有两处，都必须按"这在客户端看来是多久以前"归一：实时消息取本机当前时刻，
@@ -2221,6 +2252,10 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             return;
         }
         if (reconnecting) {
+            // 必须先撤掉上一次"已恢复"留下的自动隐藏计时器：它 3 秒后无条件 dismiss，
+            // 若断线恰好发生在恢复后 3 秒内，红色重连横幅会被那次计时提前收走，
+            // 而下一轮重连回调要等退避时间（最长 30 秒）才来，使用者会以为已经连上了
+            stopBannerTimer();
             // 文案直接用回调带来的原因：服务端/网络层已经把它写成"…，正在重连（第 n 次）"，
             // 界面再拼一次次数只会两处口径
             banner.showReconnecting(reason);
@@ -2228,6 +2263,7 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
             return;
         }
         // 走到这里说明是终态断开，紧接着就会退出程序，横幅只是兜底不留残影
+        stopBannerTimer();
         bannerWasReconnecting = false;
         banner.dismiss();
     }
@@ -2238,12 +2274,23 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
      * <p>每次重新计时前先停掉上一个，避免连续两次重连恢复时第一个计时器提前把第二个横幅收掉。</p>
      */
     private void startBannerTimer() {
-        if (bannerTimer != null) {
-            bannerTimer.stop();
-        }
+        stopBannerTimer();
         bannerTimer = new Timer(3000, event -> banner.dismiss());
         bannerTimer.setRepeats(false);
         bannerTimer.start();
+    }
+
+    /**
+     * 停掉恢复横幅的自动隐藏计时器。
+     *
+     * <p>横幅一旦被别的状态接管，旧计时器就失去了意义；不主动停掉的话它会照常到点执行隐藏，
+     * 把当前正该显示的横幅一起收掉。</p>
+     */
+    private void stopBannerTimer() {
+        if (bannerTimer != null) {
+            bannerTimer.stop();
+            bannerTimer = null;
+        }
     }
 
     /**

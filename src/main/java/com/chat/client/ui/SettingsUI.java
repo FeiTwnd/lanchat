@@ -10,13 +10,11 @@ import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
 import javax.imageio.stream.ImageInputStream;
 import javax.swing.BorderFactory;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
-import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -454,18 +452,13 @@ public class SettingsUI extends BaseUI {
 
     /**
      * 选择一张本地图片作为头像。
+     *
+     * <p>用系统原生对话框（见 {@link NativeFileDialog}）：换头像是"随手挑一张图"的动作，
+     * 使用者对系统自己的选图窗口最熟悉；扩展名限制交给它顺带校验，
+     * 图片能不能解码仍由 {@link #encodeAvatar(File)} 说了算。</p>
      */
     private void chooseAvatar() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("选择头像图片");
-        chooser.setAcceptAllFileFilterUsed(true);
-        chooser.setFileFilter(new FileNameExtensionFilter(
-                "图片文件 (" + String.join("/", Constants.IMAGE_EXTENSIONS) + ")",
-                Constants.IMAGE_EXTENSIONS));
-        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
-            return;
-        }
-        File file = chooser.getSelectedFile();
+        File file = NativeFileDialog.open(this, "选择头像图片", null, Constants.IMAGE_EXTENSIONS);
         if (file == null) {
             return;
         }

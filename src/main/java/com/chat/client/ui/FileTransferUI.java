@@ -8,7 +8,6 @@ import com.chat.common.FileMessage;
 import com.chat.common.MessageType;
 import com.chat.util.FileUtil;
 
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
@@ -186,13 +185,14 @@ public class FileTransferUI extends BaseUI {
 
     /**
      * 弹出文件选择对话框。
+     *
+     * <p>用系统原生对话框（见 {@link NativeFileDialog}）：使用者在别的软件里
+     * 天天见到的就是这个窗口，不必在本程序里重新学一遍怎么找文件。</p>
      */
     private void chooseFile() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("选择要发送的文件");
-        chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
-        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-            selectedFile = chooser.getSelectedFile();
+        File file = NativeFileDialog.open(this, "选择要发送的文件", null, null);
+        if (file != null && file.isFile()) {
+            selectedFile = file;
             fileLabel.setText("已选择: " + selectedFile.getName()
                     + "（" + FileUtil.humanSize(selectedFile.length()) + "）");
             appendLog("已选择文件 " + selectedFile.getAbsolutePath());

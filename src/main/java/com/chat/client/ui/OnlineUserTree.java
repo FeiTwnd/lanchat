@@ -122,9 +122,10 @@ public class OnlineUserTree extends JTree {
         for (String username : current) {
             offline.remove(username);
         }
-        // 未读表与在线/离线表是两套数据，必须跟着一起清理：
-        // 用户离线后被管理员删除时就再也不会出现在任何一张表里，
-        // 残留的计数既画不出红点，又会让标题栏的合计角标长期虚高
+        // 未读表与在线/离线表是两套数据，这里先清掉树自己那份副本里的孤儿条目：
+        // 它们既画不出红点，又会随下一次 setUnread 被整份灌回来。真正生效的裁剪在
+        // ClientUI.refreshUserList 里（按"树上认识谁"裁剪 unreadPrivate 再刷新角标），
+        // 本行只保证 update 之后树上不会残留一个查不到主人的计数
         unread.keySet().removeIf(username -> !online.containsKey(username)
                 && !offline.containsKey(username));
         rebuild();
@@ -133,6 +134,12 @@ public class OnlineUserTree extends JTree {
 
     /**
      * 设置各用户的私聊未读条数。
+     *
+     * <p><b>为什么必须连带重建节点</b>：角标是画在行尾之外的，渲染器的
+     * {@code getPreferredSize} 会为它预留宽度，但行宽早已按"没有角标"的尺寸算好并缓存在
+     * 树里——只 {@code repaint()} 的话，角标会直接压在正文末尾（例如"账号 · 角色 · 在线"
+     * 那几个字上）。实测 {@code revalidate()} 与 {@code doLayout()} 都改不了已缓存的行宽，
+     * 只有 {@link #rebuild()}（内部 {@code model.reload()} 后重新展开）会让尺寸重新计算。</p>
      *
      * @param counts 用户名 -> 未读条数；计数为 0 或负数的条目会被忽略
      */
@@ -145,7 +152,7 @@ public class OnlineUserTree extends JTree {
                 }
             }
         }
-        repaint();
+        rebuild();
     }
 
     /**
@@ -462,7 +469,10 @@ public class OnlineUserTree extends JTree {
                         + HtmlEscape.escape(user.getUsername()) + " · " + role + " · " + state
                         + "</font></body></html>");
                 setIcon(AvatarFactory.avatar(user.getUsername(), entry.online, user.isAdmin(), 34));
-                setToolTipText(nickname + "（" + user.getUsername() + "）· " + role + " · " + state);
+                // 提示与正文走同一套转义：昵称以 "<html>" 开头时，不转义会让整条提示被当成
+                // 富文本解析（工具提示没有换行余地，因此用 oneLine 连换行一起折掉）
+                setToolTipText("<html>" + HtmlEscape.oneLine(nickname + "（" + user.getUsername()
+                        + "）· " + role + " · " + state) + "</html>");
                 // 未读只认树上的那份数据：渲染器自己不保存任何计数，避免与树的状态各记一份
                 if (tree instanceof OnlineUserTree) {
                     unreadCount = ((OnlineUserTree) tree).unreadCount(user.getUsername());
