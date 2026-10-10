@@ -256,10 +256,10 @@ public class IntegrationTest {
         connectWithBuffer("alice01");
         connectWithBuffer("bob01");
         Message list = bufferOf("bob01").await(message -> message.getType() == MessageType.USER_LIST
-                && message.getSummary().contains("alice01") && message.getSummary().contains("bob01"), 5000);
+                && payloadOf(message).contains("alice01") && payloadOf(message).contains("bob01"), 5000);
         TestRunner.assertNotNull(list, "bob 应收到包含两名在线用户的列表");
         TestRunner.assertTrue(bufferOf("alice01").await(message -> message.getType() == MessageType.USER_LIST
-                        && message.getSummary().contains("bob01"), 5000) != null,
+                        && payloadOf(message).contains("bob01"), 5000) != null,
                 "alice 也应收到包含 bob01 的最新列表");
     }
 
@@ -415,8 +415,10 @@ public class IntegrationTest {
                 "bob 断开后服务器在线人数应降为 1");
         // 必须从连接时就注册的缓冲监听器里检索：下线广播与系统通知往往在断言开始等待前就已到达，
         // 若在此处才注册监听器会稳定地错过消息（这是本用例此前偶发失败的根因）
+        // 列表内容同样要用完整正文判断：getSummary() 只取前 30 字符，而名单按用户名排序后
+        // 虚拟成员 ai 排在最前，截断后的摘要里根本不会出现后面那些用户名
         Message list = bufferOf("alice01").await(message -> message.getType() == MessageType.USER_LIST
-                && !message.getSummary().contains("bob01") && message.getSummary().contains("alice01"),
+                && !payloadOf(message).contains("bob01") && payloadOf(message).contains("alice01"),
                 5000);
         TestRunner.assertNotNull(list, "alice 应收到不含 bob01 的最新用户列表");
 
@@ -674,20 +676,28 @@ public class IntegrationTest {
     }
 
     /**
-     * 造一段结构合法的最小 PNG 数据（魔数 + IHDR），用于头像链路测试。
+     * 造一段结构完整的 PNG 数据（真实编码出来的 96×96 图片），用于头像链路测试。
+     *
+     * <p>为什么必须是"真 PNG"：服务端只放行带 IDAT 图像数据的 PNG，
+     * 手工拼出来的文件头会被当成伪造数据拒绝，测试也就测不到头像链路本身。</p>
      *
      * @return Base64 文本
      */
     private String sampleAvatar() {
-        byte[] data = new byte[32];
-        byte[] magic = {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
-        System.arraycopy(magic, 0, data, 0, magic.length);
-        data[11] = 13;
-        System.arraycopy("IHDR".getBytes(Constants.CHARSET), 0, data, 12, 4);
-        // 96×96，大端序写入
-        data[19] = (byte) Constants.AVATAR_SIDE;
-        data[23] = (byte) Constants.AVATAR_SIDE;
-        return java.util.Base64.getEncoder().encodeToString(data);
+        // 用 ImageIO 真实编码一张 96×96 的 PNG，而不是手工拼魔数与 IHDR：
+        // 服务端 AvatarCodec 会拒绝"只有文件头、没有任何 IDAT 图像数据"的伪造数据，
+        // 手工拼的头正是这种形态。真实编码的字节里 IHDR/IDAT/IEND 齐全，
+        // 无论校验规则再加多少条，都不会因为"测试造的数据不像 PNG"而误报
+        java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(
+                Constants.AVATAR_SIDE, Constants.AVATAR_SIDE,
+                java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        java.io.ByteArrayOutputStream encoded = new java.io.ByteArrayOutputStream();
+        try {
+            javax.imageio.ImageIO.write(image, "png", encoded);
+        } catch (IOException e) {
+            throw new IllegalStateException("测试头像编码失败", e);
+        }
+        return java.util.Base64.getEncoder().encodeToString(encoded.toByteArray());
     }
 
     /**

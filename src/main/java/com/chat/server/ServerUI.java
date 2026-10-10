@@ -225,7 +225,10 @@ public class ServerUI extends BaseUI implements ServerObserver {
                         user.isAdmin() ? "管理员" : "普通用户",
                         handler == null ? "-" : handler.getRemoteAddress()});
             }
-            onlineLabel.setText("在线人数: " + users.size());
+            // 表格与人数刻意不同口径：表格里要能看到虚拟成员（小助手），
+            // 而"在线人数"指的是真实连接数——否则只有小助手在线时控制台显示"在线 1 人"，
+            // 与局域网发现应答、客户端好友树给出的说法对不上
+            onlineLabel.setText("在线人数: " + server.getUserManager().size());
         });
     }
 

@@ -13,6 +13,8 @@ import com.chat.util.SecurityUtil;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -40,6 +42,24 @@ public class UserService {
 
     /** 用户名格式校验器 */
     private static final Pattern USERNAME_PATTERN = Pattern.compile(Constants.USERNAME_PATTERN);
+
+    /**
+     * 系统保留用户名（存小写，比较时统一转小写）。
+     *
+     * <p><b>为什么必须显式拒绝，而不能只靠格式规则</b>：{@code ALL} 与 {@code SYSTEM}
+     * 都符合 {@link Constants#USERNAME_PATTERN}，却与协议里两个固定标识重名——
+     * {@code @ALL} 是导出范围中的"群聊大厅"（见 {@link Constants#BROADCAST_SCOPE}），
+     * {@code SYSTEM} 是系统消息的固定发送者（见 {@link Constants#SYSTEM_SENDER}）。
+     * 允许注册就会产生二义：导出"群聊"时可能导出一个真人账号的全套记录，
+     * 界面上的"SYSTEM"也可能指向某个普通用户而不是系统通知。</p>
+     *
+     * <p>{@code ai} 目前因不足 3 位已被用户名规则挡下，仍一并列入：规则一旦放宽，
+     * 这一行就是唯一还能拦住"真人占用智能体小助手用户名"的闸门。</p>
+     *
+     * <p>集合刻意放在本类内部而不是 {@link Constants}：它是一条注册业务规则，
+     * 与协议常量无关，放进去反而会让常量类承担业务判断。</p>
+     */
+    private static final Set<String> RESERVED_USERNAMES = Set.of("all", "system", "ai");
 
     /** 同一账号连续登录失败的最大次数，超过后开始锁定 */
     private static final int MAX_LOGIN_FAILURES = 5;
@@ -115,8 +135,9 @@ public class UserService {
     /**
      * 注册新用户。
      *
-     * <p>业务规则：用户名需匹配 {@link Constants#USERNAME_PATTERN} 且全局唯一；
-     * 密码长度 6-32；昵称为空时默认取用户名；密码仅以“盐 + 散列”形式落盘。</p>
+     * <p>业务规则：用户名需匹配 {@link Constants#USERNAME_PATTERN}、不是系统保留字
+     * （见 {@link #RESERVED_USERNAMES}）且全局唯一；密码长度 6-32；昵称为空时默认取用户名；
+     * 密码仅以“盐 + 散列”形式落盘。</p>
      *
      * @param username 用户名
      * @param password 明文密码
@@ -499,6 +520,9 @@ public class UserService {
     /**
      * 校验用户名与密码格式。
      *
+     * <p>除格式规则外还要拒绝 {@link #RESERVED_USERNAMES} 中的系统保留字，
+     * 原因见该常量的注释：它们与协议里的固定标识重名，放行即产生二义。</p>
+     *
      * @param username 用户名
      * @param password 密码
      * @return 校验结果
@@ -506,6 +530,11 @@ public class UserService {
     private Result<String> validate(String username, String password) {
         if (username == null || !USERNAME_PATTERN.matcher(username).matches()) {
             return Result.fail("用户名需为 3-16 位字母、数字或下划线，且以字母开头");
+        }
+        // 按小写比较：保留字的判定必须与大小写无关，否则 All、All_ 之类变体照样能注册
+        if (RESERVED_USERNAMES.contains(username.toLowerCase(Locale.ROOT))) {
+            LOGGER.info(() -> "注册被拒绝：用户名是系统保留字: " + username);
+            return Result.fail("该用户名是系统保留字，请换一个");
         }
         return validatePassword(password);
     }

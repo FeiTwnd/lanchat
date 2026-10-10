@@ -148,7 +148,11 @@ public class JdbcUserDao implements UserDao {
      * @throws SQLException 补列失败且原因不是"列已存在"时抛出
      */
     private void ensureAvatarColumn() throws SQLException {
-        String sql = "ALTER TABLE chat_user ADD COLUMN avatar MEDIUMTEXT NULL";
+        // COMMENT 必须与 sql/schema.sql 中的列定义逐字一致：ALTER 补出来的列若没有注释，
+        // 就会出现"脚本建的库有注释、程序自动升级的库没有"这种同一列两种形态的差异，
+        // 后来的人无法从库结构判断该列存的是什么
+        String sql = "ALTER TABLE chat_user ADD COLUMN avatar MEDIUMTEXT NULL"
+                + " COMMENT '自定义头像：PNG 图片的 Base64 文本（约 6-16KB）；NULL 或空串表示未设置，界面显示默认头像'";
         try (Connection connection = openConnection();
              Statement statement = connection.createStatement()) {
             statement.execute(sql);

@@ -260,11 +260,18 @@ public final class ChatServer {
 
     /**
      * 回滚启动过程中已占用的资源。
+     *
+     * <p>必须连同在线用户表一起清理，与 {@link #stop()} 保持一致：启动中途失败时
+     * （典型是端口被占用），虚拟成员可能已经注册进 userManager，而这条失败路径
+     * 过去只关套接字与线程池。结果是服务器明明没起来，{@code size()} 与
+     * {@code onlineUsers()} 却报告"有人在线"，下一次 {@code start()} 也会带着这批
+     * 陈旧状态继续跑。</p>
      */
     private void rollback() {
         running = false;
         closeQuietly(serverSocket);
         serverSocket = null;
+        userManager.clear();
         shutdownPool(connectionPool);
         connectionPool = null;
         shutdownPool(heartbeatScanner);

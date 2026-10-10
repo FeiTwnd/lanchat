@@ -47,6 +47,15 @@ public class UserManager {
     /** 在线用户资料表：用户名 -> 脱敏用户对象，用于快速构造列表快照 */
     private final Map<String, User> userProfiles = new ConcurrentHashMap<>();
 
+    /**
+     * 虚拟成员用户名集合：这些成员只出现在名单（{@link #userProfiles}）里，没有连接。
+     *
+     * <p>单独记一份而不是每次用 {@link Constants#AI_USERNAME} 现判：虚拟成员是一个
+     * 概念而不是某一个具体名字，用集合表达后，将来再挂第二个机器人（如"翻译助手"）
+     * 只需调用 {@link #registerVirtualUser}，两个统计口径自动继续成立。</p>
+     */
+    private final Set<String> virtualUsers = ConcurrentHashMap.newKeySet();
+
     /** 服务器端观察者列表（主要供 ServerUI 刷新界面） */
     private final List<ServerObserver> observers = new CopyOnWriteArrayList<>();
 
@@ -66,6 +75,9 @@ public class UserManager {
             LOGGER.warning(() -> "重复登录被拒绝: " + user.getUsername());
             return false;
         }
+        // 真有连接进来时，同名条目不再是"虚拟成员"：不清掉的话 size() 会把这个持有连接的
+        // 真人排除在真实在线人数之外，两个口径就都对不上了
+        virtualUsers.remove(user.getUsername());
         user.setOnline(true);
         userProfiles.put(user.getUsername(), user);
         notifyObservers(ServerObserver.EventType.USER_ONLINE, user.getDisplayName() + " 已上线");
@@ -84,8 +96,12 @@ public class UserManager {
      * 但没有连接"。</p>
      *
      * <p><b>由此产生的可见取舍</b>：{@link #isOnline} 对虚拟成员返回 false，
-     * 因此给机器人发文件会被既有的"接收方不在线"校验拒绝。这是合理行为——
-     * 机器人收不了文件。</p>
+     * 因此给机器人发文件会在连接处理器（{@code ClientHandler#isValidFilePeer} 之前）的
+     * 虚拟成员分支被拒绝，并给出"小助手只支持文字问答"的中文回执——机器人收不了文件，
+     * 这一点必须让使用者看到明确原因，而不是一句协议级的"用户名格式不正确"。</p>
+     *
+     * <p>另外，本方法写入的成员<b>不计入</b> {@link #size()}（真实在线人数），
+     * 但<b>会出现在</b> {@link #onlineUsers()} 的名单里，两个口径的差别见 {@link #size()}。</p>
      *
      * <p>用 {@code put} 而不是 {@code putIfAbsent}：服务器重启或重复调用时应当幂等覆盖，
      * 而不是因为"已经有一份资料"就静默跳过，导致改过的昵称不生效。</p>
@@ -98,6 +114,7 @@ public class UserManager {
         }
         user.setOnline(true);
         userProfiles.put(user.getUsername(), user);
+        virtualUsers.add(user.getUsername());
         LOGGER.info(() -> "虚拟成员已注册: " + user.getDisplayName());
     }
 
@@ -113,6 +130,7 @@ public class UserManager {
         }
         ClientHandler removed = onlineUsers.remove(username);
         User profile = userProfiles.remove(username);
+        virtualUsers.remove(username);
         if (removed == null) {
             return false;
         }
@@ -165,6 +183,10 @@ public class UserManager {
     /**
      * 获取在线用户资料快照（已脱敏）。
      *
+     * <p>名单口径<b>包含</b>没有连接的虚拟成员（智能体小助手），与 {@link #size()}
+     * 只统计真实连接的口径不同，理由见 {@link #size()}：名单回答"能和谁说话"，
+     * 人数回答"有几个真实并发"。调用方取总数请用 {@link #size()}，不要用本列表的长度。</p>
+     *
      * @return 用户列表，按用户名排序
      */
     public List<User> onlineUsers() {
@@ -205,17 +227,34 @@ public class UserManager {
     }
 
     /**
-     * 在线人数。
+     * 获取"真实在线人数"，即当前持有连接的成员数量。
      *
-     * <p>统计口径是"在线成员数"而不是"活跃连接数"：{@link #registerVirtualUser}
-     * 注册的虚拟成员没有连接，但它在好友树与服务器控制台的名单里都是一名成员。
-     * 若按连接数统计，同一时刻的局域网发现应答、服务器控制台与客户端好友树
-     * 会给出三个互不相同的数字，而这种不一致只能靠读代码才能解释。</p>
+     * <p><b>与 {@link #onlineUsers()} 的口径差别（刻意不一致）</b>：
+     * 本方法<b>排除</b> {@link #registerVirtualUser} 注册的虚拟成员（智能体小助手），
+     * 而 {@link #onlineUsers()} 返回的名单<b>包含</b>虚拟成员。两者服务于两件不同的事，
+     * 强行统一才会出问题：</p>
+     * <ul>
+     *   <li><b>人数</b>用于对外通告并发规模与容量：局域网发现应答把它报给尚未连接的客户端，
+     *       集成测试也用它在断言"几个人在线上"。虚拟成员没有连接、不占用任何并发资源、
+     *       收不到也不会漏掉任何广播，把它算进来会凭空多出一人——服务器一个真实连接都没有时
+     *       对外宣称"在线 1 人"正是由此而来。</li>
+     *   <li><b>名单</b>用于回答"我可以和谁说话"：客户端好友树与服务器控制台按名单渲染，
+     *       小助手确实可以被私聊，必须出现在名单里，否则使用者根本点不到它。</li>
+     * </ul>
      *
-     * @return 在线成员数量
+     * <p>实现上按资料表遍历并排除虚拟成员，而不是用 {@code userProfiles.size() - virtualUsers.size()}：
+     * 后者依赖"两个集合始终同步"这一隐式约定，任何一处单独删改都会让结果变成负数或虚高。</p>
+     *
+     * @return 真实在线成员数量，不含虚拟成员
      */
     public int size() {
-        return userProfiles.size();
+        int count = 0;
+        for (String name : userProfiles.keySet()) {
+            if (!virtualUsers.contains(name)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
@@ -320,10 +359,15 @@ public class UserManager {
 
     /**
      * 清空全部在线状态，用于服务器停止时善后。
+     *
+     * <p>虚拟成员集合必须一并清空：{@link #size()} 以"资料表里存在、且不在虚拟成员集合里"
+     * 为判定条件，只清资料表会留下一条指向已不存在成员的记录，第二次启动注册新成员时
+     * 统计口径就会与名单错位。</p>
      */
     public void clear() {
         onlineUsers.clear();
         userProfiles.clear();
+        virtualUsers.clear();
         LOGGER.info("在线用户表已清空");
     }
 }
