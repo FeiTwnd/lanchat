@@ -14,7 +14,6 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,16 +33,17 @@ import java.util.logging.Logger;
  * 智能体小助手服务。
  *
  * <p>职责：把使用者提给"智能体小助手"的问题转成一次外部 HTTP 调用，取回回答正文，
- * 再交回调用方投递给提问者。外部平台选用扣子（Coze），接口为
- * {@code POST https://api.coze.cn/open_api/v2/chat}。</p>
+ * 再交回调用方投递给提问者。外部平台选用扣子（Coze），接口为工作流同步执行接口
+ * {@code POST https://api.coze.cn/v1/workflow/run}：一次请求直接拿回执行结果，
+ * 不需要像对话接口那样再轮询状态、拉取消息。</p>
  *
  * <p><b>为什么是服务端的一个虚拟成员而不是客户端直连</b>：见
  * {@link com.chat.server.UserManager#registerVirtualUser}。要点是所有客户端零改动，
  * 小助手在好友树里就是一名普通成员。</p>
  *
- * <p><b>无会话上下文</b>：请求里不带 {@code conversation_id}，每次提问都是独立的一问一答。
- * 这既符合"回答本程序怎么用"这一用途（问题都是自包含的），也省掉了
- * "哪个用户当时处在哪段会话里"这片需要过期与并发保护的状态。</p>
+ * <p><b>无会话上下文</b>：工作流按单次执行处理，请求里不传任何会话或历史参数，
+ * 每次提问都是独立的一问一答。这既符合"回答本程序怎么用"这一用途（问题都是自包含的），
+ * 也省掉了"哪个用户当时处在哪段会话里"这片需要过期与并发保护的状态。</p>
  *
  * <p><b>为什么必须异步</b>：一次问答的耗时由外部平台决定（本类按
  * {@link Constants#AI_REQUEST_TIMEOUT_MS} 设上限）。若在调用方线程上同步等待，
@@ -61,12 +61,6 @@ public class AiAssistantService {
 
     /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".AiAssistantService");
-
-    /** 扣子返回的聊天消息中，代表"助手正式回答"的角色与类型 */
-    private static final String ROLE_ASSISTANT = "assistant";
-
-    /** 只会取 {@code type=answer} 的消息：同一份返回里还有 {@code verbose} 等中间态内容 */
-    private static final String TYPE_ANSWER = "answer";
 
     /**
      * 同时进行的问答数上限。
@@ -127,8 +121,8 @@ public class AiAssistantService {
     /** 实际使用的接口地址；默认取内置常量，可由配置覆盖 */
     private final String apiUrl;
 
-    /** 外部平台的智能体编号 */
-    private final String botId;
+    /** 外部平台的工作流编号 */
+    private final String workflowId;
 
     /** 访问令牌，只用于请求头 */
     private final String token;
@@ -175,7 +169,7 @@ public class AiAssistantService {
      */
     public AiAssistantService() {
         this.apiUrl = Config.aiApiUrl();
-        this.botId = Config.aiBotId();
+        this.workflowId = Config.aiWorkflowId();
         this.token = Config.aiApiToken();
         // 令牌是手工拷进配置文件的，很容易在末尾多带一个换行或混入空格。
         // 这种令牌进不了 HTTP 头，而 JDK 抛出的异常文本会把整个头值（含令牌）原样带出来，
@@ -219,7 +213,7 @@ public class AiAssistantService {
      * @return 已配置且可用返回 true
      */
     public boolean isEnabled() {
-        return apiUrlUsable && !botId.isEmpty() && !token.isEmpty() && isHeaderValueSafe(token);
+        return apiUrlUsable && !workflowId.isEmpty() && !token.isEmpty() && isHeaderValueSafe(token);
     }
 
     /**
@@ -384,7 +378,7 @@ public class AiAssistantService {
     /**
      * 真正发起一次问答调用。
      *
-     * @param asker    提问者用户名，作为外部平台的终端用户标识
+     * @param asker    提问者用户名（仅用于日志，本接口不消费）
      * @param question 提问正文
      * @return 已清洗、可直接投递的回答正文
      * @throws IOException          网络失败、超时或接口返回非成功状态时抛出
@@ -467,34 +461,32 @@ public class AiAssistantService {
     /**
      * 拼装请求体。
      *
-     * <p>{@code stream} 固定为 false：只用一问一答的完整结果，不处理流式分片。
-     * {@code user} 用提问者的用户名而不是一个固定的占位串，是为了让外部平台按人计量与限流——
-     * 用同一个值会让所有人的调用合成一条额度。</p>
+     * <p>工作流同步执行接口只认 {@code workflow_id} 与开始节点参数：这里把提问正文放进
+     * 工作流开始节点的 {@code input} 参数，与平台侧工作流的输入定义保持一致。
+     * 不传 {@code app_id}——它只用于运行扣子应用里的工作流，空间资源库里的工作流不需要。</p>
      *
-     * @param asker    提问者用户名
+     * @param asker    提问者用户名（本方法不消费，保留参数以与调用方签名一致）
      * @param question 提问正文
      * @return JSON 请求体
      */
     private String buildRequestBody(String asker, String question) {
         return '{'
-                + "\"bot_id\":" + JsonCodec.quote(botId) + ','
-                + "\"user\":" + JsonCodec.quote(asker) + ','
-                + "\"query\":" + JsonCodec.quote(question) + ','
-                + "\"stream\":false"
+                + "\"workflow_id\":" + JsonCodec.quote(workflowId) + ','
+                + "\"parameters\":{\"input\":" + JsonCodec.quote(question) + '}'
                 + '}';
     }
 
     /**
-     * 从返回报文中取出助手回答。
+     * 从返回报文中取出工作流输出。
      *
-     * <p>返回体中 {@code messages} 是一个数组，既有助手的正式回答
-     * （{@code role=assistant}、{@code type=answer}），也有若干中间态内容
-     * 与用户自己的提问。这里只认第一段正式回答，取不到时用返回体里的
-     * {@code code} 与 {@code msg} 说明原因——那两个字段是平台报错时唯一的有效信息。</p>
+     * <p>工作流接口的返回形如 {@code {"code":0,"msg":"","data":"{\"output\":\"...\"}"}}：
+     * {@code data} 是一段 JSON 序列化字符串，里面通常只有一个 {@code output} 字段。
+     * 取不到 {@code output} 时把 {@code data} 原样返回——部分工作流直接输出纯文本，
+     * 或把结果放在别的字段里，丢掉它不如交给使用者。</p>
      *
      * @param body 返回报文
      * @return 回答正文
-     * @throws IOException 报文无法解析或其中没有可用回答时抛出
+     * @throws IOException 报文无法解析、平台报错或其中没有可用输出时抛出
      */
     private String extractAnswer(String body) throws IOException {
         Map<String, Object> root;
@@ -503,27 +495,65 @@ public class AiAssistantService {
         } catch (IllegalArgumentException e) {
             throw new IOException("返回内容不是合法 JSON：" + e.getMessage());
         }
-        Object messages = root.get("messages");
-        if (messages instanceof List) {
-            for (Object item : JsonCodec.asArray(messages)) {
-                if (!(item instanceof Map)) {
-                    continue;
-                }
-                Map<String, Object> message = JsonCodec.asObject(item);
-                if (!ROLE_ASSISTANT.equals(JsonCodec.asString(message, "role"))
-                        || !TYPE_ANSWER.equals(JsonCodec.asString(message, "type"))) {
-                    continue;
-                }
-                String content = JsonCodec.asString(message, "content");
-                if (content != null && !content.trim().isEmpty()) {
-                    return content;
-                }
+        long code = JsonCodec.asLong(root, "code", -1L);
+        if (code != 0L) {
+            throw new IOException(describeApiError(code, JsonCodec.asString(root, "msg")));
+        }
+        Object data = root.get("data");
+        if (data instanceof String) {
+            String payload = (String) data;
+            String output = extractWorkflowOutput(payload);
+            if (output != null && !output.trim().isEmpty()) {
+                return output;
+            }
+        } else if (data instanceof Map) {
+            String output = JsonCodec.asString(JsonCodec.asObject(data), "output");
+            if (output != null && !output.trim().isEmpty()) {
+                return output;
             }
         }
-        long code = JsonCodec.asLong(root, "code", -1L);
-        String reason = JsonCodec.asString(root, "msg");
-        throw new IOException("接口没有返回回答（code=" + code
-                + (reason == null || reason.isEmpty() ? "" : ", msg=" + reason) + "）");
+        throw new IOException("接口没有返回工作流输出。");
+    }
+
+    /**
+     * 从 {@code data} 字符串里取出 {@code output} 字段。
+     *
+     * @param payload 工作流返回的 {@code data} 字符串
+     * @return 输出正文；不是 JSON 对象或没有 {@code output} 时返回原字符串
+     */
+    private static String extractWorkflowOutput(String payload) {
+        try {
+            Map<String, Object> data = JsonCodec.asObject(JsonCodec.parse(payload));
+            String output = JsonCodec.asString(data, "output");
+            return output == null ? payload : output;
+        } catch (IllegalArgumentException e) {
+            // 部分工作流直接返回纯文本，不是 JSON；原样交给调用方
+            return payload;
+        }
+    }
+
+    /**
+     * 把平台错误码翻译成可行动的中文提示。
+     *
+     * <p>工作流接口的报错以 HTTP 200 + {@code code != 0} 的形式返回，因此不能只靠
+     * HTTP 状态码判断。已知错误码给出中文原因；未知错误码保留平台原文，便于管理员排查。</p>
+     *
+     * @param code 平台错误码
+     * @param msg  平台错误说明
+     * @return 中文提示
+     */
+    private static String describeApiError(long code, String msg) {
+        switch ((int) code) {
+            case 4000:
+                return "请求参数不合法，请检查工作流输入参数";
+            case 4101:
+                return "访问令牌无效或已过期，请重新生成";
+            case 4200:
+                return "工作流不存在或尚未发布，请核对配置与发布状态";
+            default:
+                return "接口返回错误（code=" + code
+                        + (msg == null || msg.isEmpty() ? "" : ", msg=" + msg) + "）";
+        }
     }
 
     /**
@@ -616,9 +646,9 @@ public class AiAssistantService {
             case 401:
                 return "访问令牌无效或已过期，请重新生成";
             case 403:
-                return "智能体未发布，或发布时没勾选 API 渠道";
+                return "令牌无权访问该工作流，或工作流尚未发布";
             case 404:
-                return "bot_id 不存在，请核对配置";
+                return "工作流编号不存在，请核对配置";
             case 429:
                 return "调用过于频繁，已被平台限流";
             default:
@@ -694,11 +724,11 @@ public class AiAssistantService {
     }
 
     /**
-     * 读取配置好的智能体编号。
+     * 读取配置好的工作流编号。
      *
-     * @return 智能体编号
+     * @return 工作流编号
      */
-    public String getBotId() {
-        return botId;
+    public String getWorkflowId() {
+        return workflowId;
     }
 }

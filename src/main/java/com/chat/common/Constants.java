@@ -208,8 +208,8 @@ public final class Constants {
      */
     public static final String AI_DISPLAY_NAME = "AI小助手";
 
-    /** 智能体平台的开放接口地址：一问一答的非流式接口，一次请求直接拿到回答 */
-    public static final String AI_API_URL = "https://api.coze.cn/open_api/v2/chat";
+    /** 智能体平台的开放接口地址：工作流同步执行接口，一次请求直接拿到结果 */
+    public static final String AI_API_URL = "https://api.coze.cn/v1/workflow/run";
 
     /** 与智能体平台的建连超时（毫秒），明显短于问答总超时，连不上时不必白等 */
     public static final int AI_CONNECT_TIMEOUT_MS = 5_000;

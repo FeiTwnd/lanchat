@@ -122,7 +122,7 @@ public final class ChatServer {
     /**
      * 智能体小助手服务（延迟初始化，原因同上）。
      *
-     * <p>未配置令牌与 bot_id 时它依然会被创建，只是 {@code isEnabled()} 为 false，
+     * <p>未配置令牌与 workflow_id 时它依然会被创建，只是 {@code isEnabled()} 为 false，
      * 服务器行为与接入前完全一致：不注册虚拟成员，也不拦截任何私聊。</p>
      */
     private AiAssistantService aiAssistant;
@@ -654,12 +654,12 @@ public final class ChatServer {
     /**
      * 注册智能体小助手为一名虚拟成员，使其出现在所有客户端的好友树里。
      *
-     * <p>未配置令牌或 bot_id 时直接跳过：小助手不出现在成员列表里，
+     * <p>未配置令牌或 workflow_id 时直接跳过：小助手不出现在成员列表里，
      * 使用者也就不会点到一个永远不回话的名字。</p>
      */
     private void registerAiAssistant() {
         if (aiAssistant == null || !aiAssistant.isEnabled()) {
-            LOGGER.info("智能体小助手未启用：未配置 ai.api.token 或 ai.bot.id，跳过注册");
+            LOGGER.info("智能体小助手未启用：未配置 ai.api.token 或 ai.workflow.id，跳过注册");
             return;
         }
         User assistant = new User(Constants.AI_USERNAME, Constants.AI_DISPLAY_NAME);

@@ -225,14 +225,23 @@ public final class Config {
     }
 
     /**
-     * 获取智能体小助手的智能体编号（bot_id）。
+     * 获取智能体小助手要执行的工作流编号（workflow_id）。
      *
-     * <p>取值位置是智能体开发页地址栏 {@code .../bot/} 之后的那串数字。</p>
+     * <p>取值位置是工作流编排页地址栏 {@code workflow_id=} 之后的那串数字。</p>
      *
-     * @return 智能体编号；未配置时返回空字符串
+     * <p>为兼容接入工作流之前的旧配置，{@code ai.workflow.id} 未配置时会回退到
+     * {@code ai.bot.id}；系统属性同理，优先 {@code lanchat.ai.workflow.id}，
+     * 其次 {@code lanchat.ai.bot.id}。</p>
+     *
+     * @return 工作流编号；未配置时返回空字符串
      */
-    public static String aiBotId() {
-        return override("lanchat.ai.bot.id", get("ai.bot.id", ""));
+    public static String aiWorkflowId() {
+        String fromFile = get("ai.workflow.id", get("ai.bot.id", ""));
+        String value = override("lanchat.ai.workflow.id", fromFile);
+        if (value.isEmpty()) {
+            value = override("lanchat.ai.bot.id", "");
+        }
+        return value;
     }
 
     /**

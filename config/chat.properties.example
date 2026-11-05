@@ -53,13 +53,13 @@ security.message.secret=
 # 它会像普通用户一样出现在所有人的好友树里，可以私聊提问。
 # 两项中只要有一项为空，小助手就整个不启用，服务器行为与接入前完全一致。
 #
-# bot.id 的取法：智能体开发页地址栏 .../bot/ 之后的那串数字。
+# workflow.id 的取法：工作流编排页地址栏 workflow_id= 之后的那串数字。
 # api.token：扣子平台「个人访问令牌」生成的 PAT（只显示一次，请当场保存）。
-# 注意：智能体必须已发布，且发布时勾选「Bot as API」渠道，否则接口会返回 403。
-ai.bot.id=
+# 注意：工作流必须已发布，否则接口会返回 4200。
+ai.workflow.id=
 ai.api.token=
 # 接口地址，一般不用改
-ai.api.url=https://api.coze.cn/open_api/v2/chat
+ai.api.url=https://api.coze.cn/v1/workflow/run
 
 # 说明：小助手在好友树里显示的昵称（AI小助手）写在 Constants.AI_DISPLAY_NAME 里，
 # 不放在本文件——配置由 Properties.load(InputStream) 按 ISO-8859-1 解码，
