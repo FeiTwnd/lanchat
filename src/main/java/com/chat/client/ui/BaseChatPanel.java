@@ -880,6 +880,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             entries.add(entry);
             addRow(entry);
             updateEmptyState();
+            refreshAfterAppend();
             scrollToBottomIf(stick);
         });
     }
@@ -994,6 +995,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             entries.add(entry);
             addRow(entry);
             updateEmptyState();
+            refreshAfterAppend();
             scrollToBottomIf(stick);
         });
     }
@@ -1152,6 +1154,7 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
             entries.add(entry);
             addRow(entry);
             updateEmptyState();
+            refreshAfterAppend();
             scrollToBottomIf(stick);
         });
     }
@@ -1942,6 +1945,19 @@ public abstract class BaseChatPanel extends JPanel implements ChatListener {
     private void scrollToBottom() {
         JScrollBar bar = historyScroll.getVerticalScrollBar();
         SwingUtilities.invokeLater(() -> bar.setValue(bar.getMaximum()));
+    }
+
+    /**
+     * 追加行后立即完成布局。
+     *
+     * <p>消息列表的首选高度会随新行增长，但滚动视口仍按旧高度摆放，
+     * 新加的行会停在 0×0；只靠 {@link #scrollToBottom()} 的延后滚动
+     * 不会触发重新布局，表现为“消息已经收到，界面没变化，最小化或
+     * 重新打开窗口后才出现”。这里主动 revalidate，让新行当场可见。</p>
+     */
+    private void refreshAfterAppend() {
+        messageList.revalidate();
+        messageList.repaint();
     }
 
     /**

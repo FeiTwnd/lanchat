@@ -77,7 +77,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>未读提示：</p>
  * <ul>
  *   <li>私聊与群聊都遵循"窗口没打开（含已最小化）就只累计未读、不主动弹窗"，
- *       否则未读永远来不及累计；</li>
+ *       否则未读永远来不及累计；小助手的答复是例外：它只回应本人提问，会主动带到眼前；</li>
  *   <li>私聊未读画在好友树对应用户行的右端，群聊未读写在群聊入口按钮上；</li>
  *   <li>两者的合计画在标题栏角标上，打开对应窗口即清零。</li>
  * </ul>
@@ -692,9 +692,22 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         if (show) {
             clearPrivateUnread(username);
             if (!window.isVisible()) {
+                // 窗口可能已被关闭（DISPOSE_ON_CLOSE）。Window#setVisible(true) 会重新
+                // addNotify 并重建原生窗口，面板里的内容仍在；不能在这里新建窗口替换，
+                // 否则小助手对话（不入库）会丢失。
                 window.setVisible(true);
             }
-            window.toFront();
+            int state = window.getExtendedState();
+            if ((state & java.awt.Frame.ICONIFIED) != 0) {
+                // 最小化时 isVisible() 仍为 true，上面的 setVisible(true) 是空操作；
+                // 只清 ICONIFIED 位而不是 setExtendedState(NORMAL)，
+                // 避免“最大化后最小化”的窗口被还原成普通大小。
+                window.setExtendedState(state & ~java.awt.Frame.ICONIFIED);
+            }
+            if (!window.isFocused()) {
+                // 已聚焦说明使用者正看着这个会话，再 toFront 只会无谓地抢一次焦点。
+                window.toFront();
+            }
         } else if (!window.isShowing()
                 || (window.getExtendedState() & java.awt.Frame.ICONIFIED) != 0) {
             // 判据不能只看 isVisible()：AWT 里窗口最小化后它仍然为 true，
@@ -1673,11 +1686,15 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
         }
         // 走到这里发送者必然是对端，会话键直接取它即可
         onEdt(() -> {
-            // 不主动弹出窗口：与群聊一致，窗口没打开时只把消息缓存进面板并累计未读，
-            // 否则"消息一到就置顶私聊窗口"会让私聊未读永远来不及累计。
+            // 小助手只会在本人提问后由服务端代答（ClientHandler#handOffToAiAssistant），
+            // 因此它的“正在思考”和最终回答都应直接带到眼前；真人私聊仍保持
+            // “不主动弹窗、只累计未读”的既有规则，不能合并成一个判断。
+            PrivateChatUI window = Constants.AI_USERNAME.equals(sender)
+                    ? openPrivateWindow(sender)          // 复用“显示并置顶”的现有路径
+                    : privateWindowFor(sender, false);   // 真人：只缓存 + 计未读
             // 气泡索引不必在这里另记一份：面板渲染完这一行后会回调 RecallHandler#remember，
             // 那条路径同时覆盖了实时消息与补拉的历史消息，两处都记反而会各写一份时刻
-            privateWindowFor(sender, false).getPanel().onMessage(message);
+            window.getPanel().onMessage(message);
         });
     }
 
