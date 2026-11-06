@@ -3,7 +3,7 @@
 一个基于 **Java SE + Socket + 多线程 + Swing** 的类 QQ 局域网聊天系统，采用 C/S 架构，
 纯标准库实现，**不依赖任何第三方框架**（不使用 Netty、Spring、JavaFX）；唯一的外部 jar 是
 MySQL 的 JDBC 驱动（`lib/mysql-connector-j-8.2.0.jar`），用于连接本项目唯一的存储——MySQL。
-代码原创，总计 27584 行主源码（70 个文件）与 3390 行测试代码（11 个文件），全部中文注释。
+代码原创，总计 27656 行主源码（70 个文件）与 3390 行测试代码（11 个文件），全部中文注释。
 
 ---
 
@@ -57,8 +57,9 @@ MySQL 的 JDBC 驱动（`lib/mysql-connector-j-8.2.0.jar`），用于连接本�
 
 ### 界面设计要点
 
-界面全部由代码绘制，**不包含任何图片资源文件**（不使用 `.png`、`.ico`、字体图标等外部素材），
-因此不存在素材版权问题，也便于逐行讲解：
+界面主要由代码绘制，**不依赖外部 UI 框架或图标字体**；只有主窗口四个功能入口允许读取
+`image/` 下的同名 PNG 素材，取不到时自动回退到 Java2D 矢量图标，因此删掉图片目录界面仍然完整。
+这样做既避免素材版权问题，也便于逐行讲解：
 
 | 类 | 职责 |
 |---|---|
@@ -240,7 +241,7 @@ java -cp "/tmp/lanchat-classes:lib/mysql-connector-j-8.2.0.jar" com.chat.server.
 
 ```
 LANChat/
-├── src/main/java/com/chat/            主源码（70 个 .java，27584 行）
+├── src/main/java/com/chat/            主源码（70 个 .java，27656 行）
 │   ├── common/        公共模块：消息体系、用户实体、常量、配置、编解码、工厂与反序列化预算过滤器
 │   ├── exception/     自定义异常体系
 │   ├── util/          工具类：口令散列与密钥派生、消息加解密、导出渲染、文件、日期
@@ -254,13 +255,12 @@ LANChat/
 ├── sql/               schema.sql 建表与升级脚本（程序启动时会自动建表，此脚本用于手工初始化或重建）
 ├── lib/               mysql-connector-j-8.2.0.jar（服务器与测试连接数据库所需）
 ├── data/              运行期数据：仅 data/received（接收文件）与 data/export（导出记录）
-└── docs/              文档
+└── docs/              交付文档
     ├── design/        需求分析、系统设计、数据库设计、实现说明
-    ├── test/          测试报告、测试用例表、界面走查截图（screenshots）与缺陷证据（evidence）
-    ├── report/        课程设计报告
-    ├── ppt/           答辩 PPT 大纲
+    ├── test/          测试说明（框架、环境、命令、57 单元 + 10 集成用例清单）
+    ├── 代码导读.md    从零理解代码运转，以及题目/课程/加分点与代码位置的一对一映射
     ├── known-issues.md 已知问题与设计取舍记录（每条给出背景、影响、当前处理与将来方案）
-    └── 用户手册.md
+    └── 用户手册.md    面向使用者的操作指南
 ```
 
 ---
@@ -290,7 +290,7 @@ cp config/chat.properties.example config/chat.properties
 | `security.message.secret` | 无 | **必填**：聊天记录正文的加密口令。**留空时服务器拒绝启动**；口令变更后此前写入的密文无法解密 |
 | `ai.bot.id` | 空 | 可选：扣子（Coze）智能体编号，取智能体开发页地址栏 `.../bot/` 之后的那串数字 |
 | `ai.api.token` | 空 | 可选：扣子平台的个人访问令牌（PAT，只显示一次）。**令牌等同密码，不要提交到仓库、不要写进文档或日志** |
-| `ai.api.url` | `https://api.coze.cn/open_api/v2/chat` | 可选：智能体接口地址，一般不用改 |
+| `ai.api.url` | `https://api.coze.cn/v1/workflow/run` | 可选：智能体接口地址，一般不用改 |
 
 补充说明：
 
@@ -342,23 +342,19 @@ java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.cha
 **不使用 JUnit / Mockito**，保证任何 JDK 环境都能直接编译运行。在 IDEA 的运行配置下拉框中选择
 `单元测试（57 用例）` 或 `集成测试（10 用例）` 后点击 `Run` 即可（命令行等价写法见第四节）。
 
-| 测试类型 | 用例数 | 结果 | 覆盖范围 |
-|---|---|---|---|
-| 单元测试 | 57 | 全部通过 | `SecurityUtilTest` 7、`UserDaoTest` 8、`UserServiceTest` 9、`MessageServiceTest` 12、`FileServiceTest` 12、`ProtocolTest` 9 |
-| 集成测试 | 10 | 全部通过 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景、消息撤回（本人/时限/幂等/越权/占位替换）、长会话稳定性（150 条不断线）、群聊撤回广播与资料变更回执 |
-| 组件级界面校验 | 6 | 全部通过 | 默认头像无渐变、在线/离线状态标记与管理员描边、好友树选中行整行浅蓝且无系统外观橙色、选中态像素断言、私聊与群聊窗口的"发送文件"按钮（离屏渲染 + 像素断言，截图见 `docs/test/screenshots/`） |
-| 界面走查 | 14 | 上一轮通过，本轮未重跑 | 无边框窗口与拖动缩放、好友树分组、私聊/群聊渲染次数、文件传输进度、离线归组（Xvfb + Robot，上一轮快照） |
-| 本轮缺陷修复探针 | 5 组 | 全部通过 | 反序列化预算 3 项、头像校验 24 项、AI 与 JSON 解析 55 项、服务端行为 50 项、客户端界面 6 项；原始输出见 `docs/test/evidence/R5-0x-*.txt` |
+| 测试类型 | 用例数 | 覆盖范围 |
+|---|---|---|
+| 单元测试 | 57 | `SecurityUtilTest` 7、`UserDaoTest` 8、`UserServiceTest` 9、`MessageServiceTest` 12、`FileServiceTest` 12、`ProtocolTest` 9 |
+| 集成测试 | 10 | 真实启动服务器 + 多客户端：登录、用户列表刷新、私聊、群聊、文件传输、下线刷新、异常场景、消息撤回（本人/时限/幂等/越权/占位替换）、长会话稳定性（150 条不断线）、群聊撤回广播与资料变更回执 |
 
 自动化测试连接数据库时使用独立测试库（把 `db.url` 中的库名替换为 `lanchat_test` 并附加
 `createDatabaseIfNotExist=true`，可用系统属性 `lanchat.test.db.url` 覆盖），
-每个用例开始前清空 `chat_user` 与 `chat_message`，避免污染开发库。
-最近一次现场复跑结果为单元 57/57、集成 10/10 通过，集成测试在"仓库默认配置（`ai` 启用）"
-与"`ai.bot.id` / `ai.api.token` 留空"两种配置下均为 10/10。集成用例的人数断言统一用
-`UserManager.size()`（只统计真实连接），小助手作为虚拟成员出现在名单里但不计入人数，
-因此不再需要为了跑集成测试而在配置里关掉小助手。
+每个用例开始前清空 `chat_user` 与 `chat_message`，避免污染开发库。集成用例的人数断言统一用
+`UserManager.size()`（只统计真实连接），小助手作为虚拟成员出现在名单里但不计入人数。
+测试结果以现场运行输出为准，不在文档中写死。
 
-详细的用例清单与结果见 `docs/test/测试报告.md` 与 `docs/test/测试用例表.md`。
+测试环境、编译与运行命令、57 条单元用例与 10 条集成用例的输入/预期、需求覆盖矩阵与通过标准，
+见 `docs/test/测试说明.md`。界面布局、原生文件对话框与多机联调属于人工验收，步骤见 `docs/用户手册.md`。
 
 ---
 
@@ -366,20 +362,14 @@ java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.cha
 
 | 文档 | 路径 | 内容 |
 |---|---|---|
+| 代码导读 | `docs/代码导读.md` | 从零理解代码运转的十条主链路、关键类说明、评分点与代码位置一对一映射、答辩脚本与高频追问 |
 | 用户手册 | `docs/用户手册.md` | 面向使用者的完整操作指南与常见问题排查 |
 | 需求分析 | `docs/design/01-需求分析.md` | 功能/非功能需求、用例图与用例描述 |
 | 系统设计 | `docs/design/02-系统设计.md` | 架构图、类图、四张核心时序图、设计模式、线程模型 |
 | 数据库与持久化设计 | `docs/design/03-数据库与持久化设计.md` | MySQL 存储、ER 图、三张表的表结构、索引与安全设计 |
 | 实现说明 | `docs/design/04-实现说明.md` | 文件清单、关键方法签名、关键算法、扩展指南 |
-| 测试报告 | `docs/test/测试报告.md` | 测试策略、结果汇总、需求覆盖矩阵、缺陷记录 |
-| 已知问题 | `docs/known-issues.md` | 已知问题与设计取舍：背景、影响、当前处理方式、本轮不彻底解决的原因、将来的方案 |
-| 测试用例表 | `docs/test/测试用例表.md` | 87 个用例（57 单元 + 10 集成 + 6 组件级界面校验 + 14 上一轮界面走查）的输入、预期、实际与结论 |
-| 课程设计报告 | `docs/report/课程设计报告.md` | 按高校模板撰写的完整报告 |
-| 答辩 PPT 大纲 | `docs/ppt/答辩PPT大纲.md` | 逐页大纲、演示脚本、答辩问题准备 |
-
-> 说明：`docs/design/`、`docs/report/`、`docs/ppt/` 下的过程文档尚未随本轮"仅 MySQL 存储"的改造同步更新，
-> 其中仍可能残留"文件存储""可选数据库"等旧表述，请以本 README、`docs/用户手册.md`
-> 与 `docs/superpowers/specs/2026-09-20-docs-facts.md` 为准。
+| 测试说明 | `docs/test/测试说明.md` | 测试策略、环境准备、编译运行命令、用例清单、覆盖矩阵、判定标准 |
+| 已知问题 | `docs/known-issues.md` | 已知问题与设计取舍：背景、影响、当前处理方式、不彻底解决的原因、将来的方案 |
 
 ---
 
@@ -459,11 +449,11 @@ java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.cha
 ### 11.2 后续可扩展方向
 
 网络层与服务端已具备稳定消息标识、`MSG_ACK` 送达确认与去重、离线消息补投、会话令牌断线重连
-（见第一章"消息可靠性"）。以下功能在代码中尚未接线或尚未提供界面入口，当前版本不可用：
+（见第一章"消息可靠性"）。以下功能已在后续轮次接通，当前版本可用：
 
 - 历史记录已支持分页：请求可携带游标与每页条数，私聊窗口提供「加载更早的消息」入口。
-- 消息类型枚举中已定义但**尚未接线**的类型只剩 `READ_RECEIPT`（已读回执），`chat_message` 表的
-  `read_flag` 同属预留列。`SEARCH_REQUEST`/`SEARCH_RESULT`（消息搜索）与 `MSG_RECALL`（消息撤回）
+- 消息类型枚举中已定义、但尚未接线的类型只剩 `READ_RECEIPT`（已读回执），`chat_message` 表的
+  `read_flag` 同属预留列；`SEARCH_REQUEST`/`SEARCH_RESULT`（消息搜索）与 `MSG_RECALL`（消息撤回）
   已在服务端、客户端与界面接通。
 - 界面（第 3 轮）已交付：左右消息气泡（自己靠右、他人靠左、系统消息居中）、多行输入
   （Enter 发送 / Shift+Enter 换行、输入法组合期间不误发）、智能时间戳、空状态、
@@ -483,7 +473,42 @@ java -cp "out/production/lanchat-master:lib/mysql-connector-j-8.2.0.jar" com.cha
 
 ### 11.3 其它
 
-- 本项目的已知设计取舍与历史缺陷修复记录见 `docs/test/测试报告.md` 的缺陷记录章节；
-  本轮审查确认、但需要跨模块改造才能彻底解决的问题见 `docs/known-issues.md`。
+- 本项目的已知设计取舍见 `docs/known-issues.md`；
+  代码运转与评分点映射见 `docs/代码导读.md`。
 - 本项目以 MySQL 作为唯一存储，不存在"文件存储模式"与 `db.enabled` 开关等历史配置。
 - 全部代码与文档为原创实现，未复制网络或往届代码。
+
+---
+
+## 十二、打包提交
+
+课程提交只需要源码、配置模板、SQL、依赖 jar 与文档。以下内容属于本机开发环境或运行期数据，
+**不要打进压缩包**：
+
+| 排除项 | 原因 |
+|---|---|
+| `.git/` | 版本库历史，不是交付内容；历史中可能含有早期配置文件 |
+| `.idea/`、`*.iml`、`.vscode/` | 本机 IDE 配置，换机器会失效，且每个人的路径不同 |
+| `config/chat.properties` | 含真实数据库口令、加密口令、管理员口令与 AI 令牌，**绝对不能提交** |
+| `data/export/*`、`data/received/*` | 本机聊天记录与接收文件，属于个人数据 |
+| `out/`、`build/`、`*.class` | 编译产物，可由源码重新生成 |
+
+Linux / macOS 打包示例（`data/` 下的空目录由程序运行时自动创建，无需保留）：
+
+```bash
+zip -r lanchat-submit.zip . \
+    -x '.git/*' '.idea/*' '*.iml' '.vscode/*' \
+       'config/chat.properties' \
+       'data/export/*' 'data/received/*' \
+       'out/*' 'build/*' '*.class'
+```
+
+打包后自检：
+
+```bash
+unzip -l lanchat-submit.zip | grep -E 'chat\.properties$|\.class$|/out/|\.idea/'   # 应无输出
+unzip -l lanchat-submit.zip | grep 'chat.properties.example'                       # 应有模板
+```
+
+Windows 下用资源管理器或 7-Zip 手动排除上表各项即可。提交前再确认一次
+`config/` 下只有 `chat.properties.example`，没有 `chat.properties`。

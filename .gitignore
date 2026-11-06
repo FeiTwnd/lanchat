@@ -18,6 +18,10 @@ data/received/*
 .idea/
 *.iml
 .vscode/
+.obsidian/
+
+# 打包产物
+*.zip
 
 # 过程文档（仅本地留存，不纳入版本管理）
 docs/superpowers/

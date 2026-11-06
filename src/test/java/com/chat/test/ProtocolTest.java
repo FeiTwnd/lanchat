@@ -5,6 +5,7 @@ import com.chat.common.ChatMessageFactory;
 import com.chat.common.Constants;
 import com.chat.common.FileMessage;
 import com.chat.common.Message;
+import com.chat.common.MessageFilter;
 import com.chat.common.MessageType;
 import com.chat.common.TextMessage;
 import com.chat.common.User;
@@ -53,11 +54,11 @@ public class ProtocolTest {
 
         int readBefore = readAll(stream, ObjectInputFilter.Config.createFilter(onlyBytesTight));
         String reasonBefore = lastStopReason;
-        int readAfter = readAll(stream, ChatMessageFactory.serializationFilter());
+        int readAfter = readAll(stream, MessageFilter.forServerInput());
         String reasonAfter = lastStopReason;
         System.out.println("        证据：同一段 " + stream.length / 1024 + " KB 报文，"
                 + "maxbytes=4MiB 读出 " + readBefore + " 条后停止（" + reasonBefore + "），"
-                + "线上 maxbytes=1GiB 读出 " + readAfter + " 条后停止（" + reasonAfter + "）");
+                + "线上每条消息独立预算读出 " + readAfter + " 条后停止（" + reasonAfter + "）");
 
         TestRunner.assertTrue(readBefore < 70,
                 "4MiB 累计上限下应当被拒绝，实际却读完了全部报文");
@@ -84,11 +85,11 @@ public class ProtocolTest {
 
         int readBefore = readAll(stream, ObjectInputFilter.Config.createFilter(onlyRefsTight));
         String reasonBefore = lastStopReason;
-        int readAfter = readAll(stream, ChatMessageFactory.serializationFilter());
+        int readAfter = readAll(stream, MessageFilter.forServerInput());
         String reasonAfter = lastStopReason;
         System.out.println("        证据：同一段 " + stream.length + " 字节 / 300 条纯文本报文，"
                 + "maxrefs=1000 读出 " + readBefore + " 条后停止（" + reasonBefore + "），"
-                + "线上 maxrefs=50000000 读出 " + readAfter + " 条后停止（" + reasonAfter + "）");
+                + "线上每条消息独立预算读出 " + readAfter + " 条后停止（" + reasonAfter + "）");
 
         TestRunner.assertTrue(readBefore < 300,
                 "maxrefs=1000 下应当在累计引用耗尽后被拒绝，实际却读完了全部报文");
@@ -103,10 +104,10 @@ public class ProtocolTest {
     }
 
     /**
-     * 拼出只改动某一处的过滤器串，其余限度与线上保持一致。
+     * 拼出只改动某一处的过滤器串，其余维度的取值与线上白名单一致。
      *
-     * <p>这样写而不是把整串复制一遍：限度值将来再调整时，本测试不会因为
-     * "复制品与线上不同步"而变成一条永远通过的假证据。</p>
+     * <p>这里刻意保留 JDK 过滤器的 {@code maxbytes}/{@code maxrefs} <b>累计</b>语义：
+     * 对照组要复现的正是"把累计量当单条上限"的旧问题，不能换成按条重置的 {@link MessageFilter}。</p>
      *
      * @param override 形如 {@code maxbytes=4194304} 的覆盖项
      * @return 过滤器串
@@ -354,6 +355,11 @@ public class ProtocolTest {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(data))) {
             in.setObjectInputFilter(filter);
             while (true) {
+                // 线上过滤器按每条消息重置预算；测试必须复现同样的读取方式，
+                // 否则测到的是"整条连接累计"，与线上行为不是一回事
+                if (filter instanceof MessageFilter perMessage) {
+                    perMessage.beginMessage();
+                }
                 in.readObject();
                 read++;
             }
