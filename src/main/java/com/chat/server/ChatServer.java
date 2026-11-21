@@ -66,6 +66,12 @@ public final class ChatServer {
     /** 会话令牌记录内的字段分隔符；用户名本身受字符集约束，不会包含该字符，因此可安全拼接 */
     private static final String TOKEN_SEPARATOR = "|";
 
+    /** 默认路由探测目标：仅用于让操作系统选择出网网卡，UDP connect 不会发送任何报文 */
+    private static final String ROUTE_PROBE_HOST = "8.8.8.8";
+
+    /** 默认路由探测端口（DNS），同样只用于选路 */
+    private static final int ROUTE_PROBE_PORT = 53;
+
     /** 单例持有者：利用类加载机制保证线程安全的懒加载 */
     private static final class Holder {
         /** 唯一实例 */
@@ -416,8 +422,18 @@ public final class ChatServer {
     /**
      * 获取本机用于对外通告的局域网地址。
      *
-     * <p>取值顺序：优先返回第一个非回环网卡上的 IPv4 地址，全部取不到时再回退
-     * {@code InetAddress.getLocalHost()}，最后兜底 127.0.0.1。</p>
+     * <p>取值顺序：</p>
+     * <ol>
+     *   <li>通过一次不发送报文的 UDP connect，由系统按默认路由选出实际出网网卡的 IPv4；</li>
+     *   <li>取不到时枚举网卡，跳过虚拟网卡与链路本地地址（169.254.*）后取第一个 IPv4；</li>
+     *   <li>仍取不到时回退 {@code InetAddress.getLocalHost()}；</li>
+     *   <li>最后兜底 127.0.0.1。</li>
+     * </ol>
+     *
+     * <p>为什么不直接取“第一个非回环网卡”：Windows 上 Java 的网卡枚举顺序不保证
+     * 物理网卡在前，装有 Hyper-V/WSL/VMware 的机器经常先枚举到虚拟网卡
+     * （例如 Hyper-V 默认交换机的 172.18.48.1）。若把这个局域网不可达的地址写进
+     * UDP 发现应答，其他客户端会“发现了服务器却连不上”。</p>
      *
      * <p>为什么不直接用 {@code getLocalHost()}：在不少 Linux 发行版上该名称解析到
      * {@code /etc/hosts} 中指向回环地址的记录（例如 127.0.1.1），导致 UDP 自动发现
@@ -426,18 +442,24 @@ public final class ChatServer {
      * @return 本机 IP 字符串
      */
     public String localAddress() {
+        String routed = routedAddress();
+        if (routed != null) {
+            return routed;
+        }
         try {
             java.util.Enumeration<java.net.NetworkInterface> interfaces =
                     java.net.NetworkInterface.getNetworkInterfaces();
             while (interfaces.hasMoreElements()) {
                 java.net.NetworkInterface networkInterface = interfaces.nextElement();
                 if (!networkInterface.isUp() || networkInterface.isLoopback()
-                        || !networkInterface.supportsMulticast()) {
+                        || !networkInterface.supportsMulticast()
+                        || isVirtualInterface(networkInterface)) {
                     continue;
                 }
                 for (java.net.InterfaceAddress address : networkInterface.getInterfaceAddresses()) {
                     InetAddress candidate = address.getAddress();
-                    if (candidate instanceof java.net.Inet4Address && !candidate.isLoopbackAddress()) {
+                    if (candidate instanceof java.net.Inet4Address && !candidate.isLoopbackAddress()
+                            && !candidate.isLinkLocalAddress()) {
                         return candidate.getHostAddress();
                     }
                 }
@@ -446,11 +468,66 @@ public final class ChatServer {
             LOGGER.log(Level.FINE, "网卡枚举失败，回退 getLocalHost()", e);
         }
         try {
-            return InetAddress.getLocalHost().getHostAddress();
+            InetAddress localHost = InetAddress.getLocalHost();
+            if (localHost instanceof java.net.Inet4Address && !localHost.isLoopbackAddress()
+                    && !localHost.isLinkLocalAddress()) {
+                return localHost.getHostAddress();
+            }
         } catch (IOException e) {
             LOGGER.log(Level.FINE, "获取本机地址失败，回退 127.0.0.1", e);
-            return "127.0.0.1";
         }
+        return "127.0.0.1";
+    }
+
+    /**
+     * 按默认路由确定本机实际出网网卡的 IPv4 地址。
+     *
+     * <p>实现方式：创建一个未绑定的 UDP 套接字并 {@code connect} 到一个外部地址。
+     * UDP 的 connect 只设置对端地址、不产生任何报文，操作系统会按路由表为这次
+     * “连接”选择源地址，因此能拿到真实出网网卡的地址。若机器没有默认路由
+     * （例如纯隔离局域网且未配置网关），connect 会失败，调用方回退到网卡枚举。</p>
+     *
+     * @return 可路由的本机 IPv4 地址；无法确定时返回 null
+     */
+    private String routedAddress() {
+        try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
+            socket.connect(InetAddress.getByName(ROUTE_PROBE_HOST), ROUTE_PROBE_PORT);
+            InetAddress local = socket.getLocalAddress();
+            if (local instanceof java.net.Inet4Address && !local.isLoopbackAddress()
+                    && !local.isLinkLocalAddress()) {
+                return local.getHostAddress();
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "按默认路由获取本机地址失败，回退网卡枚举: " + e.getMessage(), e);
+        }
+        return null;
+    }
+
+    /**
+     * 判断网卡是否为虚拟/过滤类网卡（Hyper-V、WSL、VMware、VirtualBox、Npcap 等）。
+     *
+     * <p>这些网卡同样处于 up 状态并支持组播，但地址在局域网内不可路由，
+     * 不能作为对外通告地址。该方法只在按默认路由取址失败时作为兜底过滤使用；
+     * 正常路径下 {@link #routedAddress()} 已能选对物理网卡。</p>
+     *
+     * @param networkInterface 网卡
+     * @return 虚拟网卡返回 true
+     */
+    private boolean isVirtualInterface(java.net.NetworkInterface networkInterface) {
+        if (networkInterface.isVirtual()) {
+            return true;
+        }
+        String name = (networkInterface.getDisplayName() + " " + networkInterface.getName())
+                .toLowerCase(java.util.Locale.ROOT);
+        String[] markers = {"hyper-v", "vethernet", "virtual", "vmware", "virtualbox", "wsl",
+                "docker", "npcap", "wfp", "wan miniport", "wi-fi direct", "bluetooth",
+                "kernel debug", "tap-", "tun"};
+        for (String marker : markers) {
+            if (name.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

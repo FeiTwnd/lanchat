@@ -205,12 +205,11 @@ public class DiscoveryClient {
             byte[] buffer = new byte[RECEIVE_BUFFER_SIZE];
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             socket.receive(packet);
-            String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
-                    StandardCharsets.UTF_8);
-            ServerInfo info = parse(text);
+            // 不能假设先到的包一定来自回环：同一次发现还发过广播，局域网服务器的应答
+            // 完全可能先到。统一按报文来源地址收录，才不会把远端服务器误标成 127.0.0.1。
+            ServerInfo info = parse(packet);
             if (info != null) {
-                // 应答中的地址可能是 0.0.0.0 或非回环地址，本机场景统一归一化为回环地址更可靠
-                servers.add(new ServerInfo(loopback.getHostAddress(), info.getPort(), info.getOnlineCount()));
+                servers.add(info);
             }
         } catch (SocketTimeoutException e) {
             LOGGER.fine("回环探测未获应答，继续等待广播应答");
@@ -238,9 +237,7 @@ public class DiscoveryClient {
             try {
                 socket.setSoTimeout((int) Math.max(1, deadline - System.currentTimeMillis()));
                 socket.receive(packet);
-                String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
-                        StandardCharsets.UTF_8);
-                ServerInfo info = parse(text);
+                ServerInfo info = parse(packet);
                 if (info == null) {
                     continue;
                 }
@@ -256,6 +253,31 @@ public class DiscoveryClient {
                 return;
             }
         }
+    }
+
+    /**
+     * 解析应答报文，并以报文的真实来源地址作为服务器地址。
+     *
+     * <p>为什么不信报文里自称的地址：服务器可能把 Hyper-V/WSL 等虚拟网卡的地址
+     * 写进应答（局域网内不可达），而 UDP 应答的来源地址一定是数据包实际经过的
+     * 网卡地址，用它连接才能保证可达。本机回环探测的应答来源就是 127.0.0.1，
+     * 因此也不需要再额外做地址归一化。</p>
+     *
+     * @param packet 已接收的数据包
+     * @return 服务器信息；格式非法时返回 null
+     */
+    private ServerInfo parse(DatagramPacket packet) {
+        String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
+                StandardCharsets.UTF_8);
+        ServerInfo announced = parse(text);
+        if (announced == null) {
+            return null;
+        }
+        InetAddress source = packet.getAddress();
+        if (source == null) {
+            return announced;
+        }
+        return new ServerInfo(source.getHostAddress(), announced.getPort(), announced.getOnlineCount());
     }
 
     /**
