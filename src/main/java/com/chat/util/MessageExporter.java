@@ -13,38 +13,20 @@ import java.nio.file.Files;
 import java.util.List;
 
 /**
- * 聊天记录导出文本的渲染与落盘。
- *
- * <p>职责：把消息列表渲染为"一行一条记录"的纯文本，并写成文件。之所以放在公共包，
- * 是因为导出链路横跨两台机器——服务端负责查数据库并渲染，客户端只负责把渲染好的文本
- * 存到自己的磁盘上。格式只在这里实现一份，两端的导出结果必然一致。</p>
- *
- * <p>设计要点：行分隔符固定使用 {@code \n}。导出文本可能经网络从服务端传到客户端，
- * 用平台相关的 {@code lineSeparator} 会让"切分再拼接"多出一层不可见差异，固定字符最省心。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 把聊天记录渲染为纯文本并写入文件。
  */
 public final class MessageExporter {
-
-    /** 导出文本的表头分隔线 */
+    /** 导出文本中位于表头与记录之间的分隔行。 */
     private static final String SEPARATOR = "========================================";
 
-    /**
-     * 工具类禁止实例化。
-     */
     private MessageExporter() {
     }
 
     /**
-     * 取一条消息用于展示或导出的单行正文。
+     * 提取消息的单行正文。
      *
-     * <p>刻意不用 {@link Message#getSummary()}：文本消息的摘要会截断到 30 个字符，
-     * 用它渲染历史记录与导出文件都会丢掉后半段内容。换行会破坏"一行一条记录"的格式，
-     * 因此统一压成空格。</p>
-     *
-     * @param message 消息
-     * @return 单行正文，永不为 null
+     * @param message 消息对象
+     * @return 去掉换行后的正文文本
      */
     public static String contentOf(Message message) {
         String text;
@@ -60,15 +42,6 @@ public final class MessageExporter {
         return text == null ? "" : text.replace('\n', ' ').replace('\r', ' ');
     }
 
-    /**
-     * 拼接文件消息的展示文本：文件名与大小之后补上传输结果描述。
-     *
-     * <p>{@link FileMessage#getSummary()} 只有“文件名 (大小)”，
-     * 不带结果的话，历史记录里被拒绝或传输失败的文件会与成功传输的看起来一模一样。</p>
-     *
-     * @param file 文件消息
-     * @return 形如 {@code 报告.pdf (1.20 MB) - 文件传输完成} 的文本
-     */
     private static String fileText(FileMessage file) {
         String summary = file.getSummary();
         String detail = file.getMessage();
@@ -79,25 +52,21 @@ public final class MessageExporter {
     }
 
     /**
-     * 把消息列表渲染为完整的导出文本。
+     * 把消息列表渲染为导出文本。
      *
-     * @param messages 待导出消息
-     * @return 导出文本，每行以 {@code \n} 结尾
+     * @param messages 消息列表
+     * @return 导出文本
      */
     public static String render(List<Message> messages) {
         return render(messages, null);
     }
 
     /**
-     * 把消息列表渲染为完整的导出文本，并标注数据来源。
+     * 把消息列表渲染为带数据来源的导出文本。
      *
-     * <p>标注来源是为了自证清白：客户端只负责把服务端回传的文本落盘，
-     * 出现"导出内容不对"时，文件里写着是哪台服务器给的数据，一眼就能看出是不是连错了服务器
-     * （本项目确实出现过"客户端连着自己的服务端、导出的是本机数据"的排查事故）。</p>
-     *
-     * @param messages 待导出消息
-     * @param source   数据来源描述（形如 {@code 192.168.1.5:9527}），为空时不写该行
-     * @return 导出文本，每行以 {@code \n} 结尾
+     * @param messages 消息列表
+     * @param source 数据来源说明，为 null 时不写入
+     * @return 导出文本
      */
     public static String render(List<Message> messages, String source) {
         StringBuilder builder = new StringBuilder();
@@ -107,6 +76,7 @@ public final class MessageExporter {
             builder.append("数据来源: 服务器 ").append(source.trim()).append('\n');
         }
         builder.append(SEPARATOR).append('\n');
+        // 逐条输出时间、类型、收发方与正文
         for (Message message : messages) {
             builder.append('[').append(DateUtil.format(message.getTimestamp())).append("] ")
                     .append(message.getType().getDescription()).append(' ')
@@ -118,13 +88,13 @@ public final class MessageExporter {
     }
 
     /**
-     * 把消息列表导出为文本文件。
+     * 把消息写入目标文件。
      *
-     * @param messages 待导出消息
-     * @param target   目标文件
-     * @return 实际写入的消息条数
-     * @throws IOException   写入失败时抛出
-     * @throws ChatException 参数非法时抛出
+     * @param messages 消息列表
+     * @param target 目标文件
+     * @return 写入的记录条数
+     * @throws IOException 文件写入失败时抛出
+     * @throws ChatException 消息列表或目标文件为空时抛出
      */
     public static int write(List<Message> messages, File target) throws IOException, ChatException {
         if (target == null) {
@@ -138,11 +108,11 @@ public final class MessageExporter {
     }
 
     /**
-     * 把已渲染好的导出文本写到目标文件。
+     * 把文本写入文件，父目录不存在时自动创建。
      *
-     * @param content 导出文本
-     * @param target  目标文件
-     * @throws IOException 写入失败时抛出
+     * @param content 文本内容
+     * @param target 目标文件
+     * @throws IOException 文件写入失败时抛出
      */
     public static void writeText(String content, File target) throws IOException {
         FileUtil.ensureDir(target.getParent());

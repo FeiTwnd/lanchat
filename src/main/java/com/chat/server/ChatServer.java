@@ -34,120 +34,64 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 聊天服务器主类（单例）。
- *
- * <p>职责：</p>
- * <ol>
- *   <li>绑定 TCP 端口，循环接受客户端连接，并把每个连接交给线程池中的
- *       {@link ClientHandler} 处理；</li>
- *   <li>启动 UDP 发现应答器 {@link DiscoveryResponder}，让局域网内客户端能自动找到本服务器；</li>
- *   <li>启动心跳扫描任务，清理已掉线的连接；</li>
- *   <li>持有业务服务与在线用户管理器，作为服务器端唯一的组合根。</li>
- * </ol>
- *
- * <p>设计模式：单例（全局唯一服务器实例），并通过 {@link ServerObserver} 列表
- * 把事件推送给界面层，服务器核心不依赖任何 Swing 类型。</p>
- *
- * <p>线程模型：主线程负责 {@code start()} 与 {@code stop()}；
- * 接受连接由单独的守护线程执行；连接处理使用固定大小线程池；
- * 心跳扫描使用单线程调度池。所有线程均为守护线程，保证 JVM 可正常退出。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 聊天服务器主类，单例管理监听套接字、连接线程池、在线用户、业务服务与服务器观察者。
  */
 public final class ChatServer {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".ChatServer");
 
-    /** 会话令牌有效期（毫秒）：30 分钟，每次使用后从当次使用时刻重新计算 */
+    /** 会话令牌有效期，单位毫秒。 */
     private static final long SESSION_TOKEN_TTL_MILLIS = 30 * 60 * 1000L;
 
-    /** 会话令牌记录内的字段分隔符；用户名本身受字符集约束，不会包含该字符，因此可安全拼接 */
+    /** 会话令牌记录中用户名与过期时间的分隔符。 */
     private static final String TOKEN_SEPARATOR = "|";
 
-    /** 默认路由探测目标：仅用于让操作系统选择出网网卡，UDP connect 不会发送任何报文 */
+    /** 默认路由探测使用的目标地址。 */
     private static final String ROUTE_PROBE_HOST = "8.8.8.8";
 
-    /** 默认路由探测端口（DNS），同样只用于选路 */
+    /** 默认路由探测使用的目标端口。 */
     private static final int ROUTE_PROBE_PORT = 53;
 
-    /** 单例持有者：利用类加载机制保证线程安全的懒加载 */
+    /** 单例持有类。 */
     private static final class Holder {
-        /** 唯一实例 */
         private static final ChatServer INSTANCE = new ChatServer();
     }
 
-    /** 服务器运行状态 */
     private volatile boolean running;
 
-    /** TCP 服务套接字 */
     private ServerSocket serverSocket;
 
-    /** 连接处理线程池 */
     private ExecutorService connectionPool;
 
-    /** 心跳扫描调度器 */
     private ScheduledExecutorService heartbeatScanner;
 
-    /** 接受连接的线程 */
     private Thread acceptThread;
 
-    /** UDP 发现应答器 */
     private DiscoveryResponder discoveryResponder;
 
-    /** 在线用户管理器 */
     private final UserManager userManager = new UserManager();
 
-    /**
-     * 会话令牌表：令牌 -> “用户名|过期时刻毫秒”。
-     *
-     * <p>值刻意用竖线拼接的字符串承载，而不是新建一个令牌模型类：这个二元组只在签发、
-     * 校验、续期、清理四处出现，为一个瞬时结构引入类型反而增加跳转成本。</p>
-     *
-     * <p>线程安全：连接线程会并发地签发与校验令牌，因此使用 {@link ConcurrentHashMap}；
-     * 令牌只存在于内存中，服务器重启即全部失效。</p>
-     */
+    /** 会话令牌表，键为令牌，值为用户名与过期时间的拼接串。 */
     private final Map<String, String> sessionTokens = new ConcurrentHashMap<>();
 
-    /**
-     * 用户业务服务（延迟初始化）。
-     *
-     * <p>刻意不在字段处直接 new：业务服务在构造时会读取数据目录配置，
-     * 若单例在配置就绪前被获取（例如仅查询运行状态），就会把数据目录固化到错误的位置。
-     * 改为 {@code start()} 时再创建，确保读到的永远是启动时刻的最新配置。</p>
-     */
     private UserService userService;
 
-    /** 消息业务服务（延迟初始化，原因同上） */
     private MessageService messageService;
 
-    /** 文件传输日志服务（延迟初始化，原因同上） */
     private FileLogService fileLogService;
 
-    /**
-     * 智能体小助手服务（延迟初始化，原因同上）。
-     *
-     * <p>未配置令牌与 workflow_id 时它依然会被创建，只是 {@code isEnabled()} 为 false，
-     * 服务器行为与接入前完全一致：不注册虚拟成员，也不拦截任何私聊。</p>
-     */
     private AiAssistantService aiAssistant;
 
-    /** 已建立的连接处理器，用于停止服务器时统一关闭 */
     private final List<ClientHandler> handlers = new ArrayList<>();
 
-    /** 服务器事件观察者 */
     private final List<ServerObserver> observers = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-    /** 实际监听的端口 */
     private int port = Config.serverPort();
 
-    /** 私有构造，禁止外部实例化 */
     private ChatServer() {
     }
 
     /**
-     * 获取服务器单例。
+     * 返回服务器单例。
      *
      * @return 服务器实例
      */
@@ -158,11 +102,7 @@ public final class ChatServer {
     /**
      * 启动服务器。
      *
-     * <p>启动流程：校验加密口令是否配置 -> 初始化业务服务并校验数据库可用性 ->
-     * 初始化管理员账号 -> 绑定 TCP 端口 -> 启动接受线程 -> 启动 UDP 应答器 ->
-     * 启动心跳扫描。任一步骤失败都会回滚已占用的资源，避免“半启动”状态。</p>
-     *
-     * @return 启动成功返回 true；端口被占用等失败情况返回 false
+     * @return 启动成功返回 true，配置或端口异常时返回 false
      */
     public synchronized boolean start() {
         if (running) {
@@ -170,8 +110,7 @@ public final class ChatServer {
             return true;
         }
         try {
-            // 加密口令缺失与数据库不可用同级：缺失时消息只能用不可控的密钥落库，
-            // 或者根本写不进库，与其启动后在收发消息时才报错，不如在启动阶段明确拒绝
+            // 校验消息加密口令
             if (Config.messageSecret().trim().isEmpty()) {
                 String reason = "未配置 security.message.secret，消息加密口令缺失，服务器拒绝启动；"
                         + "请在 config/chat.properties 中配置后重启（口令一旦变更，历史密文将无法解密）";
@@ -180,9 +119,9 @@ public final class ChatServer {
                 rollback();
                 return false;
             }
+            // 初始化业务服务
             initServices();
-            // 存储只保留数据库，因此数据库不可用时不存在"降级运行"这一选项：
-            // 与其让服务器起来却无法注册/登录/查历史，不如明确拒绝启动并说明原因
+
             if (!userService.isStorageAvailable() || !messageService.isStorageAvailable()) {
                 String reason = !userService.isStorageAvailable()
                         ? userService.storageFailureReason() : messageService.storageFailureReason();
@@ -192,20 +131,20 @@ public final class ChatServer {
                 return false;
             }
             if (!fileLogService.isStorageAvailable()) {
-                // 传输日志属于旁路审计：不可用时给出提示即可，不应阻止服务器启动
                 LOGGER.warning("文件传输日志表不可用，文件传输将不会写入 chat_file_log: "
                         + fileLogService.storageFailureReason());
             }
             userService.initAdminIfAbsent();
             registerAiAssistant();
+            // 创建监听套接字与线程池
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);
-            // 采用「按需创建、空闲回收」的线程池：每个连接的处理线程会一直阻塞在读取消息上，
-            // 固定大小线程池会让超出线程数的连接永久排队（表现为服务器已接受连接却毫无响应）。
+
             connectionPool = new ThreadPoolExecutor(0, Config.maxConnections(),
                     Constants.WORKER_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
                     new SynchronousQueue<>(), namedFactory("chat-worker-"));
             heartbeatScanner = Executors.newSingleThreadScheduledExecutor(namedFactory("chat-heartbeat-"));
+            // 启动接受连接、发现应答与心跳扫描
             running = true;
             acceptThread = new Thread(this::acceptLoop, "chat-accept");
             acceptThread.setDaemon(true);
@@ -227,11 +166,7 @@ public final class ChatServer {
     }
 
     /**
-     * 停止服务器并释放全部资源。
-     *
-     * <p>顺序很关键：先置 {@code running=false} 阻止新连接，再关闭监听套接字解除
-     * {@code accept()} 阻塞，最后关闭线程池与所有连接。若顺序颠倒，
-     * 接受线程可能阻塞在 accept 上无法退出。</p>
+     * 停止服务器并释放资源。
      */
     public synchronized void stop() {
         if (!running) {
@@ -239,6 +174,7 @@ public final class ChatServer {
         }
         running = false;
         LOGGER.info("正在关闭服务器……");
+        // 停止接受新连接并关闭发现应答
         closeQuietly(serverSocket);
         if (discoveryResponder != null) {
             discoveryResponder.shutdown();
@@ -248,13 +184,15 @@ public final class ChatServer {
             acceptThread.interrupt();
             acceptThread = null;
         }
+        // 断开全部客户端并清空在线用户
         for (ClientHandler handler : new ArrayList<>(handlers)) {
             handler.close();
         }
         handlers.clear();
         userManager.clear();
-        // 会话令牌等同于短期登录凭据，服务器停止后必须一并作废，不能留到下次启动继续可用
+
         sessionTokens.clear();
+        // 关闭线程池与智能体服务
         shutdownPool(connectionPool);
         connectionPool = null;
         shutdownPool(heartbeatScanner);
@@ -264,15 +202,7 @@ public final class ChatServer {
         LOGGER.info("服务器已停止");
     }
 
-    /**
-     * 回滚启动过程中已占用的资源。
-     *
-     * <p>必须连同在线用户表一起清理，与 {@link #stop()} 保持一致：启动中途失败时
-     * （典型是端口被占用），虚拟成员可能已经注册进 userManager，而这条失败路径
-     * 过去只关套接字与线程池。结果是服务器明明没起来，{@code size()} 与
-     * {@code onlineUsers()} 却报告"有人在线"，下一次 {@code start()} 也会带着这批
-     * 陈旧状态继续跑。</p>
-     */
+    /** 回收启动过程中已分配的资源。 */
     private void rollback() {
         running = false;
         closeQuietly(serverSocket);
@@ -289,11 +219,7 @@ public final class ChatServer {
         shutdownAiAssistant();
     }
 
-    /**
-     * 关闭线程池。
-     *
-     * @param pool 线程池，可为 null
-     */
+    /** 关闭线程池，超时后强制终止。 */
     private void shutdownPool(ExecutorService pool) {
         if (pool == null) {
             return;
@@ -304,17 +230,11 @@ public final class ChatServer {
                 pool.shutdownNow();
             }
         } catch (InterruptedException e) {
-            // 恢复中断标志，交由上层决定是否继续等待
             Thread.currentThread().interrupt();
             pool.shutdownNow();
         }
     }
 
-    /**
-     * 关闭套接字，忽略异常。
-     *
-     * @param socket 套接字，可为 null
-     */
     private void closeQuietly(ServerSocket socket) {
         if (socket == null) {
             return;
@@ -326,18 +246,14 @@ public final class ChatServer {
         }
     }
 
-    /**
-     * 接受连接的主循环。
-     *
-     * <p>循环直到 {@code running} 为 false 或套接字被关闭；单次接受失败不退出循环，
-     * 避免瞬时异常导致服务器停止服务。</p>
-     */
+    /** 循环接受客户端连接并提交到连接线程池。 */
     private void acceptLoop() {
         while (running) {
             try {
                 Socket socket = serverSocket.accept();
                 socket.setKeepAlive(true);
                 socket.setTcpNoDelay(true);
+                // 连接数达到上限时拒绝新连接
                 if (handlers.size() >= Config.maxConnections()) {
                     LOGGER.warning("连接数达到上限，拒绝新连接: " + socket.getRemoteSocketAddress());
                     socket.close();
@@ -353,7 +269,7 @@ public final class ChatServer {
                 if (running) {
                     LOGGER.log(Level.WARNING, "接受连接异常: " + e.getMessage(), e);
                 }
-                // 服务器关闭时 accept 会抛 SocketException，此时正常退出循环
+
                 break;
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "接受连接失败: " + e.getMessage(), e);
@@ -362,20 +278,13 @@ public final class ChatServer {
         LOGGER.info("接受连接线程已退出");
     }
 
-    /**
-     * 登记连接处理器。
-     *
-     * @param handler 连接处理器
-     */
     private void registerHandler(ClientHandler handler) {
         synchronized (handlers) {
             handlers.add(handler);
         }
     }
 
-    /**
-     * 扫描空闲连接，关闭心跳超时的连接。
-     */
+    /** 扫描并断开心跳超时的连接。 */
     private void scanIdleConnections() {
         long now = System.currentTimeMillis();
         List<ClientHandler> snapshot;
@@ -390,26 +299,13 @@ public final class ChatServer {
         }
     }
 
-    /**
-     * 从连接列表中移除已关闭的处理器。
-     *
-     * <p>由 {@link ClientHandler#onConnectionClosed()} 回调，保证长跑服务器不会
-     * 因为连接列表持续增长而内存泄漏。</p>
-     *
-     * @param handler 已关闭的连接处理器
-     */
     void removeHandler(ClientHandler handler) {
         synchronized (handlers) {
             handlers.remove(handler);
         }
     }
 
-    /**
-     * 创建带自定义名称的线程工厂，便于用 jstack 定位线程。
-     *
-     * @param prefix 线程名前缀
-     * @return 线程工厂
-     */
+    /** 创建带统一前缀的守护线程工厂。 */
     private ThreadFactory namedFactory(String prefix) {
         AtomicInteger counter = new AtomicInteger(1);
         return runnable -> {
@@ -420,28 +316,12 @@ public final class ChatServer {
     }
 
     /**
-     * 获取本机用于对外通告的局域网地址。
+     * 返回本机可供客户端访问的 IPv4 地址。
      *
-     * <p>取值顺序：</p>
-     * <ol>
-     *   <li>通过一次不发送报文的 UDP connect，由系统按默认路由选出实际出网网卡的 IPv4；</li>
-     *   <li>取不到时枚举网卡，跳过虚拟网卡与链路本地地址（169.254.*）后取第一个 IPv4；</li>
-     *   <li>仍取不到时回退 {@code InetAddress.getLocalHost()}；</li>
-     *   <li>最后兜底 127.0.0.1。</li>
-     * </ol>
-     *
-     * <p>为什么不直接取“第一个非回环网卡”：Windows 上 Java 的网卡枚举顺序不保证
-     * 物理网卡在前，装有 Hyper-V/WSL/VMware 的机器经常先枚举到虚拟网卡
-     * （例如 Hyper-V 默认交换机的 172.18.48.1）。若把这个局域网不可达的地址写进
-     * UDP 发现应答，其他客户端会“发现了服务器却连不上”。</p>
-     *
-     * <p>为什么不直接用 {@code getLocalHost()}：在不少 Linux 发行版上该名称解析到
-     * {@code /etc/hosts} 中指向回环地址的记录（例如 127.0.1.1），导致 UDP 自动发现
-     * 应答里通告的是回环地址，同机与局域网内的客户端都会连接失败或误判。</p>
-     *
-     * @return 本机 IP 字符串
+     * @return 本机地址，无法获取时返回 127.0.0.1
      */
     public String localAddress() {
+        // 优先按默认路由取地址，其次枚举网卡
         String routed = routedAddress();
         if (routed != null) {
             return routed;
@@ -480,14 +360,9 @@ public final class ChatServer {
     }
 
     /**
-     * 按默认路由确定本机实际出网网卡的 IPv4 地址。
+     * 通过默认路由探测本机出口地址。
      *
-     * <p>实现方式：创建一个未绑定的 UDP 套接字并 {@code connect} 到一个外部地址。
-     * UDP 的 connect 只设置对端地址、不产生任何报文，操作系统会按路由表为这次
-     * “连接”选择源地址，因此能拿到真实出网网卡的地址。若机器没有默认路由
-     * （例如纯隔离局域网且未配置网关），connect 会失败，调用方回退到网卡枚举。</p>
-     *
-     * @return 可路由的本机 IPv4 地址；无法确定时返回 null
+     * @return 探测到的地址，失败时返回 null
      */
     private String routedAddress() {
         try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
@@ -503,16 +378,7 @@ public final class ChatServer {
         return null;
     }
 
-    /**
-     * 判断网卡是否为虚拟/过滤类网卡（Hyper-V、WSL、VMware、VirtualBox、Npcap 等）。
-     *
-     * <p>这些网卡同样处于 up 状态并支持组播，但地址在局域网内不可路由，
-     * 不能作为对外通告地址。该方法只在按默认路由取址失败时作为兜底过滤使用；
-     * 正常路径下 {@link #routedAddress()} 已能选对物理网卡。</p>
-     *
-     * @param networkInterface 网卡
-     * @return 虚拟网卡返回 true
-     */
+    /** 根据网卡标记判断是否为虚拟网卡。 */
     private boolean isVirtualInterface(java.net.NetworkInterface networkInterface) {
         if (networkInterface.isVirtual()) {
             return true;
@@ -530,28 +396,19 @@ public final class ChatServer {
         return false;
     }
 
-    /**
-     * 服务器是否运行中。
-     *
-     * @return 运行中返回 true
-     */
     public boolean isRunning() {
         return running;
     }
 
-    /**
-     * 获取监听端口。
-     *
-     * @return TCP 端口
-     */
     public int getPort() {
         return port;
     }
 
     /**
-     * 设置监听端口（仅允许在启动前调用）。
+     * 设置监听端口。
      *
      * @param port 端口号
+     * @throws IllegalStateException 服务器运行中时抛出
      */
     public void setPort(int port) {
         if (running) {
@@ -560,33 +417,19 @@ public final class ChatServer {
         this.port = port;
     }
 
-    /**
-     * 获取在线用户管理器。
-     *
-     * @return 用户管理器
-     */
     public UserManager getUserManager() {
         return userManager;
     }
 
-    /**
-     * 获取智能体小助手服务。
-     *
-     * @return 小助手服务；服务器尚未启动时返回 null
-     */
     public AiAssistantService getAiAssistant() {
         return aiAssistant;
     }
 
     /**
-     * 把一条提问转交智能体小助手，回答就绪后异步回投给提问者。
+     * 把用户提问转交智能体回答。
      *
-     * <p>本方法立即返回：等待外部平台响应发生在小助手自己的线程池里，
-     * 绝不能占用调用方那条连接的读取线程（详见
-     * {@link AiAssistantService}的异步说明）。</p>
-     *
-     * @param asker    提问者用户名
-     * @param question 提问正文
+     * @param asker 提问者用户名
+     * @param question 问题内容
      */
     public void askAi(String asker, String question) {
         AiAssistantService service = aiAssistant;
@@ -596,20 +439,6 @@ public final class ChatServer {
         service.ask(asker, question, this::deliverAiReply);
     }
 
-    /**
-     * 投递小助手的答复。
-     *
-     * <p>按用户名现查在线表而不是沿用提问时那条连接：问答是异步的，
-     * 等待期间提问者可能已经断线重连，只有现查才能把回答投到当前连接上；
-     * 确实已经离线时静默放弃——把回答存进离线队列只会让使用者下次登录时
-     * 收到一条早已过时的独角戏。</p>
-     *
-     * <p>本方法由问答线程池的线程调用，因此只做构造消息与投递，
-     * 不触碰任何界面对象。</p>
-     *
-     * @param asker 提问者用户名
-     * @param text  小助手要回复的正文
-     */
     private void deliverAiReply(String asker, String text) {
         if (text == null || text.isEmpty()) {
             return;
@@ -624,20 +453,16 @@ public final class ChatServer {
     }
 
     /**
-     * 签发会话令牌，供客户端断线重连时恢复登录态。
-     *
-     * <p>为什么令牌不落库：它的唯一用途是让客户端不必在内存中长期保留明文口令，
-     * 属于短期凭据；写入数据库只会把一次性凭据变成可长期利用的资产。
-     * 服务器重启后令牌全部失效，客户端退回重新登录即可。</p>
+     * 签发会话令牌。
      *
      * @param username 用户名
-     * @return 新签发的令牌（UUID）；用户名为空时返回空字符串
+     * @return 新令牌，用户名为空时返回空串
      */
     public String issueSessionToken(String username) {
         if (username == null || username.trim().isEmpty()) {
             return "";
         }
-        // 借签发时机顺带清理过期项：令牌数量与在线用户同量级，不值得为此单独养一个调度线程
+
         purgeExpiredSessionTokens();
         String token = UUID.randomUUID().toString();
         String name = username.trim();
@@ -647,13 +472,10 @@ public final class ChatServer {
     }
 
     /**
-     * 校验会话令牌并顺延其有效期。
+     * 校验会话令牌并顺延有效期。
      *
-     * <p>续期采用“写回原键”的方式：客户端始终持有同一个令牌，无需在每次重连后更换，
-     * 也就不会出现“新令牌尚未送达、旧令牌已失效”的空窗。</p>
-     *
-     * @param token 客户端提交的令牌
-     * @return 令牌有效时返回对应用户名；令牌为空、不存在、已过期或记录损坏时返回 null
+     * @param token 令牌
+     * @return 令牌对应的用户名，无效或过期时返回 null
      */
     public String touchSessionToken(String token) {
         if (token == null || token.trim().isEmpty()) {
@@ -679,7 +501,6 @@ public final class ChatServer {
             return null;
         }
         if (System.currentTimeMillis() > expiresAt) {
-            // 过期项立即移除：留在表中既占用内存，也会让后续校验重复走一遍解析
             sessionTokens.remove(key);
             return null;
         }
@@ -691,7 +512,7 @@ public final class ChatServer {
     /**
      * 清理已过期的会话令牌。
      *
-     * @return 本次清理掉的令牌条数
+     * @return 清理的令牌数量
      */
     public int purgeExpiredSessionTokens() {
         long now = System.currentTimeMillis();
@@ -715,12 +536,6 @@ public final class ChatServer {
         return removed;
     }
 
-    /**
-     * 初始化业务服务。
-     *
-     * <p>每次 {@code start()} 都重新创建服务实例，使数据目录等配置的变更
-     * （特别是测试中通过系统属性切换数据目录）能够被正确感知。</p>
-     */
     private void initServices() {
         this.userService = new UserService();
         this.messageService = new MessageService();
@@ -728,12 +543,6 @@ public final class ChatServer {
         this.aiAssistant = new AiAssistantService();
     }
 
-    /**
-     * 注册智能体小助手为一名虚拟成员，使其出现在所有客户端的好友树里。
-     *
-     * <p>未配置令牌或 workflow_id 时直接跳过：小助手不出现在成员列表里，
-     * 使用者也就不会点到一个永远不回话的名字。</p>
-     */
     private void registerAiAssistant() {
         if (aiAssistant == null || !aiAssistant.isEnabled()) {
             LOGGER.info("智能体小助手未启用：未配置 ai.api.token 或 ai.workflow.id，跳过注册");
@@ -747,12 +556,6 @@ public final class ChatServer {
                 + "，接口 " + aiAssistant.getApiUrl());
     }
 
-    /**
-     * 关闭智能体小助手服务。
-     *
-     * <p>停止与回滚两条路径都要调用：回滚发生在启动中途失败时，
-     * 此时线程池已经建好，不关就留下一个永远不会再被使用的出网线程池。</p>
-     */
     private void shutdownAiAssistant() {
         if (aiAssistant != null) {
             aiAssistant.shutdown();
@@ -760,35 +563,20 @@ public final class ChatServer {
         }
     }
 
-    /**
-     * 获取用户业务服务。
-     *
-     * @return 用户服务；服务器尚未启动时返回 null
-     */
     public UserService getUserService() {
         return userService;
     }
 
-    /**
-     * 获取消息业务服务。
-     *
-     * @return 消息服务；服务器尚未启动时返回 null
-     */
     public MessageService getMessageService() {
         return messageService;
     }
 
-    /**
-     * 获取文件传输日志服务。
-     *
-     * @return 文件传输日志服务；服务器尚未启动时返回 null
-     */
     public FileLogService getFileLogService() {
         return fileLogService;
     }
 
     /**
-     * 注册服务器事件观察者。
+     * 注册服务器观察者。
      *
      * @param observer 观察者
      */
@@ -799,7 +587,7 @@ public final class ChatServer {
     }
 
     /**
-     * 注销服务器事件观察者。
+     * 移除服务器观察者。
      *
      * @param observer 观察者
      */
@@ -808,9 +596,9 @@ public final class ChatServer {
     }
 
     /**
-     * 向所有观察者推送事件。
+     * 通知全部观察者。
      *
-     * @param type    事件类型
+     * @param type 事件类型
      * @param content 事件描述
      */
     public void notify(ServerObserver.EventType type, String content) {
@@ -824,12 +612,9 @@ public final class ChatServer {
     }
 
     /**
-     * 服务器入口：启动带图形控制台的服务器。
+     * 启动服务器控制台界面。
      *
-     * <p>服务器只保留图形控制台一种启动方式：控制台里能看到在线用户、运行日志与启停按钮，
-     * 比纯命令行输出更直观，也不必为同一套功能维护两条启动路径。</p>
-     *
-     * @param args 命令行参数（当前未使用，保留标准入口签名）
+     * @param args 命令行参数，未使用
      */
     public static void main(String[] args) {
         ChatServer server = ChatServer.getInstance();

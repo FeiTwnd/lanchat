@@ -21,59 +21,37 @@ import java.awt.Window;
 import java.time.LocalDateTime;
 
 /**
- * Swing 界面抽象基类。
- *
- * <p>职责：收敛所有窗口的公共行为——外观主题初始化、窗口居中、统一字体、
- * 统一的内边距与提示对话框，避免每个窗口重复写相同的样板代码。</p>
- *
- * <p>继承价值：子类只需关注“本窗口有什么控件、怎么布局”，
- * 通用能力由父类提供；这也是课程设计的继承评分点在本项目中的实际用途，
- * 而不是为了继承而继承。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * Swing 窗口基类，统一提供主题、字体、标题栏与常用对话框等公共能力。
+ * 子类在 body() 返回的内容面板上布局自己的控件。
  */
 public abstract class BaseUI extends JFrame {
-
-    /** 序列化版本号（Swing 组件可序列化，显式声明） */
     private static final long serialVersionUID = 20250110L;
 
-    /** 界面统一字体，避免依赖系统默认字体导致中文显示异常 */
     protected static final Font FONT_NORMAL = Theme.fontBase();
 
-    /** 标题字体 */
     protected static final Font FONT_BOLD = Theme.fontTitle();
 
-    /** 聊天气泡中“本人”消息的颜色 */
     protected static final Color COLOR_SELF = new Color(0x1E88E5);
 
-    /** 聊天气泡中“他人”消息的颜色 */
     protected static final Color COLOR_OTHER = new Color(0x2E7D32);
 
-    /** 系统通知颜色 */
     protected static final Color COLOR_SYSTEM = new Color(0x9E9E9E);
 
-    /** 错误提示颜色 */
     protected static final Color COLOR_ERROR = new Color(0xC62828);
 
-    /** 内容承载面板：子类统一在它之上布局，而不是直接挂到窗口上 */
     private final JPanel body = new JPanel(new java.awt.BorderLayout());
 
-    /** 自定义标题栏 */
     private transient SkinTitleBar titleBar;
 
     /**
-     * 构造窗口并完成通用初始化。
-     *
-     * <p>窗口采用无边框外观：由 {@link SkinTitleBar} 提供标题、拖动、最大化与关闭，
-     * 内容区通过 {@link #body()} 承载。这样做的代价是失去系统原生装饰，
-     * 因此关闭按钮必须分发标准窗口事件，保证各窗口既有的关闭逻辑不被绕过。</p>
+     * 创建窗口并完成主题、标题栏与字体等公共初始化。
      *
      * @param title 窗口标题
      */
     protected BaseUI(String title) {
         super(title);
         Theme.installDefaults();
+        // 去掉系统装饰，标题栏与边框由皮肤组件提供
         setUndecorated(true);
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         body.setBackground(Theme.BG);
@@ -87,49 +65,31 @@ public abstract class BaseUI extends JFrame {
         setContentPane(root);
 
         setMinimumSize(new Dimension(480, 360));
+        // 统一内容区字体
         applyFont(body);
         WindowResizer.install(this);
         getRootPane().putClientProperty("window.title", title);
     }
 
-    /**
-     * 获取内容承载面板。
-     *
-     * <p>子类应使用 {@code body().setLayout(...)} 与 {@code body().add(...)} 组装界面。</p>
-     *
-     * @return 内容面板
-     */
     protected JPanel body() {
         return body;
     }
 
-    /**
-     * 设置窗口标题，同时更新自定义标题栏文本。
-     *
-     * @param title 标题
-     */
     @Override
     public void setTitle(String title) {
         super.setTitle(title);
+        // 同步自定义标题栏上的标题文本
         if (titleBar != null) {
             titleBar.setTitleText(title);
         }
     }
 
-    /**
-     * 获取自定义标题栏。
-     *
-     * <p>供子类在标题栏上叠加状态提示（例如主窗口的未读合计角标）；
-     * 标题栏在构造时必定已创建，正常情况下不会是 null。</p>
-     *
-     * @return 标题栏
-     */
     protected SkinTitleBar titleBar() {
         return titleBar;
     }
 
     /**
-     * 递归设置组件字体，保证中文在所有平台上一致渲染。
+     * 递归为组件及其子组件设置统一字体。
      *
      * @param component 根组件
      */
@@ -143,9 +103,9 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 创建统一的白底卡片面板。
+     * 创建带内边距的卡片面板。
      *
-     * @return 带内边距的卡片面板
+     * @return 卡片面板
      */
     protected JPanel card() {
         JPanel panel = new JPanel(new java.awt.BorderLayout());
@@ -155,11 +115,11 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 创建统一的带内边距面板。
+     * 创建带可选标题边框的面板，并把内容放在中央。
      *
-     * @param content 面板内容
-     * @param title   边框标题，为 null 时不显示标题
-     * @return 面板对象
+     * @param title 标题，为 null 时不画标题边框
+     * @param content 内容组件
+     * @return 面板
      */
     protected JPanel titledPanel(String title, Component content) {
         JPanel panel = new JPanel(new java.awt.BorderLayout());
@@ -174,12 +134,6 @@ public abstract class BaseUI extends JFrame {
         return panel;
     }
 
-    /**
-     * 创建状态标签。
-     *
-     * @param text 初始文本
-     * @return 标签对象
-     */
     protected JLabel statusLabel(String text) {
         JLabel label = new JLabel(text);
         label.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
@@ -187,7 +141,7 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 把窗口居中显示在屏幕中央。
+     * 把窗口移到屏幕中央。
      */
     public void centerOnScreen() {
         Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
@@ -195,7 +149,7 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 显示信息提示框（线程安全）。
+     * 弹出提示对话框。
      *
      * @param message 提示内容
      */
@@ -204,7 +158,7 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 显示错误提示框（线程安全）。
+     * 弹出错误对话框。
      *
      * @param message 错误内容
      */
@@ -213,10 +167,10 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 显示确认对话框（线程安全，阻塞等待用户选择）。
+     * 弹出确认对话框并等待用户选择。
      *
-     * @param message 询问内容
-     * @return 用户选择“是”返回 true
+     * @param message 确认内容
+     * @return 用户选择“是”时返回 true
      */
     protected boolean confirm(String message) {
         final boolean[] result = {false};
@@ -230,10 +184,7 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 在事件分发线程中执行任务。
-     *
-     * <p>网络线程绝不能直接操作 Swing 组件，否则会出现界面闪烁、状态错乱甚至死锁；
-     * 本方法统一收口这一约束。</p>
+     * 在事件分发线程执行任务，已在事件分发线程时直接执行。
      *
      * @param task 待执行任务
      */
@@ -246,7 +197,7 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 在事件分发线程中同步执行任务并等待完成。
+     * 在事件分发线程执行任务并等待其结束。
      *
      * @param task 待执行任务
      */
@@ -265,19 +216,19 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 生成带时间戳的日志行，供各窗口统一格式。
+     * 给日志文本加上当前时间前缀。
      *
-     * @param message 内容
-     * @return 形如 {@code [10:20:30] 内容} 的文本
+     * @param message 日志内容
+     * @return 带时间前缀的一行文本
      */
     protected String logLine(String message) {
         return "[" + com.chat.util.DateUtil.formatTime(LocalDateTime.now()) + "] " + message;
     }
 
     /**
-     * 获取窗口显示名，用于日志。
+     * 返回窗口名称，标题为 null 时用应用名代替。
      *
-     * @return 窗口标题
+     * @return 窗口名称
      */
     public String windowName() {
         String title = getTitle();
@@ -285,9 +236,9 @@ public abstract class BaseUI extends JFrame {
     }
 
     /**
-     * 安全关闭窗口：先释放资源再 dispose。
+     * 关闭窗口，窗口为 null 时忽略。
      *
-     * @param window 目标窗口
+     * @param window 待关闭的窗口
      */
     protected static void safeDispose(Window window) {
         if (window != null) {

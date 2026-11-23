@@ -20,92 +20,42 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
 /**
- * 用户业务服务。
- *
- * <p>职责：承载用户注册、登录、资料修改、删除、查询等业务规则，
- * 是“界面/网络层”与“持久化层”之间唯一的业务出入口。</p>
- *
- * <p>为什么 Service 不设接口：全系统只有这一种用户业务实现，
- * 额外定义 {@code UserServiceInterface} 只会增加跳转成本而无任何替换收益。</p>
- *
- * <p>线程安全：持久化的线程安全由 {@link UserDao} 实现保证；本类额外持有的登录失败计数
- * 使用 {@link java.util.concurrent.ConcurrentHashMap}，可被多个连接线程并发读写，
- * 计数只用于限流，个别并发下的偏差不影响安全结论。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 用户业务服务，负责注册、登录、资料修改、删除与查询。
  */
 public class UserService {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".UserService");
 
-    /** 用户名格式校验器 */
     private static final Pattern USERNAME_PATTERN = Pattern.compile(Constants.USERNAME_PATTERN);
 
-    /**
-     * 系统保留用户名（存小写，比较时统一转小写）。
-     *
-     * <p><b>为什么必须显式拒绝，而不能只靠格式规则</b>：{@code ALL} 与 {@code SYSTEM}
-     * 都符合 {@link Constants#USERNAME_PATTERN}，却与协议里两个固定标识重名——
-     * {@code @ALL} 是导出范围中的"群聊大厅"（见 {@link Constants#BROADCAST_SCOPE}），
-     * {@code SYSTEM} 是系统消息的固定发送者（见 {@link Constants#SYSTEM_SENDER}）。
-     * 允许注册就会产生二义：导出"群聊"时可能导出一个真人账号的全套记录，
-     * 界面上的"SYSTEM"也可能指向某个普通用户而不是系统通知。</p>
-     *
-     * <p>{@code ai} 目前因不足 3 位已被用户名规则挡下，仍一并列入：规则一旦放宽，
-     * 这一行就是唯一还能拦住"真人占用智能体小助手用户名"的闸门。</p>
-     *
-     * <p>集合刻意放在本类内部而不是 {@link Constants}：它是一条注册业务规则，
-     * 与协议常量无关，放进去反而会让常量类承担业务判断。</p>
-     */
     private static final Set<String> RESERVED_USERNAMES = Set.of("all", "system", "ai");
 
-    /** 同一账号连续登录失败的最大次数，超过后开始锁定 */
     private static final int MAX_LOGIN_FAILURES = 5;
 
-    /** 登录失败锁定时长（分钟） */
     private static final int LOGIN_LOCK_MINUTES = 5;
 
-    /** 登录失败锁定时长（毫秒），由分钟数换算，避免在判断中重复写算式 */
     private static final long LOGIN_LOCK_MILLIS = LOGIN_LOCK_MINUTES * 60_000L;
 
-    /** 账号或口令错误的统一提示：用户不存在与密码错误必须完全一致，防止账号枚举 */
     private static final String LOGIN_FAILED_MESSAGE = "用户名或密码错误";
 
-    /** 限流生效时的提示，明确告知等待时长，避免用户反复重试 */
     private static final String LOGIN_LOCKED_MESSAGE = "登录失败次数过多，请 " + LOGIN_LOCK_MINUTES + " 分钟后再试";
 
-    /** 用户持久化实现 */
     private final UserDao userDao;
 
-    /**
-     * 登录失败计数器：键为「用户名小写@来源」，值为累计失败次数。
-     *
-     * <p>只放在内存中：限流是抵御在线暴破的实时防线，进程重启后清零可以接受；
-     * 落库反而会给每次失败增加一次数据库写入，把限流本身变成放大攻击的入口。</p>
-     */
+    /** 登录失败计数，键为“用户名小写@来源”。 */
     private final ConcurrentHashMap<String, Integer> loginFailureCounts = new ConcurrentHashMap<>();
 
-    /** 登录锁定起始时间：键与 {@link #loginFailureCounts} 相同，值为锁定开始时的毫秒时间戳 */
+    /** 登录锁定起始时间，键与失败计数相同，值为毫秒时间戳。 */
     private final ConcurrentHashMap<String, Long> loginLockStartTimes = new ConcurrentHashMap<>();
 
-    /**
-     * 默认构造：使用数据库存储（本项目唯一的存储方式）。
-     *
-     * <p>不做任何降级：数据库不可用时把原因记录下来，由
-     * {@link #isStorageAvailable()} 交给服务器启动自检统一汇报。</p>
-     */
     public UserService() {
         this.userDao = JdbcUserDao.fromConfig();
         LOGGER.info("用户服务使用数据库存储");
     }
 
     /**
-     * 指定 DAO 构造服务，便于单元测试注入内存或临时文件实现。
+     * 使用指定的用户存储创建服务。
      *
-     * @param userDao 用户持久化实现
-     * @throws IllegalArgumentException 当 userDao 为 null 时抛出
+     * @param userDao 用户存储实现
      */
     public UserService(UserDao userDao) {
         if (userDao == null) {
@@ -126,7 +76,7 @@ public class UserService {
     /**
      * 获取用户存储不可用的原因。
      *
-     * @return 原因描述；可用时返回空字符串
+     * @return 原因描述，可用时为空字符串
      */
     public String storageFailureReason() {
         return userDao instanceof JdbcUserDao ? ((JdbcUserDao) userDao).failureReason() : "";
@@ -135,14 +85,10 @@ public class UserService {
     /**
      * 注册新用户。
      *
-     * <p>业务规则：用户名需匹配 {@link Constants#USERNAME_PATTERN}、不是系统保留字
-     * （见 {@link #RESERVED_USERNAMES}）且全局唯一；密码长度 6-32；昵称为空时默认取用户名；
-     * 密码仅以“盐 + 散列”形式落盘。</p>
-     *
      * @param username 用户名
      * @param password 明文密码
      * @param nickname 昵称，可为空
-     * @return 成功时携带脱敏后的用户对象（不含散列与盐）
+     * @return 注册结果，成功时携带脱敏用户
      */
     public Result<User> register(String username, String password, String nickname) {
         Result<String> validation = validate(username, password);
@@ -154,6 +100,7 @@ public class UserService {
                 return Result.fail("用户名已存在: " + username);
             }
             User user = new User(username, normalizeNickname(nickname, username));
+            // 生成盐与密码散列
             user.setSalt(SecurityUtil.generateSalt());
             user.setPasswordHash(SecurityUtil.hashPassword(password, user.getSalt()));
             user.setRole(Constants.ROLE_USER);
@@ -171,16 +118,13 @@ public class UserService {
     }
 
     /**
-     * 初始化管理员账号（幂等）。
+     * 在管理员账号不存在时按配置创建。
      *
-     * <p>仅在账号不存在时创建，口令取配置项 {@code admin.password}。刻意不提供内置默认口令：
-     * 内置口令会让“忘记配置”退化成“所有人共用一个公开口令”。未配置或长度不合法时
-     * 只记录告警并跳过创建，由部署者自行补齐配置后重启。</p>
-     *
-     * @return 本次调用是否新建了管理员
+     * @return 本次是否新建了管理员账号
      */
     public boolean initAdminIfAbsent() {
         try {
+            // 已有管理员账号时跳过
             if (userDao.exists(Constants.ADMIN_USERNAME)) {
                 return false;
             }
@@ -190,6 +134,7 @@ public class UserService {
                         + "请在 config/chat.properties 中配置后重启");
                 return false;
             }
+            // 校验配置中的管理员密码长度
             if (password.length() < Constants.PASSWORD_MIN_LENGTH
                     || password.length() > Constants.PASSWORD_MAX_LENGTH) {
                 LOGGER.warning("admin.password 长度需为 " + Constants.PASSWORD_MIN_LENGTH + "-"
@@ -213,37 +158,17 @@ public class UserService {
         }
     }
 
-    /**
-     * 用户登录校验（来源未知）。
-     *
-     * <p>保留该重载是为了兼容既有调用方，实际逻辑委托给
-     * {@link #login(String, String, String)}，来源按 "unknown" 统计。</p>
-     *
-     * @param username 用户名
-     * @param password 明文密码
-     * @return 成功时携带脱敏用户对象及最近登录时间更新结果
-     */
     public Result<User> login(String username, String password) {
         return login(username, password, "unknown");
     }
 
     /**
-     * 用户登录校验（带来源标识）。
-     *
-     * <p>安全规则：</p>
-     * <ul>
-     *   <li>限流：同一「用户名 + 来源」连续失败达到 {@link #MAX_LOGIN_FAILURES} 次后锁定
-     *       {@link #LOGIN_LOCK_MINUTES} 分钟，抵御在线暴力破解；</li>
-     *   <li>防账号枚举：用户不存在与密码错误返回完全相同的提示文案，
-     *       避免攻击者据此判断某个用户名是否已注册；日志中仍区分记录以便排障；</li>
-     *   <li>透明升级：登录成功时若发现历史单轮散列，立即改用 PBKDF2 重新散列，
-     *       并与最近登录时间合并为同一次写库，不额外增加一次数据库往返。</li>
-     * </ul>
+     * 校验用户名与密码并完成登录。
      *
      * @param username 用户名
      * @param password 明文密码
-     * @param source   登录来源标识（如客户端 IP），可为 null，为 null 时按 "unknown" 统计
-     * @return 成功时携带脱敏用户对象及最近登录时间更新结果
+     * @param source 登录来源标识，参与失败计数
+     * @return 登录结果，成功时携带脱敏用户
      */
     public Result<User> login(String username, String password, String source) {
         if (username == null || username.trim().isEmpty()) {
@@ -253,9 +178,10 @@ public class UserService {
             return Result.fail("密码不能为空");
         }
         String name = username.trim();
-        // 用户名不区分大小写地统计失败次数，避免通过变换大小写绕过限流
+        // 失败计数按用户名与来源组合
         String failureKey = name.toLowerCase() + "@"
                 + (source == null || source.trim().isEmpty() ? "unknown" : source.trim());
+        // 锁定期内直接拒绝
         if (isLocked(failureKey)) {
             LOGGER.warning(() -> "登录被限流拒绝: " + name);
             return Result.fail(LOGIN_LOCKED_MESSAGE);
@@ -272,7 +198,9 @@ public class UserService {
                 recordFailure(failureKey);
                 return Result.fail(LOGIN_FAILED_MESSAGE);
             }
+            // 登录成功后清除失败计数
             clearFailures(failureKey);
+            // 单轮散列在登录成功时升级为 PBKDF2
             boolean upgraded = SecurityUtil.isLegacyHash(user.getPasswordHash());
             if (upgraded) {
                 user.setSalt(SecurityUtil.generateSalt());
@@ -291,15 +219,6 @@ public class UserService {
         }
     }
 
-    /**
-     * 判断指定计数键是否处于锁定期。
-     *
-     * <p>锁定到期后直接清除计数，使账号在等待期满后自动恢复可用，
-     * 不需要管理员手工解锁。</p>
-     *
-     * @param key 计数键（用户名小写@来源）
-     * @return 处于锁定期返回 true
-     */
     private boolean isLocked(String key) {
         Long lockStart = loginLockStartTimes.get(key);
         if (lockStart == null) {
@@ -312,11 +231,6 @@ public class UserService {
         return false;
     }
 
-    /**
-     * 记录一次登录失败，达到上限时开始计时锁定。
-     *
-     * @param key 计数键（用户名小写@来源）
-     */
     private void recordFailure(String key) {
         int failures = loginFailureCounts.merge(key, 1, Integer::sum);
         if (failures >= MAX_LOGIN_FAILURES) {
@@ -325,11 +239,6 @@ public class UserService {
         }
     }
 
-    /**
-     * 清除指定计数键的失败次数与锁定状态。
-     *
-     * @param key 计数键（用户名小写@来源）
-     */
     private void clearFailures(String key) {
         loginFailureCounts.remove(key);
         loginLockStartTimes.remove(key);
@@ -340,7 +249,7 @@ public class UserService {
      *
      * @param username 用户名
      * @param nickname 新昵称
-     * @return 成功时携带更新后的脱敏用户对象
+     * @return 修改结果，成功时携带脱敏用户
      */
     public Result<User> updateNickname(String username, String nickname) {
         if (nickname == null || nickname.trim().isEmpty()) {
@@ -368,20 +277,12 @@ public class UserService {
     /**
      * 修改头像。
      *
-     * <p>无需管理员审核：头像属于个人展示资料，与昵称同级，改错了自己再改回来即可。</p>
-     *
-     * <p>校验交给 {@link AvatarCodec}：只验 PNG 文件头与尺寸范围，不在服务端解码图片
-     * （原因见该类注释）。空值表示恢复默认头像，与"从未设置过"共用数据库里的 NULL
-     * 这一种存储形态，不引入第二种"空"的表示。</p>
-     *
-     * <p>刻意不截断超长输入：Base64 一旦被截断，解出来的就不是图片而是坏数据，
-     * 与其存下一段必然显示不出来的垃圾，不如明确拒绝并回执原因。</p>
-     *
      * @param username 用户名
-     * @param base64   头像 PNG 的 Base64 文本，传 null 或空串表示恢复默认头像
-     * @return 成功时携带脱敏后的用户副本
+     * @param base64 头像的 Base64 文本，空值表示恢复默认头像
+     * @return 修改结果，成功时携带脱敏用户
      */
     public Result<User> updateAvatar(String username, String base64) {
+        // 校验 Base64 头像数据
         String reason = AvatarCodec.check(base64);
         if (reason != null) {
             return Result.fail(reason);
@@ -406,14 +307,13 @@ public class UserService {
     /**
      * 修改密码。
      *
-     * <p>安全要求：必须校验旧密码，防止会话被劫持后直接改密码。</p>
-     *
-     * @param username    用户名
-     * @param oldPassword 旧密码
+     * @param username 用户名
+     * @param oldPassword 原密码
      * @param newPassword 新密码
-     * @return 操作结果
+     * @return 修改结果
      */
     public Result<Boolean> updatePassword(String username, String oldPassword, String newPassword) {
+        // 校验新密码长度
         Result<String> validation = validatePassword(newPassword);
         if (!validation.isSuccess()) {
             return Result.fail(validation.getMessage());
@@ -423,9 +323,11 @@ public class UserService {
             if (user == null) {
                 return Result.fail("用户不存在: " + username);
             }
+            // 校验原密码
             if (!SecurityUtil.verifyPassword(oldPassword, user.getSalt(), user.getPasswordHash())) {
                 return Result.fail("原密码错误");
             }
+            // 重新生成盐与密码散列
             user.setSalt(SecurityUtil.generateSalt());
             user.setPasswordHash(SecurityUtil.hashPassword(newPassword, user.getSalt()));
             if (!userDao.update(user)) {
@@ -439,11 +341,11 @@ public class UserService {
     }
 
     /**
-     * 删除用户（仅管理员）。
+     * 删除用户，仅管理员可执行。
      *
      * @param operator 操作者用户名
-     * @param target   被删除用户名
-     * @return 操作结果
+     * @param target 被删除的用户名
+     * @return 删除结果
      */
     public Result<Boolean> deleteUser(String operator, String target) {
         if (operator == null || target == null) {
@@ -453,6 +355,7 @@ public class UserService {
             return Result.fail("默认管理员账号不允许删除");
         }
         try {
+            // 仅管理员可以删除用户
             User admin = userDao.findByUsername(operator);
             if (admin == null || !admin.isAdmin()) {
                 LOGGER.warning(() -> "越权删除尝试: " + operator + " -> " + target);
@@ -471,10 +374,10 @@ public class UserService {
     }
 
     /**
-     * 按用户名查询用户（返回脱敏对象）。
+     * 按用户名查询用户。
      *
      * @param username 用户名
-     * @return 成功时携带脱敏用户对象
+     * @return 查询结果，成功时携带脱敏用户
      */
     public Result<User> findByUsername(String username) {
         try {
@@ -489,9 +392,9 @@ public class UserService {
     }
 
     /**
-     * 查询全部用户（返回脱敏对象列表），供管理端展示。
+     * 查询全部用户。
      *
-     * @return 成功时携带用户列表
+     * @return 脱敏后的用户列表
      */
     public Result<List<User>> listAll() {
         try {
@@ -504,9 +407,9 @@ public class UserService {
     }
 
     /**
-     * 统计注册用户数量。
+     * 统计用户数量。
      *
-     * @return 用户数量
+     * @return 用户数，查询失败返回 0
      */
     public long count() {
         try {
@@ -517,21 +420,12 @@ public class UserService {
         }
     }
 
-    /**
-     * 校验用户名与密码格式。
-     *
-     * <p>除格式规则外还要拒绝 {@link #RESERVED_USERNAMES} 中的系统保留字，
-     * 原因见该常量的注释：它们与协议里的固定标识重名，放行即产生二义。</p>
-     *
-     * @param username 用户名
-     * @param password 密码
-     * @return 校验结果
-     */
     private Result<String> validate(String username, String password) {
         if (username == null || !USERNAME_PATTERN.matcher(username).matches()) {
             return Result.fail("用户名需为 3-16 位字母、数字或下划线，且以字母开头");
         }
-        // 按小写比较：保留字的判定必须与大小写无关，否则 All、All_ 之类变体照样能注册
+
+        // 拒绝系统保留用户名
         if (RESERVED_USERNAMES.contains(username.toLowerCase(Locale.ROOT))) {
             LOGGER.info(() -> "注册被拒绝：用户名是系统保留字: " + username);
             return Result.fail("该用户名是系统保留字，请换一个");
@@ -539,12 +433,6 @@ public class UserService {
         return validatePassword(password);
     }
 
-    /**
-     * 校验密码长度。
-     *
-     * @param password 密码
-     * @return 校验结果
-     */
     private Result<String> validatePassword(String password) {
         if (password == null || password.length() < Constants.PASSWORD_MIN_LENGTH
                 || password.length() > Constants.PASSWORD_MAX_LENGTH) {
@@ -554,13 +442,6 @@ public class UserService {
         return Result.ok("校验通过", password);
     }
 
-    /**
-     * 归一化昵称：为空时退化为用户名，过长时截断。
-     *
-     * @param nickname 原始昵称
-     * @param username 用户名
-     * @return 合法昵称
-     */
     private String normalizeNickname(String nickname, String username) {
         if (nickname == null || nickname.trim().isEmpty()) {
             return username;
@@ -571,10 +452,10 @@ public class UserService {
     }
 
     /**
-     * 生成用于网络传输或界面展示的用户副本，剔除密码散列与盐。
+     * 复制一份用于对外传输的用户对象，不携带密码散列与盐。
      *
-     * @param user 原始用户
-     * @return 脱敏副本
+     * @param user 原用户对象
+     * @return 脱敏后的用户副本
      */
     private User copyForTransfer(User user) {
         User copy = new User(user.getUsername(), user.getNickname());
@@ -582,9 +463,7 @@ public class UserService {
         copy.setCreateTime(user.getCreateTime());
         copy.setLastLoginTime(user.getLastLoginTime());
         copy.setOnline(user.isOnline());
-        // 头像必须一并复制：登录成功后注册进 UserManager 的是这个副本，
-        // 漏掉这一行会让在线用户列表里所有人的头像恒为 null——
-        // 表现为"头像改了、数据库里也存了，但界面上就是不变"
+
         copy.setAvatar(user.getAvatar());
         return copy;
     }

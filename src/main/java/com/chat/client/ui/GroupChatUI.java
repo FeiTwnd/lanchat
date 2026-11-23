@@ -8,31 +8,19 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * 群聊窗口。
- *
- * <p>职责：展示所有在线用户都能看到的群聊消息与系统通知
- * （用户上线、下线、服务器公告等）。</p>
- *
- * <p>与私聊的差异：群聊消息的接收者为空字符串，系统通知同样广播，
- * 因此本面板的过滤条件相应放宽。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 群聊大厅窗口，承载群聊面板并在进入时显示系统提示。
  */
 public class GroupChatUI extends BaseUI {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250116L;
 
-    /** 聊天面板 */
     private final transient GroupChatPanel panel;
 
     /**
-     * 构造群聊窗口。
+     * 创建群聊窗口。
      *
-     * @param client      客户端实例
-     * @param nickname    当前用户昵称，仅用于标题展示
-     * @param onlineUsers 在线用户名提供者，用于群发文件
+     * @param client 已登录的客户端
+     * @param nickname 当前用户昵称
+     * @param onlineUsers 在线用户名列表的来源
      */
     public GroupChatUI(ChatClient client, String nickname, Supplier<List<String>> onlineUsers) {
         super(Constants.APP_NAME + " - 群聊大厅");
@@ -45,11 +33,6 @@ public class GroupChatUI extends BaseUI {
         centerOnScreen();
     }
 
-    /**
-     * 获取群聊面板，供外部投递消息。
-     *
-     * @return 群聊面板
-     */
     public GroupChatPanel getPanel() {
         return panel;
     }

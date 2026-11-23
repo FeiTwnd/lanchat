@@ -3,19 +3,10 @@ package com.chat.test;
 import com.chat.util.SecurityUtil;
 
 /**
- * 密码安全工具单元测试。
- *
- * <p>覆盖点：盐值随机性、散列不可逆特征、正确/错误密码校验、
- * 相同密码不同盐产生不同散列（防彩虹表的关键性质）。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 覆盖盐值生成、密码散列、密码校验与 SHA-256 校验和。
  */
 public class SecurityUtilTest {
-
-    /**
-     * 用例 1：生成的盐值长度与随机性。
-     */
+    /** 验证盐值长度固定为 32 且两次生成不同。 */
     @Test("盐值生成：长度 32 且两次生成不同")
     public void testGenerateSalt() {
         String first = SecurityUtil.generateSalt();
@@ -24,9 +15,7 @@ public class SecurityUtilTest {
         TestRunner.assertNotEquals(first, second, "两次生成的盐值不应相同");
     }
 
-    /**
-     * 用例 2：相同密码不同盐产生不同散列。
-     */
+    /** 验证相同密码搭配不同盐得到不同散列。 */
     @Test("散列一致性：相同密码 + 不同盐 结果不同")
     public void testHashWithDifferentSalt() {
         String salt1 = SecurityUtil.generateSalt();
@@ -40,9 +29,7 @@ public class SecurityUtilTest {
         TestRunner.assertNotEquals(hash1, hash2, "加盐后相同密码的散列必须不同");
     }
 
-    /**
-     * 用例 3：相同密码相同盐产生相同散列（可复现性）。
-     */
+    /** 验证相同密码与相同盐始终得到同一散列。 */
     @Test("散列可复现：相同密码 + 相同盐 结果一致")
     public void testHashDeterministic() {
         String salt = SecurityUtil.generateSalt();
@@ -50,9 +37,7 @@ public class SecurityUtilTest {
                 SecurityUtil.hashPassword("abc123", salt), "相同输入必须得到相同散列");
     }
 
-    /**
-     * 用例 4：正确密码校验通过、错误密码校验失败。
-     */
+    /** 验证正确密码通过校验，大小写不同或错误的密码被拒绝。 */
     @Test("密码校验：正确通过、错误拒绝")
     public void testVerifyPassword() {
         String salt = SecurityUtil.generateSalt();
@@ -65,9 +50,7 @@ public class SecurityUtilTest {
                 "错误密码应校验失败");
     }
 
-    /**
-     * 用例 5：空参数安全处理，不抛异常只返回失败。
-     */
+    /** 验证密码、盐或散列任一为空时校验返回 false。 */
     @Test("边界处理：空密码或空凭据返回 false")
     public void testNullSafety() {
         TestRunner.assertFalse(SecurityUtil.verifyPassword(null, "s", "h"), "空密码应返回 false");
@@ -75,9 +58,7 @@ public class SecurityUtilTest {
         TestRunner.assertFalse(SecurityUtil.verifyPassword("p", "s", null), "空散列应返回 false");
     }
 
-    /**
-     * 用例 6：凭据串的编码与解析。
-     */
+    /** 验证编码凭据可解析出盐与散列，非法格式解析为 null。 */
     @Test("凭据解析：encode 后可取出盐与散列")
     public void testEncodeAndParse() {
         String credential = SecurityUtil.encode("123456");
@@ -91,9 +72,7 @@ public class SecurityUtilTest {
         TestRunner.assertNull(SecurityUtil.extractHash("非法格式"), "非法格式应返回 null");
     }
 
-    /**
-     * 用例 7：字节数组 SHA-256 校验和计算。
-     */
+    /** 验证相同数据的 SHA-256 结果可复现，不同数据结果不同。 */
     @Test("文件校验：字节数组 SHA-256 可复现且长度正确")
     public void testSha256Hex() {
         byte[] data = "局域网聊天程序".getBytes(java.nio.charset.StandardCharsets.UTF_8);

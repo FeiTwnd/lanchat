@@ -18,37 +18,21 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 消息业务服务。
- *
- * <p>职责：聊天消息的保存（数据库）、检索与导出。检索支持“用户名 + 时间范围”两种条件的任意组合，
- * 以及按关键字全文模糊检索。</p>
- *
- * <p>设计要点：所有时间范围参数在进入 DAO 之前统一补全边界值
- * （起始日补 00:00:00，结束日补 23:59:59），避免用户输入“2025-01-01”这类纯日期时漏掉当天记录。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 消息业务服务，负责聊天记录的保存、查询、检索与导出。
  */
 public class MessageService {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".MessageService");
 
-    /** 消息持久化实现 */
     private final MessageDao messageDao;
 
-    /**
-     * 默认构造：使用数据库存储（本项目唯一的存储方式）。
-     */
     public MessageService() {
         this(JdbcMessageDao.fromConfig());
     }
 
     /**
-     * 指定 DAO 构造服务，便于测试。
+     * 使用指定的消息存储创建服务。
      *
-     * @param messageDao 消息持久化实现
-     * @throws IllegalArgumentException 当 messageDao 为 null 时抛出
+     * @param messageDao 消息存储实现
      */
     public MessageService(MessageDao messageDao) {
         if (messageDao == null) {
@@ -57,20 +41,10 @@ public class MessageService {
         this.messageDao = messageDao;
     }
 
-    /**
-     * 判断聊天记录存储是否可用。
-     *
-     * @return 可用返回 true
-     */
     public boolean isStorageAvailable() {
         return messageDao instanceof JdbcMessageDao && ((JdbcMessageDao) messageDao).isAvailable();
     }
 
-    /**
-     * 获取聊天记录存储不可用的原因。
-     *
-     * @return 原因描述；可用时返回空字符串
-     */
     public String storageFailureReason() {
         return messageDao instanceof JdbcMessageDao ? ((JdbcMessageDao) messageDao).failureReason() : "";
     }
@@ -78,11 +52,8 @@ public class MessageService {
     /**
      * 保存一条消息到历史记录。
      *
-     * <p>历史记录属于旁路功能：保存失败不应该阻断消息的正常转发，
-     * 因此本方法返回 {@link Result} 而非抛异常，调用方记录失败原因后可继续业务。</p>
-     *
-     * @param message 待保存消息
-     * @return 保存结果
+     * @param message 待保存的消息
+     * @return 保存结果，失败时携带原因
      */
     public Result<Boolean> saveMessage(Message message) {
         if (message == null) {
@@ -98,26 +69,27 @@ public class MessageService {
     }
 
     /**
-     * 查询聊天记录。
+     * 按日期范围查询聊天记录，起止日期均包含当天。
      *
-     * @param username 用户名，null 或空表示查询全部
-     * @param fromDate 起始日期（含），可为 null
-     * @param toDate   结束日期（含），可为 null
-     * @return 成功时携带按时间升序排列的消息列表
+     * @param username 用户名，空表示不限
+     * @param fromDate 起始日期，可为 null
+     * @param toDate 结束日期，可为 null
+     * @return 查询结果，成功时携带消息列表
      */
     public Result<List<Message>> queryHistory(String username, LocalDate fromDate, LocalDate toDate) {
+        // 起始日期取当天零点，结束日期取当天最后一刻
         LocalDateTime from = fromDate == null ? null : fromDate.atStartOfDay();
         LocalDateTime to = toDate == null ? null : toDate.atTime(LocalTime.MAX);
         return queryHistory(username, from, to);
     }
 
     /**
-     * 查询聊天记录（精确时间）。
+     * 按时间范围查询聊天记录。
      *
-     * @param username 用户名，null 或空表示查询全部
-     * @param from     起始时间（含），可为 null
-     * @param to       结束时间（含），可为 null
-     * @return 成功时携带消息列表
+     * @param username 用户名，空表示不限
+     * @param from 起始时间，可为 null
+     * @param to 结束时间，可为 null
+     * @return 查询结果，成功时携带消息列表
      */
     public Result<List<Message>> queryHistory(String username, LocalDateTime from, LocalDateTime to) {
         if (from != null && to != null && from.isAfter(to)) {
@@ -134,16 +106,11 @@ public class MessageService {
     }
 
     /**
-     * 在本人可见范围内按关键字检索聊天记录。
+     * 按关键字检索当前用户可见的聊天记录。
      *
-     * <p>为什么必须带请求者参数：底层 DAO 的检索是"全库逐行解密后匹配"，若把全库结果
-     * 直接回给客户端，任何登录用户都能搜到别人的私聊内容——这与历史查询曾经存在的越权问题同源。
-     * 因此服务层只暴露这个"带可见范围"的版本，全库检索能力留在 DAO 内部，
-     * 不给网络层留下误用的入口。</p>
-     *
-     * @param requester 请求者用户名（由服务端从登录态取得，不信任客户端提交值）
-     * @param keyword   关键字
-     * @return 成功时携带命中列表（仅本人可见部分）
+     * @param requester 检索发起人
+     * @param keyword 检索关键字
+     * @return 命中的记录
      */
     public Result<List<Message>> search(String requester, String keyword) {
         if (keyword == null || keyword.trim().isEmpty()) {
@@ -155,6 +122,7 @@ public class MessageService {
         String self = requester.trim();
         try {
             List<Message> visible = new ArrayList<>();
+            // 只保留当前用户作为发送者、接收者或群发的记录
             for (Message message : messageDao.search(keyword.trim())) {
                 if (visibleTo(message, self)) {
                     visible.add(message);
@@ -166,16 +134,6 @@ public class MessageService {
         }
     }
 
-    /**
-     * 判断一条记录是否对该用户可见。
-     *
-     * <p>可见范围与历史查询、导出保持同一口径：本人发送的、发给本人的，以及广播（接收者为空的群聊与系统通知）。
-     * 三者之外的一律不可见，避免"检索"成为绕过历史查询权限的旁路。</p>
-     *
-     * @param message  被判断的消息
-     * @param username 使用者用户名
-     * @return 可见返回 true
-     */
     private static boolean visibleTo(Message message, String username) {
         return username.equals(message.getSender())
                 || username.equals(message.getReceiver())
@@ -183,15 +141,11 @@ public class MessageService {
     }
 
     /**
-     * 把消息列表导出到指定文件。
+     * 把指定消息导出到文件。
      *
-     * <p>只负责"渲染 + 落盘"，不含"查哪条记录"的决策：界面上的导出由服务端查库、
-     * 客户端落盘（见 {@code ClientHandler.handleExportRequest}），本方法则是服务端本地
-     * 导出文件这一能力的入口。</p>
-     *
-     * @param messages 待导出消息
-     * @param target   目标文件
-     * @return 成功时携带导出文件对象
+     * @param messages 待导出的消息
+     * @param target 目标文件
+     * @return 导出结果，成功时携带目标文件
      */
     public Result<File> exportMessages(List<Message> messages, File target) {
         if (target == null) {
@@ -212,16 +166,6 @@ public class MessageService {
         }
     }
 
-    /**
-     * 判断稳定消息标识是否已存在。
-     *
-     * <p>供服务端落库前去重：网络重发或断线补投可能把同一条消息再次送达，
-     * 此处只做参数归一化与委托，判重规则由 DAO 决定。</p>
-     *
-     * @param messageId 稳定消息标识
-     * @return 已存在返回 true；messageId 为 null 或空白时返回 false
-     * @throws ChatException 读取失败时抛出
-     */
     public boolean existsByMessageId(String messageId) throws ChatException {
         if (messageId == null || messageId.trim().isEmpty()) {
             return false;
@@ -229,14 +173,6 @@ public class MessageService {
         return messageDao.existsByMessageId(messageId.trim());
     }
 
-    /**
-     * 查询某接收者尚未送达的消息，用于登录后的离线补投。
-     *
-     * @param receiver 接收者用户名
-     * @param limit    最多返回条数；小于等于 0 时由 DAO 使用默认值
-     * @return 按时间先后排列的消息列表，永不返回 null
-     * @throws ChatException 读取失败时抛出
-     */
     public List<Message> findUndelivered(String receiver, int limit) throws ChatException {
         if (receiver == null || receiver.trim().isEmpty()) {
             return new ArrayList<>();
@@ -244,13 +180,6 @@ public class MessageService {
         return messageDao.findUndelivered(receiver.trim(), limit);
     }
 
-    /**
-     * 批量把离线补投成功的消息标记为已送达。
-     *
-     * @param messageIds 稳定消息标识集合
-     * @return 实际更新的行数；messageIds 为 null 或空集合时返回 0
-     * @throws ChatException 更新失败时抛出
-     */
     public int markDelivered(Collection<String> messageIds) throws ChatException {
         if (messageIds == null || messageIds.isEmpty()) {
             return 0;
@@ -258,17 +187,6 @@ public class MessageService {
         return messageDao.markDelivered(messageIds);
     }
 
-    /**
-     * 按稳定消息标识查询单条消息。
-     *
-     * <p>撤回成功后需要通知会话对端，而"对端是谁"只能从原始记录里得到，
-     * 因此网络层需要这个查询入口；放在服务层是为了让网络层继续只依赖服务接口，
-     * 不必直接持有 DAO。</p>
-     *
-     * @param messageId 稳定消息标识；为 null 或空白时返回 null
-     * @return 命中返回消息对象，未命中返回 null
-     * @throws ChatException 读取失败时抛出
-     */
     public Message findByMessageId(String messageId) throws ChatException {
         if (messageId == null || messageId.trim().isEmpty()) {
             return null;
@@ -277,21 +195,12 @@ public class MessageService {
     }
 
     /**
-     * 撤回一条由本人发送且未超时的消息。
+     * 撤回一条消息。
      *
-     * <p>业务规则集中在这里而不是散落到网络层，原因是三条规则互相关联，分开实现容易出现
-     * "只校验了身份却忘了时限"这类漏洞：</p>
-     * <ol>
-     *   <li>消息必须存在（按稳定标识查询）；</li>
-     *   <li>只有发送者本人可以撤回，禁止撤回他人消息；</li>
-     *   <li>距发送时间不超过 {@link Constants#RECALL_WINDOW_MINUTES} 分钟；</li>
-     *   <li>已经撤回过的消息按幂等处理，返回成功而不是报错（客户端可能重发撤回请求）。</li>
-     * </ol>
-     *
-     * @param messageId 稳定消息标识
-     * @param requester 发起撤回的用户名（由服务端从登录态取得，不信任客户端提交值）
-     * @return 成功时返回 ok；失败时携带中文原因
-     * @throws ChatException 读取或更新失败时抛出
+     * @param messageId 消息标识
+     * @param requester 撤回发起人
+     * @return 撤回结果
+     * @throws ChatException 查询或更新失败时抛出
      */
     public Result<Boolean> recall(String messageId, String requester) throws ChatException {
         if (messageId == null || messageId.trim().isEmpty()) {
@@ -305,7 +214,7 @@ public class MessageService {
             return Result.fail("消息不存在或已过期，无法撤回");
         }
         if (!requester.trim().equals(message.getSender())) {
-            // 明确提示"只能撤回自己的消息"，而不是含糊的"操作失败"，便于使用者理解规则
+            // 只有发送者本人可以撤回
             return Result.fail("只能撤回自己发送的消息");
         }
         if (Constants.RECALLED_PLACEHOLDER.equals(message.getSummary())) {
@@ -319,23 +228,23 @@ public class MessageService {
         }
         boolean updated = messageDao.markRecalled(messageId.trim(), requester.trim());
         if (!updated) {
-            // 更新 0 行有两种可能：并发下已被撤回，或消息标识与发送者不匹配
+            // 更新 0 行时只记录日志
             LOGGER.info(() -> "撤回未更新任何行（可能已被并发撤回）: " + messageId);
         }
         return Result.ok("已撤回", Boolean.TRUE);
     }
 
     /**
-     * 键集分页查询聊天记录，供界面向上翻页加载更早的消息。
+     * 按键集分页查询聊天记录。
      *
-     * @param username 当前用户；null 或空白表示不限制
-     * @param peer     对端用户名；null 或空白表示不限定对端
-     * @param from     起始时间（含），可为 null
-     * @param to       结束时间（含），可为 null
-     * @param beforeId 分页游标；为 null 时从最新一条开始取
-     * @param limit    本页最多返回条数；小于等于 0 时由 DAO 使用默认值
-     * @return 按时间升序排列的消息列表，永不返回 null
-     * @throws ChatException 时间范围非法或读取失败时抛出
+     * @param username 当前用户名，空表示不限
+     * @param peer 对端用户名，空表示不限
+     * @param from 起始时间，可为 null
+     * @param to 结束时间，可为 null
+     * @param beforeId 上一页最后一条消息的编号，可为 null
+     * @param limit 每页条数
+     * @return 消息列表
+     * @throws ChatException 时间范围非法或查询失败时抛出
      */
     public List<Message> queryPage(String username, String peer, LocalDateTime from, LocalDateTime to,
                                    Long beforeId, int limit) throws ChatException {
@@ -348,9 +257,9 @@ public class MessageService {
     }
 
     /**
-     * 统计历史消息总数。
+     * 统计消息总数。
      *
-     * @return 消息条数
+     * @return 消息条数，查询失败返回 0
      */
     public long count() {
         try {
@@ -362,11 +271,9 @@ public class MessageService {
     }
 
     /**
-     * 生成历史记录查询的默认起始时间（最近 7 天）。
+     * 返回默认查询起点，即 7 天前的零点。
      *
-     * <p>供界面初始化日期选择器使用，避免默认查询全部记录造成界面卡顿。</p>
-     *
-     * @return 7 天前的 00:00:00
+     * @return 默认起始时间
      */
     public static LocalDateTime defaultFromTime() {
         return LocalDateTime.now().minusDays(7).with(LocalTime.MIN);

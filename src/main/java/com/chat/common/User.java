@@ -4,65 +4,37 @@ import java.io.Serializable;
 import java.time.LocalDateTime;
 
 /**
- * 用户实体类。
- *
- * <p>职责：描述一个账号的全部持久化信息（用户名、昵称、头像、密码散列、盐、角色、
- * 注册与登录时间），同时作为在线用户列表的载体在网络上传输（此时不携带敏感字段）。</p>
- *
- * <p>封装说明：所有字段私有，通过 getter/setter 访问；密码相关字段在序列化到客户端前
- * 必须由 {@link #clearCredential()} 清空，避免散列与盐随在线用户列表广播出去。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 用户账号信息，包含昵称、角色、头像与在线状态。
  */
 public class User implements Serializable {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250106L;
 
-    /** 登录用户名，全局唯一，作为持久化主键 */
     private String username;
 
-    /** 显示昵称，可重复，仅用于界面展示 */
     private String nickname;
 
-    /** 密码散列值（十六进制），格式为 {@code salt:hash} 中的 hash 部分 */
+    /** 密码哈希值 */
     private String passwordHash;
 
-    /** 密码盐值（十六进制），与散列分开存储以抵御彩虹表攻击 */
+    /** 密码哈希使用的盐值 */
     private String salt;
 
-    /** 角色：{@link Constants#ROLE_ADMIN} 或 {@link Constants#ROLE_USER} */
     private String role;
 
-    /** 注册时间 */
     private LocalDateTime createTime;
 
-    /** 最近一次登录时间 */
     private LocalDateTime lastLoginTime;
 
-    /** 是否在线（运行期状态，不持久化） */
     private boolean online;
 
-    /**
-     * 自定义头像（PNG 图片的 Base64 文本）；为 null 表示未设置，界面回落到默认剪影。
-     *
-     * <p>属于公共资料，因此 {@link #clearCredential()} 不清理它——头像本来就要随
-     * 在线用户列表下发给所有人看。</p>
-     *
-     * <p>长度上限与格式校验见 {@link Constants#AVATAR_MAX_LENGTH} 与
-     * {@link AvatarCodec}，服务端在写入前必须校验，不能依赖客户端自觉。</p>
-     */
+    /** Base64 编码的 PNG 头像 */
     private String avatar;
 
-    /**
-     * 无参构造，供文件反序列化与测试使用。
-     */
     public User() {
     }
 
     /**
-     * 构造用户。
+     * 创建普通用户并记录创建时间。
      *
      * @param username 用户名
      * @param nickname 昵称
@@ -74,202 +46,111 @@ public class User implements Serializable {
         this.createTime = LocalDateTime.now();
     }
 
-    /**
-     * 获取用户名。
-     *
-     * @return 用户名
-     */
     public String getUsername() {
         return username;
     }
 
-    /**
-     * 设置用户名。
-     *
-     * @param username 用户名
-     */
     public void setUsername(String username) {
         this.username = username;
     }
 
-    /**
-     * 获取昵称。
-     *
-     * @return 昵称
-     */
     public String getNickname() {
         return nickname;
     }
 
-    /**
-     * 设置昵称。
-     *
-     * @param nickname 昵称
-     */
     public void setNickname(String nickname) {
         this.nickname = nickname;
     }
 
-    /**
-     * 获取密码散列。
-     *
-     * @return 十六进制散列值，可能为 null（凭据已被清理）
-     */
     public String getPasswordHash() {
         return passwordHash;
     }
 
-    /**
-     * 设置密码散列。
-     *
-     * @param passwordHash 十六进制散列值
-     */
     public void setPasswordHash(String passwordHash) {
         this.passwordHash = passwordHash;
     }
 
-    /**
-     * 获取密码盐。
-     *
-     * @return 十六进制盐值，可能为 null（凭据已被清理）
-     */
     public String getSalt() {
         return salt;
     }
 
-    /**
-     * 设置密码盐。
-     *
-     * @param salt 十六进制盐值
-     */
     public void setSalt(String salt) {
         this.salt = salt;
     }
 
-    /**
-     * 获取角色。
-     *
-     * @return {@link Constants#ROLE_ADMIN} 或 {@link Constants#ROLE_USER}
-     */
     public String getRole() {
         return role;
     }
 
-    /**
-     * 设置角色。
-     *
-     * @param role 角色标识
-     */
     public void setRole(String role) {
         this.role = role;
     }
 
     /**
-     * 判断是否为管理员。
+     * 判断用户是否为管理员。
      *
-     * @return 角色为 ADMIN 时返回 true
+     * @return 管理员时返回 true
      */
     public boolean isAdmin() {
         return Constants.ROLE_ADMIN.equalsIgnoreCase(role);
     }
 
-    /**
-     * 获取注册时间。
-     *
-     * @return 注册时间
-     */
     public LocalDateTime getCreateTime() {
         return createTime;
     }
 
-    /**
-     * 设置注册时间。
-     *
-     * @param createTime 注册时间
-     */
     public void setCreateTime(LocalDateTime createTime) {
         this.createTime = createTime;
     }
 
-    /**
-     * 获取最近登录时间。
-     *
-     * @return 最近登录时间，从未登录时为 null
-     */
     public LocalDateTime getLastLoginTime() {
         return lastLoginTime;
     }
 
-    /**
-     * 设置最近登录时间。
-     *
-     * @param lastLoginTime 最近登录时间
-     */
     public void setLastLoginTime(LocalDateTime lastLoginTime) {
         this.lastLoginTime = lastLoginTime;
     }
 
-    /**
-     * 判断是否在线。
-     *
-     * @return 在线返回 true
-     */
     public boolean isOnline() {
         return online;
     }
 
-    /**
-     * 设置在线状态。
-     *
-     * @param online 在线状态
-     */
     public void setOnline(boolean online) {
         this.online = online;
     }
 
-    /**
-     * 清理密码凭据，用于把用户对象发送给客户端之前脱敏。
-     *
-     * <p>把自己从“持久化实体”临时降级为“公共资料对象”，避免散列与盐经网络泄露。</p>
-     *
-     * <p>刻意不动 {@link #avatar}：头像本就是公共资料，清掉它会让客户端收到一张空头像。</p>
-     */
+    /** 清空密码哈希与盐值。 */
     public void clearCredential() {
         this.passwordHash = null;
         this.salt = null;
     }
 
-    /**
-     * 获取自定义头像。
-     *
-     * @return PNG 图片的 Base64 文本；未设置时返回 null
-     */
     public String getAvatar() {
         return avatar;
     }
 
     /**
-     * 设置自定义头像。
+     * 设置头像数据，空字符串按未设置处理。
      *
-     * @param avatar PNG 图片的 Base64 文本，传 null 或空串表示恢复默认头像
+     * @param avatar Base64 编码的 PNG 头像
      */
     public void setAvatar(String avatar) {
         this.avatar = avatar == null || avatar.isEmpty() ? null : avatar;
     }
 
     /**
-     * 判断是否设置了自定义头像。
+     * 判断用户是否设置头像。
      *
-     * @return 已设置返回 true
+     * @return 已设置头像时返回 true
      */
     public boolean hasAvatar() {
         return avatar != null && !avatar.isEmpty();
     }
 
     /**
-     * 生成界面展示名：昵称（用户名）。
+     * 返回昵称与用户名的展示文本。
      *
-     * @return 形如 {@code 张三(alice)} 的展示名
+     * @return 昵称为空时返回用户名
      */
     public String getDisplayName() {
         if (nickname == null || nickname.isEmpty()) {
@@ -278,23 +159,12 @@ public class User implements Serializable {
         return nickname + "(" + username + ")";
     }
 
-    /**
-     * 输出用户摘要，刻意不包含密码散列与盐，防止凭据进入日志。
-     *
-     * @return 形如 {@code User{username=alice, nickname=张三, role=USER, online=true}} 的字符串
-     */
     @Override
     public String toString() {
         return "User{username=" + username + ", nickname=" + nickname
                 + ", role=" + role + ", online=" + online + "}";
     }
 
-    /**
-     * 以用户名为唯一标识判断相等性，便于放入集合去重。
-     *
-     * @param obj 比较对象
-     * @return 用户名相同则返回 true
-     */
     @Override
     public boolean equals(Object obj) {
         if (this == obj) {
@@ -307,11 +177,6 @@ public class User implements Serializable {
         return username != null && username.equals(other.username);
     }
 
-    /**
-     * 计算散列码。
-     *
-     * @return 基于用户名的散列码，与 {@link #equals(Object)} 保持一致
-     */
     @Override
     public int hashCode() {
         return username == null ? 0 : username.hashCode();

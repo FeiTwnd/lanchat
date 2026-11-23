@@ -8,41 +8,18 @@ import com.chat.service.UserService;
 import com.chat.util.SecurityUtil;
 
 /**
- * 用户业务服务单元测试。
- *
- * <p>覆盖点：注册成功、用户名格式校验、密码长度校验、重复用户名、
- * 登录成功/失败、昵称修改、密码修改（含原密码校验）、删除权限控制、查询。</p>
- *
- * <p>隔离策略：通过构造器注入指向独立测试库 {@code lanchat_test} 的 JDBC DAO
- * （见 {@link TestDatabase}），每个用例开始前清空 {@code chat_user} 表，
- * 既保证用例互不干扰，也不会污染开发者真实使用的库。
- * 数据库不可用时用例通过 {@link TestRunner#skip(String)} 报告跳过，而不是判为失败。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 覆盖注册、登录、资料修改、删除权限与用户列表脱敏。
  */
 public class UserServiceTest {
-
-    /** 当前用例使用的用户 DAO，与 service 共用同一实例，便于直接核对库中的原始记录 */
     private JdbcUserDao userDao;
 
-    /**
-     * 创建使用测试库的用户服务。
-     *
-     * <p>{@link TestDatabase#userDao()} 会先清空用户表，因此每个用例都从空库开始。</p>
-     *
-     * @return 用户服务实例
-     */
+    /** 重置测试库并构造用户服务。 */
     private UserService createService() {
         userDao = TestDatabase.userDao();
         return new UserService(userDao);
     }
 
-    /**
-     * 用例 1：注册成功并返回脱敏用户对象。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证注册成功，返回对象不含密码散列与盐值。 */
     @Test("用户服务：注册成功且返回对象不含密码散列")
     public void testRegisterSuccess() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -60,11 +37,7 @@ public class UserServiceTest {
         TestRunner.assertEquals(1L, userDao.count(), "测试库中应恰好有 1 条用户记录");
     }
 
-    /**
-     * 用例 2：用户名与密码格式校验。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证用户名与密码格式非法时拒绝注册。 */
     @Test("用户服务：用户名与密码格式非法时拒绝注册")
     public void testRegisterValidation() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -84,11 +57,7 @@ public class UserServiceTest {
         TestRunner.assertEquals(0L, userDao.count(), "非法请求不应写入任何用户");
     }
 
-    /**
-     * 用例 3：重复用户名注册被拒绝。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证重复用户名注册失败并提示用户名已存在。 */
     @Test("用户服务：重复用户名注册失败")
     public void testRegisterDuplicate() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -103,14 +72,7 @@ public class UserServiceTest {
         TestRunner.assertEquals(1L, userDao.count(), "重复注册后库中仍应只有 1 条记录");
     }
 
-    /**
-     * 用例 4：登录成功与失败。
-     *
-     * <p>失败分支同时校验"账号不存在"与"密码错误"返回完全一致的文案，
-     * 防止攻击者通过提示差异枚举出哪些用户名已注册。</p>
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证正确凭据可登录并记录最近登录时间，错误凭据统一提示。 */
     @Test("用户服务：登录成功并可查询到最近登录时间")
     public void testLogin() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -136,11 +98,7 @@ public class UserServiceTest {
         TestRunner.assertFalse(service.login("carol", "").isSuccess(), "空密码应失败");
     }
 
-    /**
-     * 用例 5：密码以加盐 PBKDF2 散列形式存储。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证数据库保存的是加盐散列而非明文密码。 */
     @Test("用户服务：数据库中的密码为加盐散列，不含明文")
     public void testPasswordHashed() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -164,11 +122,7 @@ public class UserServiceTest {
                 "保存的散列应能校验原始密码");
     }
 
-    /**
-     * 用例 6：修改昵称。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证修改昵称后查询结果与数据库同步更新。 */
     @Test("用户服务：修改昵称后查询结果更新")
     public void testUpdateNickname() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -185,11 +139,7 @@ public class UserServiceTest {
         TestRunner.assertFalse(service.updateNickname("nobody", "x").isSuccess(), "用户不存在应失败");
     }
 
-    /**
-     * 用例 7：修改密码需要正确的原密码。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证修改密码需校验原密码，修改后新密码可登录。 */
     @Test("用户服务：修改密码校验原密码，并可用新密码登录")
     public void testUpdatePassword() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -205,15 +155,7 @@ public class UserServiceTest {
         TestRunner.assertFalse(service.login("frank", "123456").isSuccess(), "旧密码应失效");
     }
 
-    /**
-     * 用例 8：删除用户的权限控制。
-     *
-     * <p>管理员账号直接写入而不是调用 {@link UserService#initAdminIfAbsent()}：
-     * 后者依赖 {@code admin.password} 配置，本用例只关注删除权限，
-     * 不应因为部署环境是否配置了管理员口令而失败。</p>
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证普通用户无权删除用户，管理员可删除且默认管理员受保护。 */
     @Test("用户服务：普通用户无权删除，管理员可删除")
     public void testDeletePermission() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -241,11 +183,7 @@ public class UserServiceTest {
                 Constants.ADMIN_USERNAME).isSuccess(), "默认管理员不允许被删除");
     }
 
-    /**
-     * 用例 9：用户列表查询不泄露凭据。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证用户列表返回脱敏后的用户对象。 */
     @Test("用户服务：列表查询返回脱敏用户对象")
     public void testListAll() throws Exception {
         if (!TestDatabase.isAvailable()) {

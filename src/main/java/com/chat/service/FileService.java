@@ -20,79 +20,37 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 文件传输业务服务。
- *
- * <p>职责：文件发送端的“分块读取”与接收端的“分块落盘 + 完整性校验”，
- * 是文件传输模块的核心业务逻辑，GUI 与网络层都只调用本类。</p>
- *
- * <p>分块协议：</p>
- * <ol>
- *   <li>发送端调用 {@link #prepareSend(File)} 生成 FILE_REQUEST 消息（含大小、块数、SHA-256）；</li>
- *   <li>接收端同意后，发送端循环调用 {@link #createChunkMessage} 投递数据块；</li>
- *   <li>接收端调用 {@link #appendChunk} 顺序落盘，并通过 {@link #progressOf} 读取进度；</li>
- *   <li>全部块收完后调用 {@link #finishReceive}，此时才做 SHA-256 比对，防止“收到一半就报成功”。</li>
- * </ol>
- *
- * <p>并发设计：接收会话使用 {@link ConcurrentHashMap} 管理，支持同一时刻多个对端并发传文件；
- * 单个会话内部使用显式锁保证“写文件 + 更新进度”的原子性。发送端使用
- * {@link RandomAccessFile} 支持按块随机定位读取，避免为每个块重新打开文件。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 文件传输业务服务，负责发送端分块读取与接收端分块落盘、完整性校验。
  */
 public class FileService {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".FileService");
 
-    /** 接收会话表：传输编号 -> 会话对象 */
     private final Map<String, ReceivingFile> receivingFiles = new ConcurrentHashMap<>();
 
-    /** 发送会话表：传输编号 -> 发送句柄 */
     private final Map<String, SendingFile> sendingFiles = new ConcurrentHashMap<>();
 
-    /** 单文件大小上限（字节），读取自配置文件，缺省为内置默认值 */
+    /** 单文件大小上限（字节）。 */
     private final long maxFileSize = com.chat.common.Config.maxFileSize();
 
-    /**
-     * 构造文件服务。
-     */
     public FileService() {
-        // 上限在构造时固化，避免每条消息都读取配置
     }
 
-    /**
-     * 获取当前生效的单文件大小上限。
-     *
-     * @return 字节数
-     */
     public long getMaxFileSize() {
         return maxFileSize;
     }
 
-    /**
-     * 把字节上限转换为可读文本，用于错误提示。
-     *
-     * @return 形如 {@code 200.00 MB} 的文本
-     */
     private String maxFileSizeText() {
         return FileUtil.humanSize(maxFileSize);
     }
 
     /**
-     * 生成文件传输请求消息。
+     * 校验待发送文件并生成文件请求消息。
      *
-     * <p>业务校验：文件必须存在、是普通文件、可读且体积不超过
-     * {@link Constants#MAX_FILE_SIZE}（实际取配置项 {@code file.max.size} 的生效值）；
-     * 任一不满足直接抛出 {@link FileTransferException}，
-     * 让调用方明确得到“为什么发不出去”。空文件允许发送，按 1 个空块传输，
-     * 与 {@link com.chat.common.FileMessage#failReason()} 的块数口径保持一致。</p>
-     *
-     * @param sender   发送者用户名
+     * @param sender 发送者用户名
      * @param receiver 接收者用户名
-     * @param file     待发送文件
-     * @return 已填充元信息的 FILE_REQUEST 消息
-     * @throws FileTransferException 文件不合法或读取失败时抛出
+     * @param file 待发送文件
+     * @return 文件请求消息
+     * @throws FileTransferException 文件无效、超过大小上限或元信息构造失败时抛出
      */
     public FileMessage prepareSend(String sender, String receiver, File file) throws FileTransferException {
         if (file == null) {
@@ -109,6 +67,7 @@ public class FileService {
                     + "，当前 " + FileUtil.humanSize(file.length()));
         }
         try {
+            // 填充文件元信息并计算 SHA-256
             FileMessage request = ChatMessageFactory.file(sender, receiver, MessageType.FILE_REQUEST);
             request.setTransferId(UUID.randomUUID().toString());
             request.setFileName(safeFileName(file.getName()));
@@ -117,9 +76,10 @@ public class FileService {
             request.setSha256(FileUtil.sha256(file));
             String reason = request.failReason();
             if (reason != null) {
-                // 读出文件后才可能发现元信息自相矛盾，这里提前失败，避免把非法请求发给对端
+                // 元信息校验未通过
                 throw new FileTransferException("无法发送文件：" + reason);
             }
+            // 登记发送会话
             sendingFiles.put(request.getTransferId(), new SendingFile(file));
             LOGGER.info(() -> "准备发送文件 " + file.getName() + "（"
                     + FileUtil.humanSize(file.length()) + "，" + request.getTotalChunks() + " 块）");
@@ -130,14 +90,14 @@ public class FileService {
     }
 
     /**
-     * 按块序号构造数据块消息。
+     * 读取指定序号的数据块并生成数据块消息。
      *
-     * @param sender     发送者用户名
-     * @param receiver   接收者用户名
-     * @param request    原始请求消息（提供传输编号与文件信息）
-     * @param chunkIndex 块序号，从 0 开始
-     * @return FILE_CHUNK 消息；当块序号超出范围时返回 null 表示已发送完毕
-     * @throws FileTransferException 读取失败时抛出
+     * @param sender 发送者用户名
+     * @param receiver 接收者用户名
+     * @param request 文件请求消息
+     * @param chunkIndex 数据块序号，从 0 开始
+     * @return 数据块消息，序号越界时返回 null
+     * @throws FileTransferException 发送会话不存在或读取失败时抛出
      */
     public FileMessage createChunkMessage(String sender, String receiver, FileMessage request, int chunkIndex)
             throws FileTransferException {
@@ -169,12 +129,12 @@ public class FileService {
     }
 
     /**
-     * 构造传输结束消息。
+     * 生成文件传输结束消息。
      *
-     * @param sender   发送者用户名
+     * @param sender 发送者用户名
      * @param receiver 接收者用户名
-     * @param request  原始请求消息
-     * @return FILE_END 消息
+     * @param request 文件请求消息
+     * @return 结束消息
      */
     public FileMessage createEndMessage(String sender, String receiver, FileMessage request) {
         FileMessage end = ChatMessageFactory.file(sender, receiver, MessageType.FILE_END);
@@ -199,14 +159,12 @@ public class FileService {
     }
 
     /**
-     * 创建接收会话，准备落盘。
+     * 校验请求并创建接收会话与目标文件。
      *
-     * <p>目标目录不存在时自动创建；文件重名时自动追加序号，绝不覆盖已有文件。</p>
-     *
-     * @param receiverDir 保存目录
-     * @param request     文件请求消息
-     * @return 接收会话编号
-     * @throws FileTransferException 创建失败时抛出
+     * @param receiverDir 接收目录，空值使用默认目录
+     * @param request 文件请求消息
+     * @return 传输编号
+     * @throws FileTransferException 请求非法或目标文件创建失败时抛出
      */
     public String openReceive(String receiverDir, FileMessage request) throws FileTransferException {
         validateRequest(request);
@@ -214,9 +172,11 @@ public class FileService {
             String dir = (receiverDir == null || receiverDir.trim().isEmpty())
                     ? Constants.RECEIVED_DIR : receiverDir;
             FileUtil.ensureDir(dir);
+            // 创建唯一的接收文件
             File target = FileUtil.uniqueTarget(dir, safeFileName(request.getFileName()));
             ReceivingFile receiving = new ReceivingFile(request.getTransferId(), target,
                     request.getTotalChunks(), request.getFileSize());
+            // 登记接收会话
             receivingFiles.put(request.getTransferId(), receiving);
             LOGGER.info(() -> "开始接收文件，保存到 " + target.getAbsolutePath());
             return request.getTransferId();
@@ -226,17 +186,11 @@ public class FileService {
     }
 
     /**
-     * 接收一个数据块并顺序落盘。
+     * 将数据块按序写入接收文件。
      *
-     * <p>严格校验块序号连续性：若收到的块序号与期望不符，说明网络乱序或对端实现有误，
-     * 立即抛异常并清理残缺文件，绝不写入错位数据。</p>
-     *
-     * <p>在连续性之前先做范围校验：声明总块数为 N 时，序号只允许落在 {@code [0, N)}，
-     * 否则说明对端在请求之外伪造了数据块，必须当场拒绝。</p>
-     *
-     * @param chunk FILE_CHUNK 消息
-     * @return 当前累计接收字节数
-     * @throws FileTransferException 会话不存在、块序号越界或错乱、写盘失败时抛出
+     * @param chunk 数据块消息
+     * @return 已接收的字节数
+     * @throws FileTransferException 会话不存在、块序号越界或写入失败时抛出
      */
     public long appendChunk(FileMessage chunk) throws FileTransferException {
         if (chunk == null || chunk.getTransferId() == null) {
@@ -248,6 +202,7 @@ public class FileService {
         }
         int index = chunk.getChunkIndex();
         if (index < 0 || index >= receiving.getTotalChunks()) {
+            // 块序号越界时取消整个接收
             cancelReceive(chunk.getTransferId());
             throw new FileTransferException("数据块序号越界：允许 0 - " + (receiving.getTotalChunks() - 1)
                     + "，实际 " + index, chunk.getTransferId());
@@ -261,11 +216,11 @@ public class FileService {
     }
 
     /**
-     * 结束接收：关闭文件并校验 SHA-256。
+     * 结束接收，校验块数、字节数与 SHA-256。
      *
-     * @param end FILE_END 消息
-     * @return 保存成功的文件对象
-     * @throws FileTransferException 块数不足、校验和比对失败或文件缺失时抛出
+     * @param end 传输结束消息
+     * @return 接收完成的文件
+     * @throws FileTransferException 会话不存在、落盘失败或校验失败时抛出
      */
     public File finishReceive(FileMessage end) throws FileTransferException {
         if (end == null || end.getTransferId() == null) {
@@ -283,8 +238,7 @@ public class FileService {
             receiving.discard();
             throw new FileTransferException("文件落盘失败: " + e.getMessage(), end.getTransferId());
         } catch (FileTransferException e) {
-            // 块数不足或校验和不一致都意味着文件不完整，必须删除残缺文件，
-            // 否则用户会在接收目录看到一个“看起来正常但内容损坏”的文件
+            // 校验失败时删除残缺文件
             receiving.discard();
             throw e;
         }
@@ -304,10 +258,10 @@ public class FileService {
     }
 
     /**
-     * 获取接收进度（0.0 - 1.0）。
+     * 查询接收进度。
      *
      * @param transferId 传输编号
-     * @return 进度比例；会话不存在时返回 0
+     * @return 进度比例，取值 0.0 到 1.0；会话不存在返回 0.0
      */
     public double progressOf(String transferId) {
         ReceivingFile receiving = transferId == null ? null : receivingFiles.get(transferId);
@@ -315,10 +269,10 @@ public class FileService {
     }
 
     /**
-     * 获取已接收字节数。
+     * 查询已接收的字节数。
      *
      * @param transferId 传输编号
-     * @return 已接收字节数；会话不存在时返回 0
+     * @return 已接收字节数；会话不存在返回 0
      */
     public long receivedBytesOf(String transferId) {
         ReceivingFile receiving = transferId == null ? null : receivingFiles.get(transferId);
@@ -326,14 +280,10 @@ public class FileService {
     }
 
     /**
-     * 校验文件请求消息的合法性。
+     * 校验文件请求的必填字段、元信息与大小上限。
      *
-     * <p>结构性规则（文件名、块数、SHA-256 格式）统一委托给
-     * {@link FileMessage#failReason()}，本方法只补充“体积必须大于 0”与依赖配置的上限判断，
-     * 保证与文本通道解析使用同一套规则、且校验规则不在两处重复实现。</p>
-     *
-     * @param request 请求消息
-     * @throws FileTransferException 请求为空、元信息非法、体积为 0 或超过大小上限时抛出
+     * @param request 文件请求消息
+     * @throws FileTransferException 请求为 null、元信息非法或超过大小上限时抛出
      */
     private void validateRequest(FileMessage request) throws FileTransferException {
         if (request == null) {
@@ -349,20 +299,18 @@ public class FileService {
     }
 
     /**
-     * 清洗并校验文件名，得到可安全落盘的纯文件名。
-     *
-     * <p>先清洗再校验的顺序是刻意为之：清洗剔除路径部分，校验负责拒绝
-     * {@code ..} 这类清洗后仍保留危险语义的名字，两级防线不能相互替代。</p>
+     * 过滤文件名并检查长度、路径成分与控制字符。
      *
      * @param rawName 原始文件名
-     * @return 不含路径的安全文件名
-     * @throws FileTransferException 名字为空、过长或含危险内容时抛出
+     * @return 处理后的文件名
+     * @throws FileTransferException 文件名过长或包含非法字符时抛出
      */
     private static String safeFileName(String rawName) throws FileTransferException {
         String safe = FileUtil.sanitizeFileName(rawName);
         if (safe.length() > FileMessage.MAX_FILE_NAME_LENGTH) {
             throw new FileTransferException("文件名过长，最多 " + FileMessage.MAX_FILE_NAME_LENGTH + " 个字符");
         }
+        // 拒绝路径穿越与路径分隔符
         if (safe.contains("..") || safe.indexOf('/') >= 0 || safe.indexOf('\\') >= 0) {
             throw new FileTransferException("文件名包含非法路径成分: " + rawName);
         }
@@ -375,38 +323,20 @@ public class FileService {
     }
 
     /**
-     * 发送端句柄：持有文件并支持按块随机读取。
-     *
-     * <p>使用 {@link RandomAccessFile} 而非普通输入流，是为了在多线程场景下
-     * 仍能按块序号精确定位，避免“必须顺序发送”这一隐性约束。</p>
+     * 发送会话，持有按块随机读取的文件句柄。
      */
     private static final class SendingFile {
-
-        /** 待发送文件 */
         private final File file;
 
-        /** 随机访问句柄 */
         private final RandomAccessFile accessor;
 
-        /**
-         * 打开文件句柄。
-         *
-         * @param file 待发送文件
-         * @throws IOException 打开失败时抛出
-         */
         private SendingFile(File file) throws IOException {
             this.file = file;
             this.accessor = new RandomAccessFile(file, "r");
         }
 
-        /**
-         * 读取指定块的数据。
-         *
-         * @param chunkIndex 块序号
-         * @return 块字节数组，最后一块可能不足 {@link Constants#FILE_CHUNK_SIZE}
-         * @throws IOException 读取失败时抛出
-         */
         private byte[] readChunk(int chunkIndex) throws IOException {
+            // 按块序号计算偏移与长度
             long offset = FileUtil.offsetOf(chunkIndex, Constants.FILE_CHUNK_SIZE);
             int length = (int) Math.min(Constants.FILE_CHUNK_SIZE, file.length() - offset);
             if (length < 0) {
@@ -420,9 +350,6 @@ public class FileService {
             return buffer;
         }
 
-        /**
-         * 关闭句柄，失败仅记录日志。
-         */
         private void close() {
             try {
                 accessor.close();
@@ -433,42 +360,25 @@ public class FileService {
     }
 
     /**
-     * 接收端会话：顺序写入目标文件并维护进度。
-     */    private static final class ReceivingFile {
-
-        /** 传输编号 */
+     * 接收会话，按序写入目标文件并记录进度。
+     */
+    private static final class ReceivingFile {
         private final String transferId;
 
-        /** 目标文件 */
         private final File target;
 
-        /** 输出流，随会话生命周期持有 */
         private final OutputStream output;
 
-        /** 期望的总块数 */
         private final int totalChunks;
 
-        /** 期望的文件总字节数 */
         private final long expectedSize;
 
-        /** 已接收字节数 */
         private long receivedBytes;
 
-        /** 下一个期望的块序号 */
         private int expectedChunk;
 
-        /** 会话内部锁 */
         private final Object lock = new Object();
 
-        /**
-         * 创建目标文件并打开输出流。
-         *
-         * @param transferId   传输编号
-         * @param target       目标文件
-         * @param totalChunks  总块数
-         * @param expectedSize 文件总字节数
-         * @throws IOException 创建失败时抛出
-         */
         private ReceivingFile(String transferId, File target, int totalChunks, long expectedSize) throws IOException {
             this.transferId = transferId;
             this.target = target;
@@ -478,17 +388,9 @@ public class FileService {
                     StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
         }
 
-        /**
-         * 追加一个数据块。
-         *
-         * @param chunkIndex 块序号
-         * @param data       块数据
-         * @return 累计接收字节数
-         * @throws IOException              写盘失败时抛出
-         * @throws FileTransferException    块序号错乱时抛出
-         */
         private long append(int chunkIndex, byte[] data) throws IOException, FileTransferException {
             synchronized (lock) {
+                // 数据块必须按序号连续到达
                 if (chunkIndex != expectedChunk) {
                     throw new FileTransferException("数据块序号错乱：期望 " + expectedChunk + "，实际 " + chunkIndex,
                             transferId);
@@ -502,18 +404,11 @@ public class FileService {
             }
         }
 
-        /**
-         * 关闭文件并校验完整性。
-         *
-         * @param expectedSha256 期望的 SHA-256，可为 null 表示跳过校验
-         * @return 保存成功的文件
-         * @throws IOException             关闭失败时抛出
-         * @throws FileTransferException   块数或校验和不匹配时抛出
-         */
         private File finish(String expectedSha256) throws IOException, FileTransferException {
             synchronized (lock) {
                 output.flush();
                 output.close();
+                // 校验块数与总字节数
                 if (expectedChunk != totalChunks) {
                     throw new FileTransferException("接收到的块数不足：期望 " + totalChunks + "，实际 " + expectedChunk,
                             transferId);
@@ -522,6 +417,7 @@ public class FileService {
                     throw new FileTransferException("接收字节数与声明不符：声明 " + expectedSize
                             + "，实际 " + receivedBytes, transferId);
                 }
+                // 请求带校验和时比对 SHA-256
                 if (expectedSha256 != null && !expectedSha256.isEmpty()) {
                     String actual = FileUtil.sha256(target);
                     if (!actual.equalsIgnoreCase(expectedSha256)) {
@@ -532,9 +428,6 @@ public class FileService {
             }
         }
 
-        /**
-         * 中止接收：关闭流并删除残缺文件。
-         */
         private void abort() {
             synchronized (lock) {
                 closeOutputQuietly();
@@ -542,9 +435,6 @@ public class FileService {
             }
         }
 
-        /**
-         * 丢弃残缺文件：关闭流并删除，用于校验失败等失败的收尾处理。
-         */
         private void discard() {
             synchronized (lock) {
                 closeOutputQuietly();
@@ -555,9 +445,6 @@ public class FileService {
             }
         }
 
-        /**
-         * 静默关闭输出流，关闭失败不影响后续清理动作。
-         */
         private void closeOutputQuietly() {
             try {
                 output.close();
@@ -566,11 +453,6 @@ public class FileService {
             }
         }
 
-        /**
-         * 计算接收进度。
-         *
-         * @return 0.0 - 1.0 的进度比例
-         */
         private double progress() {
             synchronized (lock) {
                 if (expectedSize <= 0) {
@@ -580,31 +462,16 @@ public class FileService {
             }
         }
 
-        /**
-         * 获取已接收字节数。
-         *
-         * @return 已接收字节数
-         */
         private long getReceivedBytes() {
             synchronized (lock) {
                 return receivedBytes;
             }
         }
 
-        /**
-         * 获取期望的总块数，用于判断对端发来的块序号是否越界。
-         *
-         * @return 总块数
-         */
         private int getTotalChunks() {
             return totalChunks;
         }
 
-        /**
-         * 获取目标文件。
-         *
-         * @return 目标文件
-         */
         private File getTarget() {
             return target;
         }

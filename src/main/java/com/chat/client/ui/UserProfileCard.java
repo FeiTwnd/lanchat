@@ -21,58 +21,41 @@ import java.awt.Font;
 import java.awt.Window;
 
 /**
- * 用户资料卡：点开某个用户时展示其身份信息的小窗。
- *
- * <p>职责：把好友树行里被两行 HTML 压扁的信息展开成一张卡片——大头像、昵称、用户名、
- * 角色与在线状态，并直接给出"发消息"入口。</p>
- *
- * <p>展示的字段严格限定在客户端已有的数据内（{@code USER_LIST} 只下发用户名、昵称、角色，
- * 在线状态由好友树比对得出）。注册时间、最近登录时间、来源地址这些字段服务端虽然有，
- * 但协议里没有对应消息类型，本卡片不为此新增协议——一个纯展示的卡片不值得让两端一起改。</p>
- *
- * <p>非模态：资料卡是"看一眼"的辅助信息，模态会挡住使用者正在进行的输入。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 用户资料卡片，以无模式对话框显示昵称、账号、角色与在线状态。
  */
 public final class UserProfileCard {
-
-    /** 头像尺寸 */
+    /** 头像边长，单位像素。 */
     private static final int AVATAR_SIZE = 56;
 
-    /** 卡片宽度 */
+    /** 卡片最小宽度，单位像素。 */
     private static final int CARD_WIDTH = 260;
 
-    /**
-     * 当前已打开的资料卡。
-     *
-     * <p>同一时刻只留一张：连续点开几个用户时，若每次都不回收上一张，屏幕上会叠起一摞卡片，
-     * 使用者还得逐个关掉。</p>
-     */
+    /** 当前打开的卡片，打开新卡片前会关闭它。 */
     private static JDialog openCard;
 
-    /** 私有构造，禁止实例化工具类 */
     private UserProfileCard() {
     }
 
     /**
-     * 弹出用户资料卡。
+     * 显示指定用户的资料卡片。
      *
-     * @param owner     父窗口
-     * @param user      被展示的用户
-     * @param online    是否在线
-     * @param onMessage 点击"发消息"时的动作
+     * @param owner 所属窗口
+     * @param user 要显示的用户，为 null 时直接返回
+     * @param online 用户是否在线
+     * @param onMessage 点击发消息时的回调，可为 null
      */
     public static void show(Window owner, User user, boolean online, Runnable onMessage) {
         if (user == null) {
             return;
         }
+        // 昵称为空时显示用户名
         String nickname = user.getNickname() == null || user.getNickname().isEmpty()
                 ? user.getUsername() : user.getNickname();
         String role = user.isAdmin() ? "管理员" : "普通用户";
         String state = online ? "在线" : "离线";
 
         if (openCard != null) {
+            // 同时只保留一张资料卡片
             openCard.dispose();
             openCard = null;
         }
@@ -100,6 +83,7 @@ public final class UserProfileCard {
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 10));
         actions.setBackground(Theme.CARD);
+        // 点击发消息后关闭卡片并执行回调
         actions.add(SkinButton.normal("发消息", event -> {
             dialog.dispose();
             if (onMessage != null) {
@@ -111,21 +95,13 @@ public final class UserProfileCard {
         dialog.setLayout(new BorderLayout());
         dialog.add(content, BorderLayout.CENTER);
         dialog.add(actions, BorderLayout.SOUTH);
-        // 高度交给布局算：昵称长短、中文字体度量在不同平台上都不同，写死高度会截字
+
         dialog.pack();
         dialog.setMinimumSize(new Dimension(CARD_WIDTH, dialog.getHeight()));
         dialog.setLocationRelativeTo(owner);
         dialog.setVisible(true);
     }
 
-    /**
-     * 构造一个居中且左对齐基线一致的单行标签。
-     *
-     * @param text  文本
-     * @param font  字体
-     * @param color 颜色
-     * @return 标签
-     */
     private static JLabel centered(String text, Font font, java.awt.Color color) {
         JLabel label = new JLabel(text, SwingConstants.CENTER);
         label.setFont(font);

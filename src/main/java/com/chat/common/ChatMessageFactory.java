@@ -4,78 +4,28 @@ import java.io.ObjectInputFilter;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 消息工厂类。
- *
- * <p>职责：集中创建各类消息对象，并在创建时统一分配消息编号、填充消息类型与时间戳。
- * 体现“工厂模式”，同时把“编号从哪来”“类型谁来设”这类易错细节收敛到唯一入口，
- * 业务代码只需调用 {@code ChatMessageFactory.text(...)} 即可。</p>
- *
- * <p>线程安全：编号使用 {@link AtomicLong} 生成，多线程并发创建不会产生重复编号。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 创建各类消息对象，并校验消息正文与协议字段格式。
  */
 public final class ChatMessageFactory {
-
-    /** 全局递增的消息编号生成器 */
+    /** 消息自增编号 */
     private static final AtomicLong SEQUENCE = new AtomicLong(1L);
 
-    /**
-     * 单条报文允许的最大字段数量。
-     *
-     * <p>协议以竖线分隔字段，若不设上限，客户端可以提交包含成千上万个字段的超长正文，
-     * 服务端解析时会一次性创建巨大的字符串数组，既拖慢处理又可能耗尽内存（拒绝服务）。
-     * 取 16 是因为现有控制报文最多只用到 5 个字段，留出充足余量又不会失控。</p>
-     */
+    /** 协议文本允许的最大字段数 */
     public static final int MAX_FIELD_COUNT = 16;
 
-    /**
-     * 反序列化白名单与结构限制过滤器串。
-     *
-     * <p>只放行协议真正会用到的类型：本项目消息类与服务端下发的业务类位于
-     * {@code com.chat.common}；字符串、包装类型与枚举依赖 {@code java.lang}；
-     * 消息时间戳使用 {@code java.time}；{@code java.util} 当前报文并未直接使用，
-     * 保留它是为了兼容既定的过滤器基线并给后续批量消息类扩展留出余量。
-     * 末尾的 {@code !*} 表示其余一律拒绝，从而阻断依赖链 gadget 类被加载。</p>
-     *
-     * <p>{@code maxdepth} 与 {@code maxarray} 是这里的结构限制：前者限制嵌套深度，
-     * 后者限制单个数组的长度（{@code byte[]} 这类基本类型数组不受类名白名单约束，
-     * 只能靠它兜底）。</p>
-     *
-     * <p><b>这里刻意不再设置 {@code maxbytes} 与 {@code maxrefs}</b>（缺陷 D-22 / D-23 及其后续）：
-     * 它们绑定的是同一个 {@code ObjectInputStream} 上的<b>累计</b>量，而不是单条消息的规模
-     * （{@link java.io.ObjectInputFilter.FilterInfo#streamBytes()} 与
-     * {@link java.io.ObjectInputFilter.FilterInfo#references()}），且流里的 {@code TC_RESET}
-     * （由对端 {@code out.reset()} 写出）会清空句柄表却<b>不清零</b>这两个计数器。于是：</p>
-     * <ul>
-     *   <li>取小了会在正常使用中被打满——例如 {@code maxrefs=1000} 时，本项目每条消息都
-     *       {@code reset()}，实测一条纯文本消息约耗 15 个引用，<b>发到第 67 条整条连接作废</b>（D-23）；
-     *       {@code maxbytes=4MiB} 则在传完 4MiB 文件后作废（D-22）；</li>
-     *   <li>把取值抬到 1GiB / 5000 万，又等于把未认证连接变成堆耗尽入口：白名单里的
-     *       {@code java.util.LinkedList} 并不受 {@code maxarray} 约束，攻击者只要把报文里
-     *       元素个数改成 1500 万（约 71MB 流量），就能让服务端分配几百 MB 的节点并在小堆下 OOM。</li>
-     * </ul>
-     *
-     * <p>正确的做法是"每条消息独立预算"，由 {@link MessageFilter} 承担：
-     * 类型白名单与结构限制仍由本串负责，字节数与引用数的预算改成按消息计算。</p>
-     */
+    /** 反序列化白名单与资源上限 */
     private static final String SERIALIZATION_FILTER_PATTERN =
             "com.chat.common.*;java.lang.*;java.time.*;java.util.*;!*;"
                     + "maxdepth=8;maxarray=65536";
 
-    /** 私有构造，禁止实例化工具类 */
     private ChatMessageFactory() {
     }
 
     /**
-     * 校验文本消息正文是否符合协议约束。
+     * 检查文本消息正文。
      *
-     * <p>为什么不把校验塞进 {@link #text} 构造流程：工厂方法被服务端与客户端共同使用，
-     * 直接抛异常会让"用户输入过长"这类正常业务失败变成连接级错误。
-     * 因此改为返回中文原因，由入口决定如何回执。</p>
-     *
-     * @param content 消息正文，可为 null
-     * @return 合法返回 null；非法返回可直接回执给客户端的中文原因
+     * @param content 消息正文
+     * @return 错误说明，正文合法时返回 null
      */
     public static String checkTextContent(String content) {
         if (content == null) {
@@ -91,36 +41,21 @@ public final class ChatMessageFactory {
     }
 
     /**
-     * 按竖线切分控制报文正文，并校验字段数量与字段内容。
+     * 按竖线拆分协议文本，使用默认长度上限。
      *
-     * <p>为什么超限时返回 null 而不是截断：截断会让客户端以为自己的请求被完整接受，
-     * 双方对"实际生效的是哪几个字段"产生分歧；返回 null 由调用方回执中文错误，
-     * 语义只有"接受"与"拒绝"两种。</p>
-     *
-     * @param text 报文正文，可为 null
-     * @return 字段数组；正文为 null、超过正文长度上限、字段数超过 {@link #MAX_FIELD_COUNT}
-     *         或任一字段含非法控制字符时返回 null
+     * @param text 待拆分的文本
+     * @return 拆分结果，不合法时返回 null
      */
     public static String[] splitFields(String text) {
         return splitFields(text, Constants.MESSAGE_MAX_LENGTH);
     }
 
     /**
-     * 按竖线切分控制报文正文，并指定正文长度上限。
+     * 按竖线拆分协议文本。
      *
-     * <p>为什么需要这个重载：{@link Constants#MESSAGE_MAX_LENGTH} 是<b>聊天正文</b>的上限，
-     * 并不天然适用于所有控制报文。头像变更请求就属于反例——它的载荷是图片的 Base64
-     * （上限 {@link Constants#AVATAR_MAX_LENGTH}，默认正文上限的两倍多），
-     * 若沿用 2000 字符的闸门，任何一张真头像都会被判为"字段非法"而拒绝，
-     * 表现为"选了图片却提示消息过长"。</p>
-     *
-     * <p>放宽的只是长度，字段数量上限与非法控制字符检查一字未动：
-     * 头像分支真正需要防的是"同一套校验被绕过"，而不是"限制放松了"。</p>
-     *
-     * @param text      报文正文，可为 null
-     * @param maxLength 正文长度上限
-     * @return 字段数组；正文为 null、超过给定长度上限、字段数超过 {@link #MAX_FIELD_COUNT}
-     *         或任一字段含非法控制字符时返回 null
+     * @param text 待拆分的文本
+     * @param maxLength 文本长度上限
+     * @return 拆分结果，不合法时返回 null
      */
     public static String[] splitFields(String text, int maxLength) {
         if (text == null || text.length() > maxLength) {
@@ -139,14 +74,10 @@ public final class ChatMessageFactory {
     }
 
     /**
-     * 判断字符串是否含破坏行式协议的控制字符。
+     * 判断文本是否含除换行与制表符外的控制字符。
      *
-     * <p>为什么放行换行与制表符：历史查询结果用 {@code \n} 作为行分隔、
-     * 本地用户文件用制表符作为字段分隔，二者是既有协议的组成部分；
-     * 其余控制字符（回车、退格、NUL 等）会污染日志行的切分，必须拒绝。</p>
-     *
-     * @param value 待检查字符串，可为 null
-     * @return 含非法控制字符返回 true；null 或合法时返回 false
+     * @param value 待检查的文本
+     * @return 含非法控制字符时返回 true
      */
     public static boolean hasIllegalControlChar(String value) {
         if (value == null) {
@@ -162,42 +93,23 @@ public final class ChatMessageFactory {
     }
 
     /**
-     * 构造反序列化白名单过滤器。
+     * 创建消息反序列化过滤器。
      *
-     * <p>为什么必须有过滤器：Java 原生反序列化会依据字节流中声明的类名递归实例化对象，
-     * 攻击者只要能让服务端读取一段精心构造的数据，就能借助第三方库中可被串联的
-     * {@code readObject} 形成 gadget 链执行任意代码；即便不执行代码，超深的嵌套引用
-     * 也能让反序列化过程耗尽内存。过滤器在类加载前就拒绝白名单之外的类型，
-     * 并限制递归深度、引用数、总字节数与数组长度。</p>
-     *
-     * <p>放行清单由实测得出：全部协议报文（文本、系统、文件请求、文件数据块、登录结果）
-     * 都能通过过滤器完成一次完整往返；消息类与其父类位于 {@code com.chat.common}，
-     * 字符串、包装类型与枚举依赖 {@code java.lang}，时间戳依赖 {@code java.time}。
-     * 两点实测结论需要留意：其一，{@code java.util.*} 只匹配该包下的直接成员，
-     * {@code java.util.concurrent.atomic} 这类子包并不在放行范围内；
-     * 其二，{@code byte[]} 等基本类型数组不受类名白名单约束，其长度由 {@code maxarray} 单独限制，
-     * 文件数据块因此可以正常传输，而 {@code java.io.File}、{@code java.util.concurrent.*}
-     * 等非协议类型会被拒绝。</p>
-     *
-     * <p><b>本方法只提供类型与结构限制</b>；实际绑到 {@code ObjectInputStream} 上的是
-     * {@link MessageFilter#forServerInput()} / {@link MessageFilter#forClientInput()}，
-     * 它们在白名单之外还按消息计算预算。需要"只有白名单"的场景（例如单元测试）才直接用它。</p>
-     *
-     * @return 过滤器实例，可直接绑定到 {@code ObjectInputStream}
+     * @return 带白名单与资源上限的过滤器
      */
     public static ObjectInputFilter serializationFilter() {
         return ObjectInputFilter.Config.createFilter(SERIALIZATION_FILTER_PATTERN);
     }
 
     /**
-     * 创建文本消息（私聊或群聊）。
+     * 创建文本消息。
      *
-     * @param sender   发送者用户名
-     * @param receiver 接收者用户名，群聊传空字符串
-     * @param content  消息正文
-     * @param type     消息类型，仅允许 {@link MessageType#TEXT_PRIVATE} 或 {@link MessageType#TEXT_GROUP}
-     * @return 已设置编号与类型的文本消息
-     * @throws IllegalArgumentException 当 type 不是文本类消息时抛出
+     * @param sender 发送者
+     * @param receiver 接收者
+     * @param content 消息正文
+     * @param type 私聊或群聊类型
+     * @return 文本消息
+     * @throws IllegalArgumentException 类型不是私聊或群聊时
      */
     public static TextMessage text(String sender, String receiver, String content, MessageType type) {
         if (type != MessageType.TEXT_PRIVATE && type != MessageType.TEXT_GROUP) {
@@ -211,9 +123,9 @@ public final class ChatMessageFactory {
     /**
      * 创建系统通知消息。
      *
-     * @param receiver 接收者用户名，广播传空字符串
-     * @param content  通知正文
-     * @return 已设置编号与类型的系统消息
+     * @param receiver 接收者，为空表示广播
+     * @param content 通知内容
+     * @return 系统通知
      */
     public static SystemMessage system(String receiver, String content) {
         SystemMessage message = new SystemMessage(receiver, content);
@@ -224,9 +136,9 @@ public final class ChatMessageFactory {
     /**
      * 创建错误通知消息。
      *
-     * @param receiver 接收者用户名
-     * @param reason   错误原因
-     * @return 已设置编号与类型的错误消息
+     * @param receiver 接收者
+     * @param reason 错误原因
+     * @return 错误通知
      */
     public static SystemMessage error(String receiver, String reason) {
         SystemMessage message = new SystemMessage(receiver, reason);
@@ -235,12 +147,12 @@ public final class ChatMessageFactory {
     }
 
     /**
-     * 创建文件消息骨架。
+     * 创建文件消息。
      *
-     * @param sender   发送者用户名
-     * @param receiver 接收者用户名
-     * @param type     文件相关消息类型
-     * @return 已设置编号与类型的文件消息
+     * @param sender 发送者
+     * @param receiver 接收者
+     * @param type 文件消息类型
+     * @return 文件消息
      */
     public static FileMessage file(String sender, String receiver, MessageType type) {
         FileMessage message = new FileMessage(sender, receiver);
@@ -249,15 +161,12 @@ public final class ChatMessageFactory {
     }
 
     /**
-     * 创建无负载的控制类消息。
+     * 创建控制类系统消息。
      *
-     * <p>用于 {@link MessageType#HEARTBEAT}、{@link MessageType#LOGOUT} 等只需类型即可表达语义的场景，
-     * 统一使用 {@link SystemMessage} 作为载体，正文留空。</p>
-     *
-     * @param sender   发送者用户名
-     * @param receiver 接收者用户名，广播传空字符串
-     * @param type     消息类型
-     * @return 控制消息
+     * @param sender 发送者
+     * @param receiver 接收者
+     * @param type 控制消息类型
+     * @return 系统消息
      */
     public static SystemMessage control(String sender, String receiver, MessageType type) {
         SystemMessage message = new SystemMessage(receiver, "");
@@ -266,12 +175,6 @@ public final class ChatMessageFactory {
         return message;
     }
 
-    /**
-     * 为消息统一分配编号并写入类型。
-     *
-     * @param message 目标消息
-     * @param type    消息类型
-     */
     private static void apply(Message message, MessageType type) {
         message.setType(type);
         message.setId(SEQUENCE.getAndIncrement());

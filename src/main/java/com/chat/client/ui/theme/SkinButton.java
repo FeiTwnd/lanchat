@@ -9,40 +9,31 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 
 /**
- * 扁平风格按钮。
- *
- * <p>职责：替代系统默认按钮外观，提供主色、常规、幽灵、危险四种变体，
- * 并自带悬停与按下反馈。之所以自绘而不使用图片：按钮状态组合多（悬停、按下、禁用、选中），
- * 代码绘制可以精确控制每个状态的配色，且不产生资源文件。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 统一样式的按钮，按用途分为主要、普通、幽灵和危险四种外观。
  */
 public class SkinButton extends JButton {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20260919L;
 
-    /** 按钮变体 */
+    /**
+     * 按钮的用途分类，决定背景、文字与边框的配色。
+     */
     public enum Kind {
-        /** 主色实心按钮，用于主操作 */
         PRIMARY,
-        /** 白底描边按钮，用于常规操作 */
+
         NORMAL,
-        /** 无边框按钮，用于次要操作 */
+
         GHOST,
-        /** 危险色按钮，用于删除等不可恢复操作 */
+
         DANGER
     }
 
-    /** 变体 */
     private final Kind kind;
 
     /**
-     * 构造按钮。
+     * 创建按钮并设置统一的字体、边距与鼠标样式。
      *
-     * @param text 按钮文本
-     * @param kind 变体
+     * @param text 按钮文字
+     * @param kind 按钮用途
      */
     public SkinButton(String text, Kind kind) {
         super(text);
@@ -59,11 +50,11 @@ public class SkinButton extends JButton {
     }
 
     /**
-     * 创建主色按钮。
+     * 创建主要按钮并绑定点击动作。
      *
-     * @param text   文本
-     * @param action 点击事件
-     * @return 按钮
+     * @param text 按钮文字
+     * @param action 点击后执行的动作
+     * @return 新建的按钮
      */
     public static SkinButton primary(String text, java.awt.event.ActionListener action) {
         SkinButton button = new SkinButton(text, Kind.PRIMARY);
@@ -72,11 +63,11 @@ public class SkinButton extends JButton {
     }
 
     /**
-     * 创建常规按钮。
+     * 创建普通按钮并绑定点击动作。
      *
-     * @param text   文本
-     * @param action 点击事件
-     * @return 按钮
+     * @param text 按钮文字
+     * @param action 点击后执行的动作
+     * @return 新建的按钮
      */
     public static SkinButton normal(String text, java.awt.event.ActionListener action) {
         SkinButton button = new SkinButton(text, Kind.NORMAL);
@@ -85,12 +76,12 @@ public class SkinButton extends JButton {
     }
 
     /**
-     * 创建左侧对齐的功能按钮（用于功能菜单列）。
+     * 创建普通外观的菜单按钮。
      *
-     * @param text   文本
-     * @param icon   图标
-     * @param action 点击事件
-     * @return 按钮
+     * @param text 按钮文字
+     * @param icon 按钮图标，可以为 null
+     * @param action 点击后执行的动作
+     * @return 新建的按钮
      */
     public static SkinButton menu(String text, javax.swing.Icon icon,
                                  java.awt.event.ActionListener action) {
@@ -98,13 +89,13 @@ public class SkinButton extends JButton {
     }
 
     /**
-     * 创建左侧对齐的功能按钮。
+     * 创建左对齐、带图标的菜单按钮。
      *
-     * @param text   文本
-     * @param icon   图标
-     * @param kind   变体
-     * @param action 点击事件
-     * @return 按钮
+     * @param text 按钮文字
+     * @param icon 按钮图标，可以为 null
+     * @param kind 按钮用途
+     * @param action 点击后执行的动作
+     * @return 新建的按钮
      */
     public static SkinButton menu(String text, javax.swing.Icon icon, Kind kind,
                                  java.awt.event.ActionListener action) {
@@ -118,13 +109,9 @@ public class SkinButton extends JButton {
     }
 
     /**
-     * 为按钮补充图标。
+     * 设置按钮图标并调整图标与文字的间距。
      *
-     * <p>保留作为公开能力：最初服务于主窗口头部那枚"刷新列表"，
-     * 该按钮在第 4 轮改动中因与用户面板的刷新入口重复而被删除，
-     * 但"给一枚按钮补图标"本身是通用需求，删掉反而会让下一个需要它的地方重写一遍。</p>
-     *
-     * @param icon 图标
+     * @param icon 按钮图标
      * @return 当前按钮，便于链式调用
      */
     public SkinButton withIcon(javax.swing.Icon icon) {
@@ -133,11 +120,7 @@ public class SkinButton extends JButton {
         return this;
     }
 
-    /**
-     * 依据变体取文字颜色。
-     *
-     * @return 颜色
-     */
+    /** 返回当前用途对应的文字颜色。 */
     private Color foregroundFor() {
         switch (kind) {
             case PRIMARY:
@@ -151,11 +134,7 @@ public class SkinButton extends JButton {
         }
     }
 
-    /**
-     * 依据变体与当前状态取填充色。
-     *
-     * @return 填充色；返回 null 表示不绘制底色
-     */
+    /** 返回当前用途与按压、悬停状态对应的背景色，幽灵按钮未悬停时为 null。 */
     private Color fillFor() {
         boolean pressed = getModel().isPressed();
         boolean rollover = getModel().isRollover();
@@ -171,11 +150,6 @@ public class SkinButton extends JButton {
         }
     }
 
-    /**
-     * 自绘按钮背景，再交由父类绘制文本与图标。
-     *
-     * @param g 画笔
-     */
     @Override
     protected void paintComponent(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
@@ -183,16 +157,19 @@ public class SkinButton extends JButton {
         int width = getWidth();
         int height = getHeight();
         int arc = 8;
+        // 先自绘圆角背景，再交给基类绘制文字与图标
         Color fill = isEnabled() ? fillFor() : new Color(0xEDF1F5);
         if (fill != null) {
             g2.setColor(fill);
             g2.fillRoundRect(0, 0, width - 1, height - 1, arc, arc);
         }
         if (kind != Kind.PRIMARY && kind != Kind.GHOST) {
+            // 普通与危险按钮额外绘制边框
             g2.setColor(kind == Kind.DANGER ? new Color(0xF3C9C9) : Theme.BORDER);
             g2.drawRoundRect(0, 0, width - 1, height - 1, arc, arc);
         }
         g2.dispose();
+        // 禁用状态使用弱化文字颜色
         if (!isEnabled()) {
             setForeground(Theme.TEXT_WEAK);
         } else {

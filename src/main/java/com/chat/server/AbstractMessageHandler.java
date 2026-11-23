@@ -7,44 +7,16 @@ import java.net.Socket;
 import java.util.logging.Logger;
 
 /**
- * 消息处理器抽象基类。
- *
- * <p>职责：实现“按类型分派”这一模板逻辑。子类只需实现三个具体处理方法，
- * 由本类负责把收到的消息路由到正确的方法上，从而消除子类中的类型判断分支。</p>
- *
- * <p>设计模式：这是模板方法（Template Method）的实际应用——骨架固定在本类中，
- * 变化的处理细节交给子类。</p>
- *
- * <p>默认行为：基类对所有具体处理方法提供空实现（仅记录日志），
- * 子类按需覆写自己关心的消息类型，符合“最小惊讶”原则：
- * 收到未处理的消息类型不会导致崩溃。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 消息处理器抽象基类，按消息类型分派到对应的处理方法，未覆写的入口只记录调试日志。
  */
 public abstract class AbstractMessageHandler implements MessageHandler {
-
-    /** 日志记录器，供子类复用 */
     protected final Logger logger = Logger.getLogger(getClass().getName());
 
     /**
-     * 按消息类型分派到对应的处理方法。
+     * 按消息类型分派消息。
      *
-     * <p>分派规则：</p>
-     * <ul>
-     *   <li>文本类消息 -> {@link #handleTextMessage(Message, Socket)}</li>
-     *   <li>文件类消息 -> {@link #handleFileMessage(Message, Socket)}</li>
-     *   <li>控制类消息 -> {@link #handleSystemMessage(Message, Socket)}</li>
-     * </ul>
-     *
-     * <p>为什么控制类型要逐个列举而不是用 {@code default} 兜底：兜底写法会把任何
-     * 服务器本不该接收的类型（例如各种 {@code *_RESULT} 回执）也悄悄送进控制处理流程，
-     * 既掩盖了协议异常，也让后续新增枚举值时默认落进错误分支。逐个列举后，
-     * 未纳入分派的类型会留下 warning 日志并被拒绝，行为可观测；已列举的控制类型
-     * 仍走原有的 {@link #handleSystemMessage(Message, Socket)}，兼容既有客户端与服务端。</p>
-     *
-     * @param message 待处理消息，为 null 时直接忽略
-     * @param socket  消息来源连接
+     * @param message 待分派的消息
+     * @param socket 客户端连接
      */
     public final void dispatch(Message message, Socket socket) {
         if (message == null || message.getType() == null) {
@@ -97,74 +69,42 @@ public abstract class AbstractMessageHandler implements MessageHandler {
                 handleSystemMessage(message, socket);
                 break;
             default:
-                // 走到这里说明枚举新增了类型却没同步分派规则，必须留下可观测日志而不是静默按控制消息处理
+
                 logger.warning(() -> "收到未纳入分派规则的消息类型，已拒绝: " + type);
                 break;
         }
     }
 
     /**
-     * 处理在线用户列表消息，默认空实现。
+     * 处理用户列表消息，默认仅记录日志。
      *
-     * <p>单独抽出该方法而不是并入系统消息，是因为用户列表在本系统中
-     * 既是服务器推送的数据也是客户端刷新的依据，值得一个独立的扩展点。</p>
-     *
-     * @param message 用户列表消息
-     * @param socket  消息来源连接
+     * @param message 消息对象
+     * @param socket 客户端连接
      */
     public void handleUserList(Message message, Socket socket) {
         logger.fine(() -> "未处理用户列表消息: " + message.getType());
     }
 
-    /**
-     * 处理文本消息，默认空实现。
-     *
-     * @param message 文本消息
-     * @param socket  消息来源连接
-     */
     @Override
     public void handleTextMessage(Message message, Socket socket) {
         logger.fine(() -> "未处理文本消息: " + message.getType());
     }
 
-    /**
-     * 处理文件消息，默认空实现。
-     *
-     * @param message 文件消息
-     * @param socket  消息来源连接
-     */
     @Override
     public void handleFileMessage(Message message, Socket socket) {
         logger.fine(() -> "未处理文件消息: " + message.getType());
     }
 
-    /**
-     * 处理系统控制消息，默认空实现。
-     *
-     * @param message 控制消息
-     * @param socket  消息来源连接
-     */
     @Override
     public void handleSystemMessage(Message message, Socket socket) {
         logger.fine(() -> "未处理控制消息: " + message.getType());
     }
 
-    /**
-     * 用户上线事件，默认空实现。
-     *
-     * @param username 用户名
-     * @param socket   连接
-     */
     @Override
     public void onUserOnline(String username, Socket socket) {
         logger.fine(() -> "用户上线: " + username);
     }
 
-    /**
-     * 用户下线事件，默认空实现。
-     *
-     * @param username 用户名
-     */
     @Override
     public void onUserOffline(String username) {
         logger.fine(() -> "用户下线: " + username);

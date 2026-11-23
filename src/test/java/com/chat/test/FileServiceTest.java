@@ -16,46 +16,23 @@ import java.nio.file.Path;
 import java.util.Random;
 
 /**
- * 文件传输业务单元测试。
- *
- * <p>覆盖点：发送前校验（不存在、超限）、分块数量计算、分块内容正确性、
- * 接收端顺序落盘、SHA-256 校验、块序号错乱检测、校验和不匹配检测、
- * 重名文件自动改名、大文件（1MB）完整往返。</p>
- *
- * <p>测试策略：不启动网络，直接把 {@link FileService} 当作“发送端 + 接收端”使用，
- * 逐块传递 {@link FileMessage}，从而在毫秒级内验证完整的分块协议逻辑。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 覆盖文件分块传输、校验和检查、取消接收与文件工具方法。
  */
 public class FileServiceTest {
-
-    /** 当前测试使用的临时目录 */
     private Path baseDir;
 
-    /**
-     * 准备临时目录。
-     *
-     * @param prefix 前缀
-     * @throws IOException 创建失败
-     */
+    /** 创建本次用例的临时目录。 */
     private void prepare(String prefix) throws IOException {
         baseDir = TestRunner.createTempDir(prefix);
     }
 
-    /**
-     * 清理临时目录。
-     */
+    /** 删除临时目录并清空引用。 */
     private void cleanup() {
         TestRunner.deleteRecursively(baseDir);
         baseDir = null;
     }
 
-    /**
-     * 用例 1：文件不存在时拒绝发送。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证发送不存在或为空的文件时抛出 FileTransferException。 */
     @Test("文件服务：文件不存在时抛出 FileTransferException")
     public void testPrepareSendMissingFile() throws Exception {
         prepare("filesvc-missing");
@@ -82,9 +59,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 2：分块数量计算规则。
-     */
+    /** 验证分块数量计算覆盖空文件、整块与余数边界。 */
     @Test("文件服务：分块数量计算包含空文件与整块边界")
     public void testChunkCount() {
         int size = Constants.FILE_CHUNK_SIZE;
@@ -95,11 +70,7 @@ public class FileServiceTest {
         TestRunner.assertEquals(3, FileUtil.chunkCount(size * 2 + 5, size), "两块多应为 3 块");
     }
 
-    /**
-     * 用例 3：小文件完整往返并校验 SHA-256。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证小文件传输后内容与校验和一致。 */
     @Test("文件服务：小文件分块传输后内容与校验和一致")
     public void testSmallFileRoundTrip() throws Exception {
         prepare("filesvc-small");
@@ -112,11 +83,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 4：跨越多块的 1MB 随机文件往返。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证超过 1MB 的文件分多块传输后逐字节一致。 */
     @Test("文件服务：1MB 随机文件多块传输后逐字节一致")
     public void testLargeFileRoundTrip() throws Exception {
         prepare("filesvc-large");
@@ -132,11 +99,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 5：空文件也能正确传输。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证空文件可完成传输并得到 0 字节文件。 */
     @Test("文件服务：空文件可完成传输并生成 0 字节文件")
     public void testEmptyFile() throws Exception {
         prepare("filesvc-empty");
@@ -149,11 +112,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 6：块序号错乱时立即报错并清理残缺文件。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证数据块序号错乱时抛出异常。 */
     @Test("文件服务：数据块序号错乱时抛异常并清理残缺文件")
     public void testChunkOrderValidation() throws Exception {
         prepare("filesvc-order");
@@ -166,8 +125,8 @@ public class FileServiceTest {
             FileMessage request = sender.prepareSend("alice", "bob", source);
             receiver.openReceive(baseDir.resolve("recv").toString(), request);
 
-            // 故意跳过第 0 块，直接发送第 1 块
             FileMessage wrong = sender.createChunkMessage("alice", "bob", request, 1);
+            // 先发送序号 1 的块，制造顺序错乱
             boolean thrown = false;
             try {
                 receiver.appendChunk(wrong);
@@ -181,11 +140,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 7：校验和不一致时拒绝接收。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证校验和不匹配时抛出异常并删除残缺文件。 */
     @Test("文件服务：SHA-256 不匹配时抛异常并删除文件")
     public void testChecksumMismatch() throws Exception {
         prepare("filesvc-checksum");
@@ -201,6 +156,7 @@ public class FileServiceTest {
                 receiver.appendChunk(sender.createChunkMessage("alice", "bob", request, i));
             }
             FileMessage end = sender.createEndMessage("alice", "bob", request);
+            // 篡改结束消息中的校验和
             end.setSha256("0000000000000000000000000000000000000000000000000000000000000000");
             boolean thrown = false;
             try {
@@ -219,11 +175,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 8：重名文件自动追加序号，不覆盖已有文件。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证重名文件依次生成带 (1) 与 (2) 的副本名。 */
     @Test("文件工具：重名文件自动生成 (1) (2) 副本")
     public void testUniqueTarget() throws Exception {
         prepare("filesvc-unique");
@@ -240,9 +192,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 9：文件名清洗防止目录穿越。
-     */
+    /** 验证文件名清洗可剥离路径并替换非法字符。 */
     @Test("文件工具：文件名清洗可阻止目录穿越")
     public void testSanitizeFileName() {
         TestRunner.assertEquals("passwd", FileUtil.sanitizeFileName("../../etc/passwd"),
@@ -253,9 +203,7 @@ public class FileServiceTest {
         TestRunner.assertEquals("unnamed", FileUtil.sanitizeFileName(""), "空名应回退默认值");
     }
 
-    /**
-     * 用例 10：人类可读大小格式化。
-     */
+    /** 验证文件大小按单位格式化输出。 */
     @Test("文件工具：大小格式化输出正确单位")
     public void testHumanSize() {
         TestRunner.assertEquals("512 B", FileUtil.humanSize(512), "字节级应显示 B");
@@ -265,11 +213,7 @@ public class FileServiceTest {
         TestRunner.assertEquals("0 B", FileUtil.humanSize(-1), "负数应回退 0 B");
     }
 
-    /**
-     * 用例 11：文件校验和计算与工具方法一致。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证文件 SHA-256 与字节数组计算结果一致。 */
     @Test("文件工具：文件 SHA-256 与字节数组计算结果一致")
     public void testFileSha256() throws Exception {
         prepare("filesvc-sha");
@@ -283,11 +227,7 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 用例 12：取消接收会清理会话与残缺文件。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证取消接收后进度归零并清理残缺文件。 */
     @Test("文件服务：取消接收后进度归零且文件被清理")
     public void testCancelReceive() throws Exception {
         prepare("filesvc-cancel");
@@ -301,6 +241,7 @@ public class FileServiceTest {
             String receiveDir = baseDir.resolve("recv").toString();
             String transferId = receiver.openReceive(receiveDir, request);
             receiver.appendChunk(sender.createChunkMessage("alice", "bob", request, 0));
+            // 接收一块后取消传输
             TestRunner.assertTrue(receiver.progressOf(transferId) > 0, "应有接收进度");
             receiver.cancelReceive(transferId);
             TestRunner.assertEquals(0.0, receiver.progressOf(transferId), "取消后进度查询应归零");
@@ -313,27 +254,13 @@ public class FileServiceTest {
         }
     }
 
-    /**
-     * 写入测试文件。
-     *
-     * @param name    文件名
-     * @param content 内容
-     * @return 文件对象
-     * @throws IOException 写入失败
-     */
     private File writeFile(String name, byte[] content) throws IOException {
         File file = baseDir.resolve(name).toFile();
         Files.write(file.toPath(), content);
         return file;
     }
 
-    /**
-     * 执行一次完整传输并校验内容与校验和。
-     *
-     * @param source 源文件
-     * @return 本次传输的请求消息
-     * @throws Exception 传输失败
-     */
+    /** 执行完整传输并校验内容，返回发送请求。 */
     private FileMessage transferAndVerify(File source) throws Exception {
         FileService sender = new FileService();
         FileService receiver = new FileService();
@@ -351,13 +278,7 @@ public class FileServiceTest {
         return request;
     }
 
-    /**
-     * 执行传输并返回接收到的文件。
-     *
-     * @param source 源文件
-     * @return 接收到的文件
-     * @throws Exception 传输失败
-     */
+    /** 执行完整传输并校验内容，返回接收文件。 */
     private File runTransfer(File source) throws Exception {
         FileService sender = new FileService();
         FileService receiver = new FileService();
@@ -373,13 +294,6 @@ public class FileServiceTest {
         return target;
     }
 
-    /**
-     * 校验接收文件与源文件完全一致。
-     *
-     * @param source 源文件
-     * @param target 接收文件
-     * @throws IOException 读取失败
-     */
     private void verifySame(File source, File target) throws IOException {
         TestRunner.assertArrayEquals(Files.readAllBytes(source.toPath()),
                 Files.readAllBytes(target.toPath()), "接收文件内容应与源文件一致");

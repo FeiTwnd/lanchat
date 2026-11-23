@@ -23,83 +23,45 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 文件传输窗口。
- *
- * <p>职责：发起文件发送、展示传输进度与结果。窗口按“对端用户名”复用，
- * 与同一好友的多次传输共用同一个窗口，避免弹窗泛滥。</p>
- *
- * <p>进度路由：{@link ChatClient} 会把 FILE_CHUNK 消息先转换为仅含进度信息的
- * 轻量消息再回调界面；界面通过静态注册表 {@link #WINDOWS} 依据传输编号把进度
- * 投递到正确的窗口。</p>
- *
- * <p>界面与网络解耦：窗口不直接操作 Socket，发送与接收全部通过
- * {@link ChatClient} 与 {@link com.chat.service.FileService} 完成。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 文件传输窗口，展示收发进度、处理传输请求与结果，并按接收方复用窗口。
  */
 public class FileTransferUI extends BaseUI {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250118L;
 
-    /** 活跃窗口注册表：对端用户名 -> 窗口，保证同一好友只开一个传输窗口 */
+    /** 按接收方用户名复用的传输窗口。 */
     private static final Map<String, FileTransferUI> WINDOWS = new ConcurrentHashMap<>();
 
-    /** 传输编号到窗口的映射，用于接收进度与结果回执 */
+    /** 传输编号到所属窗口的映射，用于分发进度与结果消息。 */
     private static final Map<String, FileTransferUI> TRANSFER_OWNERS = new ConcurrentHashMap<>();
 
-    /** 发送成功后的自动关闭延时（毫秒）：留一点时间让使用者看到"传输完成" */
+    /** 发送完成后窗口自动关闭的延时，单位毫秒。 */
     private static final int AUTO_CLOSE_DELAY_MS = 2000;
 
-    /** 日志记录器：文件会话释放失败等清理问题需要留痕，但不应打扰使用者 */
     private static final java.util.logging.Logger LOGGER =
             java.util.logging.Logger.getLogger(com.chat.common.Constants.LOGGER_NAME
                     + ".client.ui.FileTransferUI");
 
-    /** 客户端实例 */
     private final transient ChatClient client;
 
-    /** 传输对象（好友用户名或文件发送者） */
     private final String peer;
 
-    /** 接收方输入框（仅发送场景可编辑） */
     private final JTextField receiverField = new JTextField(12);
 
-    /** 顶部操作行：接收方 + 选择文件 + 发送 */
     private transient JPanel topPanel;
 
-    /**
-     * 本次传输是否由聊天窗口发起。
-     *
-     * <p>由聊天窗口发起时，接收方与文件在进入本窗口之前就已确定，
-     * 顶部那一行"接收方 / 选择文件 / 发送"既用不上、又会造成误解
-     * （窗口里明明已经收到文件了，却还摆着一个"选择文件"按钮和一句"尚未选择文件"），
-     * 因此这种情形下整行隐藏，本窗口只当进度与日志控制台用。</p>
-     */
+    /** 是否由聊天面板直接发起传输，此时隐藏顶部的接收方与文件选择区。 */
     private transient boolean chatInitiated;
 
-    /** 文件路径显示 */
     private final JLabel fileLabel = new JLabel("尚未选择文件");
 
-    /** 进度条 */
     private final JProgressBar progressBar = new JProgressBar(0, 100);
 
-    /** 进度说明 */
     private final JLabel progressLabel = new JLabel("等待开始");
 
-    /** 传输日志 */
     private final JTextArea logArea = new JTextArea(8, 42);
 
-    /** 当前待发送文件 */
     private transient File selectedFile;
 
-    /**
-     * 构造文件传输窗口。
-     *
-     * @param client 客户端实例
-     * @param peer   对端用户名
-     */
     private FileTransferUI(ChatClient client, String peer) {
         super("文件传输 - " + peer + " - " + Constants.APP_NAME);
         this.client = client;
@@ -111,32 +73,28 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 获取或创建与指定对端的传输窗口。
+     * 获取或创建与指定用户的传输窗口。
      *
-     * @param client 客户端实例
-     * @param peer   对端用户名
-     * @return 窗口实例
+     * @param client 已登录的客户端
+     * @param peer 接收方用户名
+     * @return 该接收方对应的传输窗口
      */
     public static FileTransferUI windowFor(ChatClient client, String peer) {
         return WINDOWS.computeIfAbsent(peer, key -> new FileTransferUI(client, key));
     }
 
     /**
-     * 依据传输编号查找所属窗口。
+     * 按传输编号查找所属窗口。
      *
      * @param transferId 传输编号
-     * @return 窗口实例；未登记时返回 null
+     * @return 所属窗口，编号为空或没有对应窗口时返回 null
      */
     public static FileTransferUI ownerOf(String transferId) {
         return transferId == null ? null : TRANSFER_OWNERS.get(transferId);
     }
 
     /**
-     * 关闭全部传输窗口并清空注册表。
-     *
-     * <p>传输窗口由静态注册表管理（同一对端只开一个），并不属于主窗口的组件树，
-     * 因此退出登录或程序退出时必须显式统一关闭：否则旧窗口会残留在屏幕上，
-     * 且继续持有已经关闭的客户端连接，导致下次登录后发文件毫无反应。</p>
+     * 关闭并清理所有传输窗口。
      */
     public static void disposeAll() {
         for (FileTransferUI window : new java.util.ArrayList<>(WINDOWS.values())) {
@@ -146,9 +104,6 @@ public class FileTransferUI extends BaseUI {
         TRANSFER_OWNERS.clear();
     }
 
-    /**
-     * 组装界面组件。
-     */
     private void initComponents() {
         JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 8));
         top.setBackground(Theme.BG);
@@ -183,12 +138,6 @@ public class FileTransferUI extends BaseUI {
         appendLog("单个文件大小上限为 " + Constants.MAX_FILE_SIZE_TEXT + "，传输过程显示实时进度");
     }
 
-    /**
-     * 弹出文件选择对话框。
-     *
-     * <p>用系统原生对话框（见 {@link NativeFileDialog}）：使用者在别的软件里
-     * 天天见到的就是这个窗口，不必在本程序里重新学一遍怎么找文件。</p>
-     */
     private void chooseFile() {
         File file = NativeFileDialog.open(this, "选择要发送的文件", null, null);
         if (file != null && file.isFile()) {
@@ -199,9 +148,6 @@ public class FileTransferUI extends BaseUI {
         }
     }
 
-    /**
-     * 发起文件发送。
-     */
     private void startSend() {
         if (selectedFile == null) {
             showError("请先选择要发送的文件");
@@ -212,16 +158,14 @@ public class FileTransferUI extends BaseUI {
             showError("请填写接收方用户名");
             return;
         }
-        // 不再拦"发给自己"：给自己发文件是一个正当用法（把图片存进本机的 data/received
-        // 留档、跨机器给自己递文件），服务端按用户名中继，本人在线时这条链路与发给别人一致
+
+        // 发起传输并登记编号与当前窗口的关系
         File sending = selectedFile;
         String transferId = client.sendFile(receiver, sending);
         if (transferId == null) {
             progressLabel.setText("发送失败");
             appendLog("发送失败：文件不合法或连接异常");
-            // 只在日志里写一句是不够的：日志区在窗口底部，使用者刚点完按钮，
-            // 视线还在文件那一行，很可能把这次失败整个错过。
-            // 弹窗同时保证"文件没发出去"这件事不会被误认为已经发出
+
             showError("发送失败：文件不合法或连接异常（" + sending.getName() + "）");
             return;
         }
@@ -231,18 +175,17 @@ public class FileTransferUI extends BaseUI {
         appendLog("已向 " + receiver + " 发起文件传输请求，编号 "
                 + transferId.substring(0, 8));
         selectedFile = null;
-        // 不清成"尚未选择文件"：那行字会让人以为还得再选一次文件才能发，
-        // 而这次传输其实已经在路上了；显示刚发出去的文件名才是这一刻的事实
+
         fileLabel.setText("已发送: " + sending.getName()
                 + "（" + FileUtil.humanSize(sending.length()) + "）");
     }
 
     /**
-     * 更新进度显示。
+     * 更新进度条与进度文字，可在任意线程调用。
      *
-     * @param fileName 文件名
-     * @param progress 进度比例（0.0 - 1.0）
-     * @param text     附加说明
+     * @param fileName 当前传输的文件名
+     * @param progress 完成比例，取值 0 到 1
+     * @param text 当前阶段说明
      */
     public void updateProgress(String fileName, double progress, String text) {
         onEdt(() -> {
@@ -254,7 +197,7 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 追加传输日志。
+     * 向日志区追加一行带时间戳的记录。
      *
      * @param message 日志内容
      */
@@ -266,7 +209,7 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 登记一个接收中的传输编号，使进度能路由到本窗口。
+     * 登记传输编号与当前窗口的归属关系。
      *
      * @param transferId 传输编号
      */
@@ -277,14 +220,13 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 处理收到的文件传输请求：询问用户是否接收并回执。
+     * 处理收到的文件传输请求，按需询问用户是否接收。
      *
-     * @param request 文件请求消息
+     * @param request 传输请求消息
      */
     public void handleIncomingRequest(FileMessage request) {
         registerTransfer(request.getTransferId());
-        // 发给自己时不必再问一遍"是否接收"：请求本来就是自己刚点出去的，
-        // 服务端原样中继回来只是这条链路的实现细节，弹窗会让一次自发送变成两次确认
+
         boolean selfSend = request.getSender() != null
                 && request.getSender().equals(client.getUsername());
         onEdt(() -> {
@@ -294,6 +236,7 @@ public class FileTransferUI extends BaseUI {
                     ? "正在接收: " + request.getFileName() : "等待确认: " + request.getFileName());
         });
         if (selfSend) {
+            // 自己发给自己的副本直接接收
             client.respondFileRequest(request, true, "");
             appendLog("这是发给自己的一份副本，已自动接收");
             return;
@@ -309,18 +252,14 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 处理传输结果回执。
+     * 处理传输结束的回执，更新状态并按需关闭窗口。
      *
-     * <p>发送成功后本窗口会在短暂延时后自动关闭，只留聊天窗口：传输已经结束，
-     * 再挂着一个窗口只会挡住聊天。失败与"对方拒绝"不自动关闭，
-     * 因为使用者需要看到原因并可能重试；接收方也不自动关闭，它要显示文件的保存位置。</p>
-     *
-     * @param result 结果消息
+     * @param result 传输结果消息
      */
     public void handleResult(FileMessage result) {
         TRANSFER_OWNERS.remove(result.getTransferId());
         boolean success = result.isAccepted();
-        // 结果回执由接收方发出：发送者字段不是自己，说明本窗口是发起方
+
         boolean senderSide = !client.getUsername().equals(result.getSender());
         onEdt(() -> {
             progressBar.setValue(success ? 100 : 0);
@@ -328,24 +267,20 @@ public class FileTransferUI extends BaseUI {
         });
         appendLog((success ? "[成功] " : "[失败] ") + result.getMessage());
         if (!success) {
-            // 失败时同样必须释放发送会话：否则 SendingFile 会一直持有文件句柄，
-            // 使用者既删不掉源文件，进程也会持续占用文件描述符
+            // 失败时释放发送会话并提示原因
             releaseSendSession(result.getTransferId());
             showError(result.getMessage());
             return;
         }
         if (senderSide) {
+            // 发送方成功后在延时后关闭窗口
             appendLog("传输已完成，本窗口将在 " + (AUTO_CLOSE_DELAY_MS / 1000) + " 秒后自动关闭");
             scheduleAutoClose();
         }
     }
 
     /**
-     * 释放发送会话及其持有的文件句柄。
-     *
-     * <p>为什么由界面负责收尾：发送线程只有在对端同意后才会启动，被拒绝或提前失败时
-     * 根本不存在那个线程，也就没有它的 {@code finally} 来释放会话；会话不释放，
-     * {@code SendingFile} 会一直占着文件句柄。释放是幂等的，因此多条结束路径都可以放心调用。</p>
+     * 释放服务端为失败传输保留的发送会话。
      *
      * @param transferId 传输编号
      */
@@ -353,20 +288,14 @@ public class FileTransferUI extends BaseUI {
         try {
             client.getFileService().closeSend(transferId);
         } catch (RuntimeException e) {
-            // 清理失败只留日志，不能因此打断界面提示，否则使用者看到的是"清理异常"而不是传输结果
             LOGGER.log(java.util.logging.Level.FINE, "释放文件发送会话失败: " + transferId, e);
         }
     }
 
-    /**
-     * 安排一次延时自动关闭。
-     *
-     * <p>使用 Swing 定时器而不是新线程：回调直接发生在事件分发线程上，可以安全操作窗口。</p>
-     */
     private void scheduleAutoClose() {
         javax.swing.Timer timer = new javax.swing.Timer(AUTO_CLOSE_DELAY_MS, event -> {
             if (TRANSFER_OWNERS.containsValue(this)) {
-                // 同一对端可能还有别的传输在进行，此时不能关闭
+                // 还有未完成的传输时保持窗口打开
                 return;
             }
             dispose();
@@ -376,9 +305,9 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 根据消息类型分发到本窗口的处理方法。
+     * 按文件消息类型分发到对应的处理逻辑。
      *
-     * @param message 文件相关消息
+     * @param message 文件消息
      */
     public void handleFileMessage(FileMessage message) {
         MessageType type = message.getType();
@@ -397,8 +326,8 @@ public class FileTransferUI extends BaseUI {
                 appendLog("对方拒绝接收文件: " + message.getMessage());
                 onEdt(() -> progressLabel.setText("对方拒绝接收"));
                 TRANSFER_OWNERS.remove(message.getTransferId());
-                // 被拒绝时发送线程从未启动，不存在它的 finally 来收尾，
-                // 必须在这里主动释放发送会话与文件句柄，否则句柄会一直挂到退出程序
+
+                // 对方拒绝后释放发送会话
                 releaseSendSession(message.getTransferId());
                 break;
             case FILE_ACCEPT:
@@ -412,10 +341,10 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 解析进度消息中携带的比例。
+     * 解析进度文本，无法解析时返回 0。
      *
      * @param text 进度文本
-     * @return 进度比例；解析失败返回 0
+     * @return 完成比例
      */
     private double parseProgress(String text) {
         try {
@@ -426,10 +355,10 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 生成进度的可读文本。
+     * 生成已传输块数的进度文字。
      *
-     * @param message 进度消息
-     * @return 形如 {@code 已传输 3/10 块} 的文本
+     * @param message 文件分块消息
+     * @return 形如 3/10 块的说明文本
      */
     private String textProgress(FileMessage message) {
         int total = Math.max(1, message.getTotalChunks());
@@ -438,11 +367,12 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 窗口关闭时注销注册表，防止内存泄漏。
+     * 关闭窗口并清理该窗口持有的窗口映射与传输记录。
      */
     @Override
     public void dispose() {
         WINDOWS.remove(peer);
+        // 移除所有归属当前窗口的传输编号
         List<String> owned = TRANSFER_OWNERS.entrySet().stream()
                 .filter(entry -> entry.getValue() == this)
                 .map(Map.Entry::getKey)
@@ -452,23 +382,15 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 以指定文件立即发起一次传输。
+     * 直接发送指定文件，供聊天面板调用。
      *
-     * <p>聊天窗口内的"发送文件"按钮已经知道接收方是谁（私聊窗口是对端、群聊窗口是全部在线用户），
-     * 因此选择文件后可以直接发起，不需要再让使用者回到本窗口点一次"发送"。</p>
-     *
-     * <p>这条路径同时也是"聊天窗口已经成为唯一入口"的体现：从聊天窗口发文件时
-     * 顶部那行选择控件会被收起来，本窗口只剩进度条与日志。窗口随 {@link #WINDOWS}
-     * 按对端复用，因此同一次会话里第二次发文件也不会又冒出一个要求选文件的界面。</p>
-     *
-     * @param file 待发送文件
+     * @param file 待发送的文件
      */
     public void sendNow(File file) {
         selectedFile = file;
         chatInitiated = true;
         if (topPanel != null && topPanel.isVisible()) {
-            // 接收方与文件都已确定，收掉那一行选择控件：留着它，使用者会以为
-            // 还得再选一次文件、再点一次发送（截图里那句"为什么还是需要选择文件"就是这么来的）
+            // 由聊天面板发起时隐藏顶部的接收方与选择区
             topPanel.setVisible(false);
             topPanel.getParent().revalidate();
             topPanel.getParent().repaint();
@@ -478,7 +400,7 @@ public class FileTransferUI extends BaseUI {
     }
 
     /**
-     * 获取尺寸建议，避免窗口过小。
+     * 返回不小于 600×400 的首选窗口尺寸。
      *
      * @return 首选尺寸
      */

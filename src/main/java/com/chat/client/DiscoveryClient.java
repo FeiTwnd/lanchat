@@ -24,55 +24,33 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 局域网服务器自动发现客户端。
- *
- * <p>职责：向本网段广播 {@code LANCHAT_DISCOVER} 报文，收集 {@link DiscoveryResponder}
- * 返回的应答，解析出可用的服务器地址列表，供登录界面一键填充。</p>
- *
- * <p>实现要点：</p>
- * <ul>
- *   <li>向每个网卡的广播地址各发一次，避免多网卡机器只走默认网卡导致发现失败；</li>
- *   <li>同时向 255.255.255.255 发送一次，兼容部分未正确枚举广播地址的环境；</li>
- *   <li>在规定超时窗口内持续接收，用去重集合避免同一次发现出现重复条目；</li>
- *   <li>发现失败返回空列表而非抛异常——自动发现只是便捷入口，用户仍可手动输入 IP。</li>
- * </ul>
- *
- * <p>健壮性：接收窗口内收到的任何报文都可能是伪造/畸形的，因此解析失败一律忽略，
- * 既不中断接收循环也不放入结果集；结果规模另设上限，防止同一网段内的异常主机
- * 用海量伪造应答把内存和界面撑爆。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 通过 UDP 广播发现局域网内正在运行的聊天服务器。
  */
 public class DiscoveryClient {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".DiscoveryClient");
 
-    /** 接收缓冲区大小（字节），与应答长度上限保持同一量级 */
+    /** 单个应答报文的接收缓冲区大小，单位字节。 */
     private static final int RECEIVE_BUFFER_SIZE = 256;
 
-    /** 单次发现接受的最大服务器条目数，超出后不再收录新条目 */
+    /** 单次发现最多保留的服务器数量。 */
     private static final int MAX_SERVER_ENTRIES = 64;
 
-    /** 发现结果条目：服务器地址与在线人数 */
+    /**
+     * 一条服务器发现结果，包含主机地址、端口和在线人数。
+     */
     public static final class ServerInfo {
-
-        /** 服务器地址 */
         private final String host;
 
-        /** 服务器 TCP 端口 */
         private final int port;
 
-        /** 应答时的在线人数 */
         private final int onlineCount;
 
         /**
-         * 构造发现结果。
+         * 构造一条服务器信息。
          *
-         * @param host        服务器地址
-         * @param port        TCP 端口
-         * @param onlineCount 在线人数
+         * @param host 服务器主机地址
+         * @param port 服务器端口
+         * @param onlineCount 当前在线人数
          */
         public ServerInfo(String host, int port, int onlineCount) {
             this.host = host;
@@ -80,49 +58,28 @@ public class DiscoveryClient {
             this.onlineCount = onlineCount;
         }
 
-        /**
-         * 获取服务器地址。
-         *
-         * @return 主机地址
-         */
         public String getHost() {
             return host;
         }
 
-        /**
-         * 获取端口。
-         *
-         * @return TCP 端口
-         */
         public int getPort() {
             return port;
         }
 
-        /**
-         * 获取在线人数。
-         *
-         * @return 在线人数
-         */
         public int getOnlineCount() {
             return onlineCount;
         }
 
         /**
-         * 生成界面展示文本。
+         * 返回用于界面展示的服务器描述文字。
          *
-         * @return 形如 {@code 192.168.1.5:9527（在线 3 人，本机）} 的文本
+         * @return 主机、端口与在线人数的组合文字
          */
         public String describe() {
             String suffix = DiscoveryResponder.isLoopback(host) ? "，本机服务器" : "";
             return host + ":" + port + "（在线 " + onlineCount + " 人" + suffix + "）";
         }
 
-        /**
-         * 以地址与端口判定唯一性。
-         *
-         * @param obj 比较对象
-         * @return 相同返回 true
-         */
         @Override
         public boolean equals(Object obj) {
             if (!(obj instanceof ServerInfo)) {
@@ -132,21 +89,11 @@ public class DiscoveryClient {
             return port == other.port && host.equals(other.host);
         }
 
-        /**
-         * 计算散列码。
-         *
-         * @return 散列码
-         */
         @Override
         public int hashCode() {
             return host.hashCode() * 31 + port;
         }
 
-        /**
-         * 输出条目信息。
-         *
-         * @return 展示文本
-         */
         @Override
         public String toString() {
             return describe();
@@ -154,10 +101,10 @@ public class DiscoveryClient {
     }
 
     /**
-     * 执行一次自动发现。
+     * 广播发现请求并收集应答。
      *
-     * @param timeoutMillis 等待应答的总时长（毫秒）
-     * @return 服务器列表，按地址排序；未发现任何服务器时返回空列表
+     * @param timeoutMillis 等待应答的总时长，单位毫秒
+     * @return 按主机地址排序的服务器列表，未发现时为空列表
      */
     public List<ServerInfo> discover(int timeoutMillis) {
         int port = Config.discoveryPort();
@@ -166,6 +113,7 @@ public class DiscoveryClient {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
             socket.setSoTimeout(Math.min(500, timeoutMillis));
+            // 向每个广播地址发送一份发现请求
             for (InetAddress address : broadcastAddresses()) {
                 try {
                     socket.send(new DatagramPacket(payload, payload.length, address, port));
@@ -179,34 +127,24 @@ public class DiscoveryClient {
             LOGGER.log(Level.WARNING, "自动发现失败（无法创建 UDP 套接字）: " + e.getMessage(), e);
         }
         List<ServerInfo> result = new ArrayList<>(servers);
+        // 按主机地址排序，保证界面中的列表顺序稳定
         result.sort((a, b) -> a.getHost().compareTo(b.getHost()));
         LOGGER.info(() -> "自动发现完成，共找到 " + result.size() + " 台服务器");
         return result;
     }
 
-    /**
-     * 额外向回环地址发一次单播探测。
-     *
-     * <p>UDP 广播通常不会回到本机，而教室演示、开发自测与集成测试都常在同一台机器上
-     * 同时运行服务器与客户端。补一次回环单播，可让"本机服务器"立即可被发现，
-     * 无需依赖操作系统的广播回环行为。</p>
-     *
-     * @param socket  套接字
-     * @param payload 请求报文
-     * @param port    发现端口
-     * @param servers 结果集合
-     */
+    /** 向回环地址发送一次探测请求。 */
     private void sendLoopbackProbe(DatagramSocket socket, byte[] payload, int port, Set<ServerInfo> servers) {
         try {
             InetAddress loopback = InetAddress.getLoopbackAddress();
             socket.send(new DatagramPacket(payload, payload.length, loopback, port));
-            // 本机应答几乎瞬时到达，单独收一次并设置短超时，避免拖慢整体发现过程
+
+            // 回环探测只等 300 毫秒
             socket.setSoTimeout(300);
             byte[] buffer = new byte[RECEIVE_BUFFER_SIZE];
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             socket.receive(packet);
-            // 不能假设先到的包一定来自回环：同一次发现还发过广播，局域网服务器的应答
-            // 完全可能先到。统一按报文来源地址收录，才不会把远端服务器误标成 127.0.0.1。
+
             ServerInfo info = parse(packet);
             if (info != null) {
                 servers.add(info);
@@ -218,17 +156,7 @@ public class DiscoveryClient {
         }
     }
 
-    /**
-     * 在超时窗口内持续收集应答。
-     *
-     * <p>使用“剩余时间”递减的方式收敛等待，避免最后一个超时窗口无谓等待。
-     * 循环内对每个报文单独判错：解析失败只是忽略该包，接收循环继续等待下一个应答，
-     * 否则一台异常主机就能让本次发现提前结束。</p>
-     *
-     * @param socket        套接字
-     * @param servers       结果集合
-     * @param timeoutMillis 总等待时间
-     */
+    /** 在截止时间前接收应答，直到超时。 */
     private void collectResponses(DatagramSocket socket, Set<ServerInfo> servers, int timeoutMillis) {
         long deadline = System.currentTimeMillis() + timeoutMillis;
         byte[] buffer = new byte[RECEIVE_BUFFER_SIZE];
@@ -242,7 +170,7 @@ public class DiscoveryClient {
                     continue;
                 }
                 if (servers.size() >= MAX_SERVER_ENTRIES) {
-                    LOGGER.warning("发现结果已达上限 " + MAX_SERVER_ENTRIES + " 条，忽略后续应答");
+                    LOGGER.warning("发现结果已达上限 " + MAX_SERVER_ENTRIES + " 条，忽略其余应答");
                     return;
                 }
                 servers.add(info);
@@ -255,17 +183,7 @@ public class DiscoveryClient {
         }
     }
 
-    /**
-     * 解析应答报文，并以报文的真实来源地址作为服务器地址。
-     *
-     * <p>为什么不信报文里自称的地址：服务器可能把 Hyper-V/WSL 等虚拟网卡的地址
-     * 写进应答（局域网内不可达），而 UDP 应答的来源地址一定是数据包实际经过的
-     * 网卡地址，用它连接才能保证可达。本机回环探测的应答来源就是 127.0.0.1，
-     * 因此也不需要再额外做地址归一化。</p>
-     *
-     * @param packet 已接收的数据包
-     * @return 服务器信息；格式非法时返回 null
-     */
+    /** 解析应答报文，并用报文的实际来源地址作为主机地址。 */
     private ServerInfo parse(DatagramPacket packet) {
         String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
                 StandardCharsets.UTF_8);
@@ -280,21 +198,12 @@ public class DiscoveryClient {
         return new ServerInfo(source.getHostAddress(), announced.getPort(), announced.getOnlineCount());
     }
 
-    /**
-     * 解析应答报文。
-     *
-     * <p>长度与各字段范围由 {@link DiscoveryResponder#parseAnnouncement(String)} 统一校验，
-     * 这里只负责把结果包装为条目；任何解析异常都不得向上传播，否则会打断接收线程的收集循环。</p>
-     *
-     * @param text 报文文本
-     * @return 服务器信息；格式非法时返回 null
-     */
+    /** 把应答文本解析为服务器信息，格式不合法时返回 null。 */
     private ServerInfo parse(String text) {
         String[] parts;
         try {
             parts = DiscoveryResponder.parseAnnouncement(text);
         } catch (RuntimeException e) {
-            // 防御性兜底：解析路径已做格式校验，此处仅保证异常不会终止发现流程
             LOGGER.log(Level.FINE, "解析发现应答失败: " + e.getMessage(), e);
             return null;
         }
@@ -304,11 +213,7 @@ public class DiscoveryClient {
         return new ServerInfo(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
     }
 
-    /**
-     * 枚举本机所有广播地址。
-     *
-     * @return 广播地址列表；枚举失败时回退为有限广播地址 255.255.255.255
-     */
+    /** 枚举所有已启用网卡的广播地址，并补上有限广播地址。 */
     private List<InetAddress> broadcastAddresses() {
         List<InetAddress> addresses = new ArrayList<>();
         try {
@@ -337,34 +242,31 @@ public class DiscoveryClient {
     }
 
     /**
-     * 阻塞式自动发现，供非界面场景（命令行、测试）使用。
+     * 创建临时客户端并执行一次发现。
      *
-     * <p>界面调用方应把本方法放入后台线程或 {@code SwingWorker}，
-     * 否则会阻塞事件分发线程导致界面假死。</p>
-     *
-     * @param timeoutMillis 超时时间
-     * @return 服务器列表
+     * @param timeoutMillis 等待应答的总时长，单位毫秒
+     * @return 发现的服务器列表
      */
     public static List<ServerInfo> discoverOnce(int timeoutMillis) {
         return new DiscoveryClient().discover(timeoutMillis);
     }
 
     /**
-     * 构造回环地址的服务器条目，供“本机启动服务器”场景直接使用。
+     * 构造本机服务器信息。
      *
-     * @param port TCP 端口
-     * @return 服务器条目
+     * @param port 服务器端口
+     * @return 主机固定为 127.0.0.1 的服务器信息
      */
     public static ServerInfo loopback(int port) {
         return new ServerInfo("127.0.0.1", port, 0);
     }
 
     /**
-     * 判断给定地址是否可用于连接测试。
+     * 尝试建立 TCP 连接，判断目标地址是否可连接。
      *
-     * @param host 主机地址
-     * @param port 端口
-     * @return 在超时时间内可建立连接返回 true
+     * @param host 目标主机
+     * @param port 目标端口
+     * @return 连接成功返回 true
      */
     public static boolean probe(String host, int port) {
         try (java.net.Socket socket = new java.net.Socket()) {

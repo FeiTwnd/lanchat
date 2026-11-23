@@ -30,161 +30,65 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 智能体小助手服务。
- *
- * <p>职责：把使用者提给"智能体小助手"的问题转成一次外部 HTTP 调用，取回回答正文，
- * 再交回调用方投递给提问者。外部平台选用扣子（Coze），接口为工作流同步执行接口
- * {@code POST https://api.coze.cn/v1/workflow/run}：一次请求直接拿回执行结果，
- * 不需要像对话接口那样再轮询状态、拉取消息。</p>
- *
- * <p><b>为什么是服务端的一个虚拟成员而不是客户端直连</b>：见
- * {@link com.chat.server.UserManager#registerVirtualUser}。要点是所有客户端零改动，
- * 小助手在好友树里就是一名普通成员。</p>
- *
- * <p><b>无会话上下文</b>：工作流按单次执行处理，请求里不传任何会话或历史参数，
- * 每次提问都是独立的一问一答。这既符合"回答本程序怎么用"这一用途（问题都是自包含的），
- * 也省掉了"哪个用户当时处在哪段会话里"这片需要过期与并发保护的状态。</p>
- *
- * <p><b>为什么必须异步</b>：一次问答的耗时由外部平台决定（本类按
- * {@link Constants#AI_REQUEST_TIMEOUT_MS} 设上限）。若在调用方线程上同步等待，
- * 被阻塞的会是 {@link com.chat.server.ClientHandler} 的读取循环——那个线程同时负责
- * 应答心跳，一旦被卡满 {@link Constants#HEARTBEAT_TIMEOUT_MS}，提问者本人会被服务器
- * 判定为掉线并强制断开。因此 {@link #ask} 立即返回，真正的等待发生在本类的线程池里。</p>
- *
- * <p><b>凭据处理</b>：令牌只出现在请求头里，不写日志、不进异常信息。启动日志只报
- * "是否已配置"，不报任何片段。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 智能体小助手服务，负责把提问提交到外部工作流接口并异步取回回答。
  */
 public class AiAssistantService {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".AiAssistantService");
 
-    /**
-     * 同时进行的问答数上限。
-     *
-     * <p>取 2 是因为用途是"问怎么用"，不是高并发客服；限制并发既能防止
-     * 提问潮把服务器的出网连接数拉满，也让外部平台的限流更不容易被触发。</p>
-     */
     private static final int MAX_CONCURRENT_ASKS = 2;
 
-    /**
-     * 等待队列长度。
-     *
-     * <p>队列满时明确拒绝并回一句"稍后再试"，而不是无限排队：
-     * 排队意味着提问者盯着一个可能几十秒后才出现的回答，
-     * 明确拒绝反而让他知道该重来一次。</p>
-     */
     private static final int ASK_QUEUE_CAPACITY = 32;
 
-    /**
-     * 回执与日志里异常原因的最大长度。
-     *
-     * <p>异常文本是给排查用的线索，不是正文；不设上限时一段 JDK 的长报文
-     * 会把聊天窗口刷满，也会把日志冲散。</p>
-     */
+    /** 回执与日志中异常原因的最大字符数。 */
     private static final int MAX_REASON_LENGTH = 200;
 
-    /**
-     * 单次响应体的最大字节数（1 MiB）。
-     *
-     * <p>{@code BodyHandlers.ofString} 是不设防地把整个响应读进堆：对端只要持续吐数据，
-     * 堆就会被撑爆，而 OOM 发生在 HttpClient 自己的线程上——提问者拿不到任何回执，
-     * 只看到小助手永久性地"正在思考"。真实回答是一段短文，1 MiB 已远超正常所需，
-     * 足以容纳任何合理回复；超限即中止并回报一句中文原因。
-     * 这个上限只服务于本类的读取逻辑，因此留在本类里而不是公共常量表。</p>
-     */
+    /** 响应体最大字节数（1 MiB）。 */
     private static final int MAX_RESPONSE_BODY_BYTES = 1024 * 1024;
 
-    /**
-     * 同一提问者的最小提问间隔（3 秒）。
-     *
-     * <p>每次提问都会产生一次外部平台的<b>计费</b>调用。并发与队列只约束"同时在飞"的数量，
-     * 拦不住同一个人反复追问——那只受限于他的键盘速度。给每人一个最小间隔，
-     * 既保住正常的一问一答手感，又让刷接口变得没有收益。</p>
-     */
+    /** 同一提问者的最小提问间隔（毫秒）。 */
     private static final long MIN_ASK_INTERVAL_MS = 3_000L;
 
-    /**
-     * 限频记录表的条目清理阈值。
-     *
-     * <p>记录表按用户名累积，用完不清理就是一个只增不减的容器。虽然条目数在理论上
-     * 受账号总数约束，但没有理由让一份"只用来判断 3 秒"的状态长期驻留，超过阈值即清理过期项。</p>
-     */
     private static final int RATE_LIMIT_CLEANUP_THRESHOLD = 256;
 
-    /** 被限频时回给提问者的固定提示 */
     private static final String RATE_LIMITED_REPLY = "提问太快了，请稍等几秒再问。";
 
-    /** 实际使用的接口地址；默认取内置常量，可由配置覆盖 */
     private final String apiUrl;
 
-    /** 外部平台的工作流编号 */
     private final String workflowId;
 
-    /** 访问令牌，只用于请求头 */
     private final String token;
 
-    /**
-     * 接口地址是否可用（可解析且 scheme 为 http/https）。
-     *
-     * <p>构造阶段就判定并固化，而不是每次提问再解析：配置写错属于启动期问题，
-     * 让它表现为"小助手没有出现"，而不是"每次提问都换回一句英文异常"。
-     * 与令牌非法同样的失败方式，管理员看启动日志即可定位。</p>
-     */
     private final boolean apiUrlUsable;
 
-    /**
-     * 每个提问者的最近一次提问时刻（毫秒时间戳），用于限频。
-     *
-     * <p>用 {@link ConcurrentHashMap} 而不是普通表：提问来自各自连接的读取线程，
-     * 天然并发；计数表又只做"读改写一个时间戳"这一件事，用锁或更大结构都不划算。</p>
-     */
+    /** 每个提问者的最近提问时刻（毫秒时间戳）。 */
     private final Map<String, Long> lastAskAt = new ConcurrentHashMap<>();
 
-    /** 上次清理限频记录的时刻，用于把清理动作限制在低频（见 {@link #evictStaleAskers(long)}） */
     private final AtomicLong lastRateLimitCleanup = new AtomicLong();
 
-    /**
-     * JDK 自带的 HTTP 客户端，无需任何第三方依赖。
-     *
-     * <p><b>为什么显式锁定 HTTP/1.1</b>：JDK 的 HttpClient 在 HTTPS 之外的地址上默认会先
-     * 发一次 {@code Upgrade: h2c} 试探 HTTP/2 明文升级，等对端回 {@code 101} 才继续。
-     * 智能体平台提供的是 HTTP/1.1 接口，这次试探纯属多一个来回；更要紧的是，
-     * 任何不理解该扩展的中转（企业代理、抓包工具、调试桩）都会让请求停在这里不动，
-     * 表现成"提问发出去之后一直没有回音"。锁定版本号可以整段避开这个不确定性。</p>
-     */
     private final HttpClient httpClient;
 
-    /** 问答工作线程池，只在真正有提问时才创建线程 */
     private final ExecutorService workers;
 
     /**
-     * 构造服务并读取配置。
-     *
-     * <p>构造阶段不做任何网络动作：配置缺失时本对象仍然存在，只是
-     * {@link #isEnabled()} 为 false，服务器照常启动，小助手不出现在成员列表里。</p>
+     * 读取配置并创建 HTTP 客户端与问答线程池。
      */
     public AiAssistantService() {
         this.apiUrl = Config.aiApiUrl();
         this.workflowId = Config.aiWorkflowId();
         this.token = Config.aiApiToken();
-        // 令牌是手工拷进配置文件的，很容易在末尾多带一个换行或混入空格。
-        // 这种令牌进不了 HTTP 头，而 JDK 抛出的异常文本会把整个头值（含令牌）原样带出来，
-        // 一旦被日志或回执带出去就是凭据泄露；因此这里就地判定为"未配置"，
-        // 让服务器照常启动、小助手不注册，只留一条不含令牌的配置提示。
+        // 校验令牌能否放入 HTTP 请求头
         if (!token.isEmpty() && !isHeaderValueSafe(token)) {
             LOGGER.warning("ai.api.token 含有 HTTP 头不允许的字符（换行、空格或非 ASCII 字符），"
                     + "小助手不会启用；请在配置文件中重新填写该令牌");
         }
+        // 校验接口地址
         this.apiUrlUsable = isUsableEndpoint(apiUrl);
         if (!apiUrlUsable) {
-            // 只报协议，不回显原始地址：地址上可能挂着查询串形式的凭据，而协议名不可能含令牌
+            // 地址不可用时记录协议名
             LOGGER.warning("ai.api.url 不是可用的 http/https 地址（scheme=" + describeScheme(apiUrl)
                     + "），小助手不会启用；请检查配置文件中的该地址");
         }
+        // 固定使用 HTTP/1.1 并设置连接超时
         this.httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofMillis(Constants.AI_CONNECT_TIMEOUT_MS))
@@ -196,35 +100,19 @@ public class AiAssistantService {
     }
 
     /**
-     * 判断小助手是否可用。
+     * 判断小助手是否已配置完成并可用。
      *
-     * <p>两个必填项都配齐才算启用——把"填了令牌"本身当作开关，
-     * 不再单设一个 {@code ai.enabled}：两个开关表达同一件事时，
-     * 总会出现"开关开着但令牌没填"这种只能靠日志解释的状态。</p>
-     *
-     * <p>令牌还必须能放进 HTTP 头：含换行、空格或非 ASCII 字符的令牌只会让每次提问
-     * 都失败在请求构造阶段，不如当作未配置——那样使用者看到的是"没有小助手"，
-     * 而不是一个每次提问都报错的成员。</p>
-     *
-     * <p>接口地址同理：{@code file:///etc/passwd} 这类地址在构造时就已判为不可用
-     * （见 {@link #isUsableEndpoint(String)}），配置错了就不启用，
-     * 而不是等到每次提问才把一句英文异常回给使用者。</p>
-     *
-     * @return 已配置且可用返回 true
+     * @return 可用返回 true
      */
     public boolean isEnabled() {
         return apiUrlUsable && !workflowId.isEmpty() && !token.isEmpty() && isHeaderValueSafe(token);
     }
 
     /**
-     * 判断接口地址是否可用。
+     * 判断字符串是否为可用的 http 或 https 地址。
      *
-     * <p>只接受 http 与 https：其余协议（{@code file}、{@code ftp}、{@code jar} 等）
-     * 要么根本发不出请求，要么会去读本机资源，都不是"调用外部智能体平台"该做的事。
-     * 主机名也要求非空——{@code http:///path} 能通过 URI 解析，但不可能连得通。</p>
-     *
-     * @param url 配置中的接口地址
-     * @return 可作为 HTTP 接口地址返回 true
+     * @param url 接口地址
+     * @return 可用返回 true
      */
     private static boolean isUsableEndpoint(String url) {
         if (url == null || url.isEmpty()) {
@@ -237,18 +125,16 @@ public class AiAssistantService {
                     && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
                     && uri.getHost() != null && !uri.getHost().isEmpty();
         } catch (IllegalArgumentException e) {
-            // URI.create 对非法格式抛的就是它：当作"不可用"，交由启动日志说明
+            // 地址无法解析
             return false;
         }
     }
 
     /**
-     * 取出接口地址的协议名，仅供日志使用。
+     * 取出接口地址的协议名，用于日志。
      *
-     * <p>刻意只暴露协议：地址本身可能带查询串形式的凭据，而协议名不可能含令牌。</p>
-     *
-     * @param url 配置中的接口地址
-     * @return 小写协议名；缺失时返回"缺失"，无法解析时返回"无法解析"
+     * @param url 接口地址
+     * @return 协议名；缺失时返回“缺失”，无法解析时返回“无法解析”
      */
     private static String describeScheme(String url) {
         if (url == null) {
@@ -263,55 +149,48 @@ public class AiAssistantService {
     }
 
     /**
-     * 提交一次提问，回答就绪后回调。
+     * 提交一次提问，回答就绪后通过回调返回。
      *
-     * <p>本方法立即返回，不阻塞调用线程。回调在问答线程池的线程上执行，
-     * 实现方若要操作界面需自行切到事件分发线程。</p>
-     *
-     * <p>同一提问者的两次提问至少间隔 {@link #MIN_ASK_INTERVAL_MS}：间隔之内直接回调一句中文提示，
-     * 既不占用工作线程，也不会产生对外计费调用。未启用、被限频、队列已满这三种"没提交成功"
-     * 的情况同样走回调，调用方看到的永远是一条消息而不是沉默。</p>
-     *
-     * @param asker    提问者用户名，用于回投与时序排查
+     * @param asker 提问者用户名
      * @param question 提问正文
-     * @param sink     答复回调：参数依次为提问者用户名、机器人要回复的正文
-     *                 （失败时同样走这里，正文是一句道歉加中文原因，绝不静默丢弃）
+     * @param sink 回答回调，参数依次为提问者与回答正文
      */
     public void ask(String asker, String question, BiConsumer<String, String> sink) {
         if (sink == null) {
             return;
         }
         if (!isEnabled()) {
+            // 未启用时直接回调提示
             sink.accept(asker, "小助手尚未配置好，请联系管理员。");
             return;
         }
+        // 按提问者限频
         if (!allowAsk(asker)) {
-            // 限频判定放在提交任务之前：被挡下的提问不该占用工作线程与队列名额
+            // 被限频时直接回调提示
             sink.accept(asker, RATE_LIMITED_REPLY);
             return;
         }
         try {
+            // 提交到问答线程池
             workers.execute(() -> {
                 try {
                     sink.accept(asker, sanitize(requestAnswer(asker, question)));
                 } catch (InterruptedException e) {
-                    // 服务器停止时线程池被中断，属于正常收尾，不当作故障上报
+                    // 恢复中断标记
                     Thread.currentThread().interrupt();
                 } catch (RuntimeException | IOException e) {
+                    // 记录失败原因并回调提示
                     LOGGER.log(Level.WARNING, "智能体问答失败: " + asker + " - " + redact(e.getMessage()));
                     sink.accept(asker, sanitize("抱歉，这次没能取到回答：" + friendlyReason(e)));
                 } catch (Throwable t) {
-                    // Error（例如栈溢出、内存耗尽）不在上面两个分支的覆盖范围内。
-                    // 少了这一层，工作线程会直接死掉且不产生任何回执，使用者面对的是一片沉默，
-                    // 与"绝不静默丢弃"相矛盾；兜底回一句固定致歉，保证任何情况下都有回应。
-                    // 只记录类型与经脱敏处理的消息：直接把 Throwable 交给日志会原样打印它的
-                    // 报错文本，而那段文本有可能夹带访问令牌。
+                    // 处理 Error 级别的异常
                     LOGGER.log(Level.SEVERE, "智能体问答遇到严重错误: " + asker + " - "
                             + redact(t.getClass().getName() + ": " + t.getMessage()));
                     sink.accept(asker, "抱歉，小助手内部出错，这次没能取到回答，请稍后再问一次。");
                 }
             });
         } catch (RejectedExecutionException e) {
+            // 队列已满时拒绝
             LOGGER.info(() -> "智能体问答队列已满，已拒绝: " + asker);
             sink.accept(asker, "现在提问的人有点多，请稍后再试。");
         }
@@ -320,17 +199,13 @@ public class AiAssistantService {
     /**
      * 判断本次提问是否通过按人限频。
      *
-     * <p>用 {@link ConcurrentHashMap#compute} 完成"读上一次时刻、比较、写入新时刻"这一整段：
-     * 拆成先 {@code get} 再 {@code put} 的话，同一个人快速双击发两条消息时，
-     * 两条都会读到同一个旧时刻并双双通过——限频在最容易触发的场景下失效。</p>
-     *
      * @param asker 提问者用户名
-     * @return 本次允许提问返回 true
+     * @return 允许提问返回 true
      */
     private boolean allowAsk(String asker) {
         long now = System.currentTimeMillis();
         AtomicBoolean allowed = new AtomicBoolean(true);
-        // 用户名由调用方保证非空，这里的兜底只是不让 ConcurrentHashMap 因 null 键抛异常
+        // 空用户名取空串作为计数键
         String key = asker == null ? "" : asker;
         lastAskAt.compute(key, (name, previous) -> {
             if (previous != null && now - previous < MIN_ASK_INTERVAL_MS) {
@@ -339,6 +214,7 @@ public class AiAssistantService {
             }
             return now;
         });
+        // 通过限频检查后清理过期记录
         if (allowed.get()) {
             evictStaleAskers(now);
         }
@@ -346,12 +222,9 @@ public class AiAssistantService {
     }
 
     /**
-     * 清理限频记录表中的过期条目，避免这张表只增不减。
+     * 清理超过限频间隔的提问记录。
      *
-     * <p>只在条目数超过阈值时动手，且两次清理至少间隔一个限频周期：
-     * 清理本身要遍历整张表，若每次提问都做，反而把限频的开销放大成每人一次全表扫描。</p>
-     *
-     * @param now 当前时刻（毫秒）
+     * @param now 当前毫秒时间戳
      */
     private void evictStaleAskers(long now) {
         if (lastAskAt.size() <= RATE_LIMIT_CLEANUP_THRESHOLD) {
@@ -361,30 +234,19 @@ public class AiAssistantService {
         if (now - lastCleanup < MIN_ASK_INTERVAL_MS || !lastRateLimitCleanup.compareAndSet(lastCleanup, now)) {
             return;
         }
-        // 只删已经过了限频周期的记录：删早了等于放行一次超频提问
+        // 移除超过限频间隔的记录
         lastAskAt.entrySet().removeIf(entry -> now - entry.getValue() >= MIN_ASK_INTERVAL_MS);
     }
 
     /**
-     * 关闭线程池，用于服务器停止时善后。
-     *
-     * <p>不等待正在进行的问答完成：那些回答的投递依赖在线表，
-     * 而在线表在停止流程里已经被清空，等下去也没有意义。</p>
+     * 停止问答线程池。
      */
     public void shutdown() {
         workers.shutdownNow();
     }
 
-    /**
-     * 真正发起一次问答调用。
-     *
-     * @param asker    提问者用户名（仅用于日志，本接口不消费）
-     * @param question 提问正文
-     * @return 已清洗、可直接投递的回答正文
-     * @throws IOException          网络失败、超时或接口返回非成功状态时抛出
-     * @throws InterruptedException 等待响应期间线程被中断时抛出
-     */
     private String requestAnswer(String asker, String question) throws IOException, InterruptedException {
+        // 构造带令牌的 POST 请求
         HttpRequest request = HttpRequest.newBuilder(URI.create(apiUrl))
                 .timeout(Duration.ofMillis(Constants.AI_REQUEST_TIMEOUT_MS))
                 .header("Authorization", "Bearer " + token)
@@ -393,14 +255,13 @@ public class AiAssistantService {
                 .POST(HttpRequest.BodyPublishers.ofString(buildRequestBody(asker, question),
                         StandardCharsets.UTF_8))
                 .build();
-        // 用 ofInputStream 而不是 ofString：后者会把响应体无上限地堆进堆内存，
-        // 对端持续吐数据就能把本进程撑爆（OOM 发生在 HttpClient 自己的线程上，
-        // 提问者连一句回执都收不到）。这里拿到流，由 readBody 按上限读。
+
+        // 发送请求并读取状态码
         HttpResponse<InputStream> response = httpClient.send(request,
                 HttpResponse.BodyHandlers.ofInputStream());
         int status = response.statusCode();
         if (status != 200) {
-            // 非成功状态不看正文，但必须把流关掉，否则连接会一直挂到超时
+            // 非 200 状态先关闭响应体
             closeQuietly(response.body());
             throw new IOException("接口返回 HTTP " + status + "（" + describeStatus(status) + "）");
         }
@@ -412,15 +273,7 @@ public class AiAssistantService {
     }
 
     /**
-     * 按上限读取响应体并解码为 UTF-8 文本。
-     *
-     * <p>逐块读取并在超限时立刻停止：先读完整段再判断长度等于没有上限。
-     * 超限抛出的是本类自己构造的中文 {@link IOException}，会经
-     * {@link #friendlyReason(Exception)} 原样回给使用者，说明"内容过大"而不是一个堆栈。</p>
-     *
-     * @param stream 响应体输入流
-     * @return 解码后的文本
-     * @throws IOException 读取失败或内容超过 {@link #MAX_RESPONSE_BODY_BYTES} 时抛出
+     * 读取响应体，超过大小上限时中止。
      */
     private String readBody(InputStream stream) throws IOException {
         if (stream == null) {
@@ -439,14 +292,6 @@ public class AiAssistantService {
         return buffer.toString(StandardCharsets.UTF_8);
     }
 
-    /**
-     * 静默关闭一个输入流。
-     *
-     * <p>关闭响应体流会同时释放底层连接；关闭本身失败不影响本次问答的结论，
-     * 因此只吞掉异常，不覆盖真正的失败原因。</p>
-     *
-     * @param stream 待关闭的流，可为 null
-     */
     private static void closeQuietly(InputStream stream) {
         if (stream == null) {
             return;
@@ -454,21 +299,10 @@ public class AiAssistantService {
         try {
             stream.close();
         } catch (IOException ignored) {
-            // 释放连接失败无法补救，也不该改写调用方正在处理的错误
+            // 关闭异常忽略
         }
     }
 
-    /**
-     * 拼装请求体。
-     *
-     * <p>工作流同步执行接口只认 {@code workflow_id} 与开始节点参数：这里把提问正文放进
-     * 工作流开始节点的 {@code input} 参数，与平台侧工作流的输入定义保持一致。
-     * 不传 {@code app_id}——它只用于运行扣子应用里的工作流，空间资源库里的工作流不需要。</p>
-     *
-     * @param asker    提问者用户名（本方法不消费，保留参数以与调用方签名一致）
-     * @param question 提问正文
-     * @return JSON 请求体
-     */
     private String buildRequestBody(String asker, String question) {
         return '{'
                 + "\"workflow_id\":" + JsonCodec.quote(workflowId) + ','
@@ -476,18 +310,6 @@ public class AiAssistantService {
                 + '}';
     }
 
-    /**
-     * 从返回报文中取出工作流输出。
-     *
-     * <p>工作流接口的返回形如 {@code {"code":0,"msg":"","data":"{\"output\":\"...\"}"}}：
-     * {@code data} 是一段 JSON 序列化字符串，里面通常只有一个 {@code output} 字段。
-     * 取不到 {@code output} 时把 {@code data} 原样返回——部分工作流直接输出纯文本，
-     * 或把结果放在别的字段里，丢掉它不如交给使用者。</p>
-     *
-     * @param body 返回报文
-     * @return 回答正文
-     * @throws IOException 报文无法解析、平台报错或其中没有可用输出时抛出
-     */
     private String extractAnswer(String body) throws IOException {
         Map<String, Object> root;
         try {
@@ -495,10 +317,12 @@ public class AiAssistantService {
         } catch (IllegalArgumentException e) {
             throw new IOException("返回内容不是合法 JSON：" + e.getMessage());
         }
+        // 校验业务状态码
         long code = JsonCodec.asLong(root, "code", -1L);
         if (code != 0L) {
             throw new IOException(describeApiError(code, JsonCodec.asString(root, "msg")));
         }
+        // data 可能是字符串或对象
         Object data = root.get("data");
         if (data instanceof String) {
             String payload = (String) data;
@@ -516,10 +340,7 @@ public class AiAssistantService {
     }
 
     /**
-     * 从 {@code data} 字符串里取出 {@code output} 字段。
-     *
-     * @param payload 工作流返回的 {@code data} 字符串
-     * @return 输出正文；不是 JSON 对象或没有 {@code output} 时返回原字符串
+     * 从 data 字符串中解析 output，解析失败时按原文返回。
      */
     private static String extractWorkflowOutput(String payload) {
         try {
@@ -527,21 +348,11 @@ public class AiAssistantService {
             String output = JsonCodec.asString(data, "output");
             return output == null ? payload : output;
         } catch (IllegalArgumentException e) {
-            // 部分工作流直接返回纯文本，不是 JSON；原样交给调用方
+            // 解析失败时按原文返回
             return payload;
         }
     }
 
-    /**
-     * 把平台错误码翻译成可行动的中文提示。
-     *
-     * <p>工作流接口的报错以 HTTP 200 + {@code code != 0} 的形式返回，因此不能只靠
-     * HTTP 状态码判断。已知错误码给出中文原因；未知错误码保留平台原文，便于管理员排查。</p>
-     *
-     * @param code 平台错误码
-     * @param msg  平台错误说明
-     * @return 中文提示
-     */
     private static String describeApiError(long code, String msg) {
         switch ((int) code) {
             case 4000:
@@ -556,20 +367,6 @@ public class AiAssistantService {
         }
     }
 
-    /**
-     * 把异常翻译成给使用者看的中文原因。
-     *
-     * <p>刻意不把原始异常信息整段抛给使用者：那些信息里混着类名、主机名与英文堆栈措辞，
-     * 对"程序怎么用"的使用者没有帮助。按类型归成几句可行动的提示，
-     * 完整信息留在服务器日志里给管理员。</p>
-     *
-     * <p><b>未知异常一律不回显原始文本</b>：这类异常多来自 JDK 的参数校验，
-     * 而它的报错会把整个请求头值抄进来——请求头里就有访问令牌（见 {@link #redact(String)}）。
-     * 对一个"任何用户都能提一次问"的入口来说，这等于把管理员凭据发给使用者。</p>
-     *
-     * @param e 问答过程中抛出的异常
-     * @return 一句中文原因
-     */
     private String friendlyReason(Exception e) {
         if (e instanceof HttpTimeoutException) {
             return "等待回答超时，请稍后再问一次。";
@@ -581,20 +378,17 @@ public class AiAssistantService {
             return "无法解析智能体平台域名，请检查网络。";
         }
         if (e instanceof IOException) {
-            // 走到这里的 IOException 都是本类自己抛的中文原因，可以原样回显
+            // 其他 IO 异常返回脱敏后的原因
             return redact(e.getMessage() == null ? "未知原因。" : e.getMessage());
         }
         return "智能体服务暂时不可用，请稍后再试。";
     }
 
     /**
-     * 脱敏一段将要写进日志或回执的文本。
+     * 掩去令牌并截断异常文本。
      *
-     * <p>做三件事：把令牌值替换成 {@code ***}、剔除控制字符、截断到可读长度。
-     * 它是"异常文本可能夹带凭据"这条链路的最后一道闸门，凡是把异常信息往外送的地方都要过一遍。</p>
-     *
-     * @param text 原始文本，可为 null
-     * @return 可安全外送的文本；入参为 null 时返回 null
+     * @param text 原始文本
+     * @return 处理后的文本
      */
     private String redact(String text) {
         if (text == null || text.isEmpty()) {
@@ -614,13 +408,10 @@ public class AiAssistantService {
     }
 
     /**
-     * 判断令牌能否安全地放进 HTTP 头。
+     * 判断字符串是否只含可放入 HTTP 头的可见 ASCII 字符。
      *
-     * <p>只接受可打印 ASCII（不含空格）：平台的令牌形如 {@code pat_xxx}，
-     * 出现其它字符一定是复制时混入了换行、空格或全角字符。</p>
-     *
-     * @param value 待检查的取值
-     * @return 可以放进请求头返回 true
+     * @param value 待判断的字符串
+     * @return 全部字符合法返回 true
      */
     private static boolean isHeaderValueSafe(String value) {
         for (int i = 0; i < value.length(); i++) {
@@ -632,15 +423,6 @@ public class AiAssistantService {
         return true;
     }
 
-    /**
-     * 把 HTTP 状态码翻译成可行动的排查提示。
-     *
-     * <p>这几种状态在接入调试阶段最常撞上，且都不是"重试就能好"的类型，
-     * 直接把病因写在回答里，比让使用者对着一个数字查文档有用。</p>
-     *
-     * @param statusCode HTTP 状态码
-     * @return 中文说明
-     */
     private String describeStatus(int statusCode) {
         switch (statusCode) {
             case 401:
@@ -657,26 +439,18 @@ public class AiAssistantService {
     }
 
     /**
-     * 清洗回答正文，使其满足本项目的消息约束。
+     * 规范化换行、去掉控制字符并限制正文长度。
      *
-     * <p>三件事：把各种换行统一成 {@code \n}（Windows 风格的 {@code \r\n} 属于
-     * 非法控制字符，界面与协议都只认 {@code \n}）；剔除其余控制字符
-     * （与 {@link com.chat.common.ChatMessageFactory#hasIllegalControlChar} 同口径）；
-     * 按 {@link Constants#MESSAGE_MAX_LENGTH} 截断——平台返回的长文可能远超本项目的正文上限，
-     * 不截断会把一条超出协议约束的消息塞进聊天窗口。</p>
-     *
-     * <p>截断时若切点正好落在代理对中间，会留下一个孤立的高代理项——那不是一个合法字符，
-     * 客户端渲染、日志与数据库编码都会因此出问题。因此切点前一位是高代理项时多退一个码元，
-     * 让被截掉的是整个字符而不是它的一半；退让后总长只会比上限更短。</p>
-     *
-     * @param raw 平台返回的原始正文
-     * @return 可直接投递的正文
+     * @param raw 原始回答
+     * @return 处理后的回答
      */
     private String sanitize(String raw) {
         if (raw == null) {
             return "";
         }
+        // 统一换行符
         String normalized = raw.replace("\r\n", "\n").replace('\r', '\n');
+        // 去掉除换行与制表符外的控制字符
         StringBuilder builder = new StringBuilder(normalized.length());
         for (int i = 0; i < normalized.length(); i++) {
             char c = normalized.charAt(i);
@@ -689,7 +463,7 @@ public class AiAssistantService {
         if (text.length() > Constants.MESSAGE_MAX_LENGTH) {
             int keep = Constants.MESSAGE_MAX_LENGTH - 3;
             if (keep > 0 && Character.isHighSurrogate(text.charAt(keep - 1))) {
-                // 切点前一位是高代理项，说明它和下一个码元本是一个字符，整体丢弃
+                // 截断位置落在代理对中间时前移一位
                 keep--;
             }
             text = text.substring(0, keep) + "...";
@@ -697,14 +471,6 @@ public class AiAssistantService {
         return text;
     }
 
-    /**
-     * 创建守护线程工厂。
-     *
-     * <p>线程名带固定前缀便于 jstack 定位；设为守护线程是为了不让一个还在等待外部响应的
-     * 问答线程拖住 JVM 退出。</p>
-     *
-     * @return 线程工厂
-     */
     private static ThreadFactory daemonFactory() {
         AtomicInteger counter = new AtomicInteger(1);
         return runnable -> {
@@ -714,20 +480,10 @@ public class AiAssistantService {
         };
     }
 
-    /**
-     * 读取接口地址，供日志展示。
-     *
-     * @return 当前生效的接口地址
-     */
     public String getApiUrl() {
         return apiUrl;
     }
 
-    /**
-     * 读取配置好的工作流编号。
-     *
-     * @return 工作流编号
-     */
     public String getWorkflowId() {
         return workflowId;
     }

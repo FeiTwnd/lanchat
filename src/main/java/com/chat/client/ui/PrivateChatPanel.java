@@ -7,55 +7,37 @@ import com.chat.common.TextMessage;
 import com.chat.util.DateUtil;
 
 /**
- * 私聊面板：仅处理与指定好友之间的私聊消息。
- *
- * <p>继承 {@link BaseChatPanel} 复用消息渲染与输入发送逻辑，
- * 本类只负责三件差异化的行为：过滤条件（{@link #accepts(Message)}）、
- * 发送目标（{@link #doSend(String)}）与文件接收方（{@link #sendFileTo(java.io.File)}）。</p>
- *
- * <p>为什么是独立类而不是私有内部类：{@link ClientUI} 需要按对端用户名
- * 复用并操作面板，若定义为私有内部类，其类型对外不可见，
- * 外部代码将无法调用面板自身的公开方法。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 私聊消息面板，负责与指定用户之间的消息收发、文件传输和聊天记录加载。
  */
 public class PrivateChatPanel extends BaseChatPanel {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250115L;
 
-    /** 对方用户名 */
     private final String peer;
 
     /**
-     * 构造私聊面板。
+     * 创建与指定用户的私聊面板。
      *
-     * @param client 客户端
-     * @param peer   对方用户名
+     * @param client 已登录的客户端
+     * @param peer 私聊对方用户名
      */
     public PrivateChatPanel(ChatClient client, String peer) {
         super(client);
         this.peer = peer;
     }
 
-    /**
-     * 获取对方用户名。
-     *
-     * @return 对方用户名
-     */
     public String getPeer() {
         return peer;
     }
 
     /**
-     * 发送私聊消息。
+     * 发送一条私聊文本，成功后在消息区回显。
      *
-     * @param content 正文
-     * @return 发送成功返回 true
+     * @param content 消息正文
+     * @return 是否发送成功
      */
     @Override
     protected boolean doSend(String content) {
+        // 发送私聊消息并取回服务端分配的消息编号
         String messageId = client.sendPrivateTextReturningId(peer, content, null, null);
         if (messageId != null) {
             appendMessage("我", content, COLOR_SELF, messageId);
@@ -66,17 +48,13 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 发送文件：接收方固定为当前私聊窗口的对端。
+     * 向私聊对方发起文件传输。
      *
-     * <p>提示文案分两种：平常那句"（对方确认后开始传输）"是如实的，因为收文件的人
-     * 确实要先点一下接收；但"与我"的会话里没有第二个人，传输窗口收到请求时已经
-     * 自动接受，再写"确认后开始传输"就成了一句永远不会发生的话——使用者会盯着窗口等一个
-     * 根本不会出现的确认按钮。这里按会话是不是自己，把话说准。</p>
-     *
-     * @param file 待发送文件
+     * @param file 待发送的文件
      */
     @Override
     protected void sendFileTo(java.io.File file) {
+        // 打开与该用户的传输窗口并立即发送
         FileTransferUI window = FileTransferUI.windowFor(client, peer);
         window.setVisible(true);
         window.sendNow(file);
@@ -86,50 +64,35 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 私聊文件发送的预检：对端在线才允许发。
+     * 判断文件发送目标是否可用，自己与自己私聊时始终可发。
      *
-     * <p>判断依据是主窗口在用户列表刷新时写入的状态——面板拿不到在线名单，
-     * 而"对端此刻在不在线"只有那份名单说了算。</p>
-     *
-     * @return 对端在线返回 true
+     * @return 可发送时返回 true
      */
     @Override
     protected boolean hasSendTarget() {
-        // 与自己私聊时接收方就是本人，不存在"对方不在线"的情况
         return isSelfChat() || super.hasSendTarget();
     }
 
     /**
-     * 无接收方时的原因描述。
+     * 返回文件无法发送时的提示文本。
      *
-     * @return 中文原因
+     * @return 提示文本
      */
     @Override
     protected String noTargetReason() {
         return peer + " 当前不在线，无法发送文件（消息仍可发出，对方下次上线后会收到）";
     }
 
-    /**
-     * 判断本会话是否是"与自己聊天"。
-     *
-     * @return 对端即本人返回 true
-     */
     private boolean isSelfChat() {
         String self = client.getUsername();
         return self != null && self.equals(peer);
     }
 
     /**
-     * 用服务器返回的历史记录填充聊天区。
+     * 加载并显示聊天记录。
      *
-     * <p>只在窗口刚创建时调用一次，用于补齐"关闭窗口再打开"或"重启客户端"之后
-     * 看不到此前对话的问题。已经由实时通道渲染过的消息会被跳过，避免同一条消息出现两次。</p>
-     *
-     * <p>解析出的时间交给基类按"今天/昨天/本年/跨年"规则显示：历史记录可能来自昨天甚至去年，
-     * 只显示时分会让使用者误以为是很久以前的当天消息。</p>
-     *
-     * @param records 历史记录，按时间升序，每项为 {@code {时间, 发送者用户名, 接收者, 消息标识, 正文}}
-     * @return 实际渲染的条数
+     * @param records 每行依次为时间、发送者、接收者、消息编号和正文
+     * @return 实际显示的记录条数
      */
     public int fillHistory(java.util.List<String[]> records) {
         if (records == null || records.isEmpty()) {
@@ -142,13 +105,13 @@ public class PrivateChatPanel extends BaseChatPanel {
                 continue;
             }
             boolean fromPeer = peer.equals(record[1]);
-            // 与自己的会话里收发双方都是本人，全部按本人消息渲染：
-            // 若按"发送者是否为对端"判断，自己发的消息会全部落到左边
+
+            // 私聊自己或发送者不是对方时，记为本人发出
             boolean mine = selfChat || !fromPeer;
             history.add(new HistoryEntry(mine ? "我" : peer, record[4], mine,
                     DateUtil.parse(record[0]), record[3]));
         }
-        // 基类按时间升序插到列表最前面，并负责跳过已经渲染过的消息
+
         int rendered = prependHistory(history);
         if (rendered > 0) {
             prependLine("[系统] 以上为最近 " + rendered + " 条历史记录", COLOR_SYSTEM);
@@ -156,31 +119,18 @@ public class PrivateChatPanel extends BaseChatPanel {
         return rendered;
     }
 
-    /**
-     * 私聊支持引用发送。
-     *
-     * <p>先前因 {@code ChatClient} 没有带引用的私聊发送重载而暂时关闭该入口：
-     * 绕过重载自行发送会丢掉 ACK 登记、超时重发与"发送中/已送达"状态。
-     * 客户端补齐 {@code sendPrivateText(receiver, content, quoteId, quoteSummary)} 后，
-     * 引用消息与普通私聊走同一条受跟踪的发送路径，因此这里恢复为支持。</p>
-     *
-     * @return 固定返回 true
-     */
     @Override
     protected boolean isQuoteSupported() {
         return true;
     }
 
     /**
-     * 发送带引用的私聊消息。
+     * 发送带引用信息的私聊消息。
      *
-     * <p>校验与 {@link #doSend(String)} 保持一致，并且必须调用带引用的重载而不是
-     * {@code client.send(...)}，否则这条消息不会有发送状态与超时重发。</p>
-     *
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识
+     * @param content 消息正文
+     * @param quoteId 被引用消息的编号
      * @param quoteSummary 被引用消息的摘要
-     * @return 发送成功返回 true
+     * @return 是否发送成功
      */
     @Override
     protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
@@ -196,8 +146,6 @@ public class PrivateChatPanel extends BaseChatPanel {
         String messageId = client.sendPrivateTextReturningId(peer, content, quoteId, quoteSummary,
                 quoteSender);
         if (messageId != null) {
-            // 本地回显必须带上引用块：引用是使用者写这条消息时的上下文，
-            // 自己看不到它就会以为引用没有生效（对方那边其实是看得见的）
             appendMessage("我", content, COLOR_SELF, messageId, quoteSummary, quoteSender,
                     client.getUsername());
         } else {
@@ -206,21 +154,16 @@ public class PrivateChatPanel extends BaseChatPanel {
         return messageId != null;
     }
 
-    /**
-     * 获取聊天对象名称。
-     *
-     * @return 对方用户名
-     */
     @Override
     public String getChatTarget() {
         return peer;
     }
 
     /**
-     * 仅接收“发件人或收件人为本面板好友”的私聊消息。
+     * 判断消息是否属于当前私聊会话。
      *
-     * @param message 消息
-     * @return 应显示返回 true
+     * @param message 待判断的消息
+     * @return 发送者或接收者为私聊对方时返回 true
      */
     @Override
     public boolean accepts(Message message) {
@@ -231,9 +174,9 @@ public class PrivateChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 私聊消息按发送者着色渲染。
+     * 处理属于当前私聊会话的消息。
      *
-     * @param message 消息
+     * @param message 收到的消息
      */
     @Override
     public void onMessage(Message message) {
@@ -243,7 +186,7 @@ public class PrivateChatPanel extends BaseChatPanel {
         String content = message instanceof TextMessage
                 ? ((TextMessage) message).getContent() : message.getSummary();
         boolean fromPeer = peer.equals(message.getSender());
-        // 交给基类渲染：对端若带引用信息，气泡里会显示引用块
+
         appendIncoming(fromPeer ? peer : "我", content,
                 fromPeer ? COLOR_OTHER : COLOR_SELF, message, false);
     }

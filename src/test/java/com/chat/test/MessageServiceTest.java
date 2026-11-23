@@ -21,43 +21,18 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 消息业务服务与持久化单元测试。
- *
- * <p>覆盖点：消息创建（工厂 + 多态摘要）、历史记录入库与查询、
- * 按用户与时间范围过滤、关键字检索、导出文件、在线用户列表编解码。</p>
- *
- * <p>隔离策略：通过构造器注入指向独立测试库 {@code lanchat_test} 的 JDBC DAO
- * （见 {@link TestDatabase}），每个用例开始前清空 {@code chat_message} 表，
- * 既保证用例互不干扰，也不会污染开发者真实使用的库。
- * 导出功能本身仍写磁盘，因此导出用例继续使用临时目录作为导出目标并在结束时删除。
- * 数据库不可用时用例通过 {@link TestRunner#skip(String)} 报告跳过，而不是判为失败。</p>
- *
- * <p>例外说明：消息工厂与用户列表编解码三条用例只操作内存对象、不接触数据库，
- * 因此不加数据库可用性判断——否则数据库缺失时会把这些本可执行的用例误报为跳过。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 覆盖消息摘要、入库查询、关键字检索、导出与历史记录恢复。
  */
 public class MessageServiceTest {
-
-    /** 当前用例使用的消息 DAO，与 service 共用同一实例，便于直接核对库中的原始记录 */
     private JdbcMessageDao messageDao;
 
-    /**
-     * 创建使用测试库的消息服务。
-     *
-     * <p>{@link TestDatabase#messageDao()} 会先清空消息表，因此每个用例都从空库开始。</p>
-     *
-     * @return 消息服务实例
-     */
+    /** 重置消息表并构造消息服务。 */
     private MessageService createService() {
         messageDao = TestDatabase.messageDao();
         return new MessageService(messageDao);
     }
 
-    /**
-     * 用例 1：消息工厂创建与多态摘要。
-     */
+    /** 验证工厂创建各类消息，摘要按类型正确返回。 */
     @Test("消息模型：工厂创建各类型消息，摘要多态正确")
     public void testMessageFactoryAndPolymorphism() {
         TextMessage text = ChatMessageFactory.text("alice", "bob", "你好", MessageType.TEXT_PRIVATE);
@@ -80,16 +55,13 @@ public class MessageServiceTest {
         TestRunner.assertTrue(file.getSummary().contains("报告.pdf"), "文件摘要应含文件名");
         TestRunner.assertTrue(file.getSummary().contains("MB"), "文件摘要应含可读大小");
 
-        // 多态的关键验证：统一以父类引用调用摘要方法，行为由实际类型决定
         Message[] messages = {text, system, file};
         for (Message message : messages) {
             TestRunner.assertNotNull(message.getSummary(), "任意消息都应能给出摘要");
         }
     }
 
-    /**
-     * 用例 2：消息编号唯一递增。
-     */
+    /** 验证后创建的消息编号更大。 */
     @Test("消息模型：编号全局递增且不重复")
     public void testMessageIdSequence() {
         TextMessage first = ChatMessageFactory.text("a", "b", "1", MessageType.TEXT_PRIVATE);
@@ -97,11 +69,7 @@ public class MessageServiceTest {
         TestRunner.assertTrue(second.getId() > first.getId(), "后创建的消息编号应更大");
     }
 
-    /**
-     * 用例 3：保存与查询历史记录。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证消息保存后可按用户查询，私聊内容不对无关用户可见。 */
     @Test("消息服务：保存后可按用户查询到记录")
     public void testSaveAndQuery() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -125,11 +93,7 @@ public class MessageServiceTest {
                 "无关用户可见的记录应为群聊消息");
     }
 
-    /**
-     * 用例 4：按日期范围过滤。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证日期范围过滤生效，起止日期倒置时返回失败。 */
     @Test("消息服务：日期范围过滤正确，起止时间倒置时报错")
     public void testQueryByDateRange() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -148,11 +112,7 @@ public class MessageServiceTest {
                 "起始日期晚于结束日期应返回失败");
     }
 
-    /**
-     * 用例 5：关键字检索。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证关键字检索命中，空关键字与缺少请求者被拒绝。 */
     @Test("消息服务：关键字检索命中与空关键字校验")
     public void testSearch() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -160,33 +120,29 @@ public class MessageServiceTest {
         }
         MessageService service = createService();
         service.saveMessage(ChatMessageFactory.text("alice", "bob",
-                "课程设计需要写测试报告", MessageType.TEXT_PRIVATE));
+                "项目需要写测试说明", MessageType.TEXT_PRIVATE));
         service.saveMessage(ChatMessageFactory.text("alice", "bob",
                 "今天天气不错", MessageType.TEXT_PRIVATE));
-        TestRunner.assertEquals(1, service.search("alice", "测试报告").getData().size(),
+        TestRunner.assertEquals(1, service.search("alice", "测试说明").getData().size(),
                 "应命中包含关键字的记录");
         TestRunner.assertEquals(0, service.search("alice", "不存在的关键字").getData().size(),
                 "不应命中无关记录");
         TestRunner.assertFalse(service.search("alice", "").isSuccess(), "空关键字应返回失败");
-        // 可见范围：carol 不是这些私聊的收发方，即使关键字命中也不应看到
+
         TestRunner.assertEquals(0, service.search("carol", "测试报告").getData().size(),
                 "无关用户不应对他人私聊的命中结果可见");
         TestRunner.assertFalse(service.search("", "测试报告").isSuccess(),
                 "缺少请求者时应拒绝而不是退化成全库检索");
     }
 
-    /**
-     * 用例 6：导出聊天记录到文件。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证导出消息生成包含正文的文本文件。 */
     @Test("消息服务：导出记录生成文本文件且内容可读")
     public void testExport() throws Exception {
         if (!TestDatabase.isAvailable()) {
             TestRunner.skip(TestDatabase.unavailableReason());
         }
         MessageService service = createService();
-        // 导出结果本身就是磁盘文件，因此仍然用临时目录隔离
+
         Path dir = TestRunner.createTempDir("msgsvc-export");
         try {
             service.saveMessage(ChatMessageFactory.text("alice", "bob", "导出测试内容",
@@ -203,11 +159,7 @@ public class MessageServiceTest {
         }
     }
 
-    /**
-     * 用例 7：空列表导出应被拒绝。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证无记录时导出返回失败。 */
     @Test("消息服务：无记录时导出返回失败")
     public void testExportEmpty() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -223,9 +175,7 @@ public class MessageServiceTest {
         }
     }
 
-    /**
-     * 用例 8：在线用户列表编解码。
-     */
+    /** 验证用户列表编解码可还原用户名、昵称与角色，空文本返回空列表。 */
     @Test("用户列表编解码：编码后可完整还原")
     public void testUserListCodec() {
         User alice = new User("alice", "爱丽丝");
@@ -241,11 +191,7 @@ public class MessageServiceTest {
         TestRunner.assertEquals(0, UserListCodec.decode("  ").size(), "空白文本应返回空列表");
     }
 
-    /**
-     * 用例 9：文件消息在历史记录中的往返。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证文件消息入库后元信息可完整回读。 */
     @Test("消息持久化：文件消息记录可回读并保留元信息")
     public void testFileMessagePersistence() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -268,11 +214,7 @@ public class MessageServiceTest {
         TestRunner.assertEquals("abc123", restoredFile.getSha256(), "校验和应保留");
     }
 
-    /**
-     * 用例 10：按消息编号删除记录。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证按编号删除后记录不再计入总数。 */
     @Test("消息持久化：按编号删除后不再被查询到")
     public void testDeleteMessage() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -287,11 +229,7 @@ public class MessageServiceTest {
         TestRunner.assertEquals(0L, messageDao.count(), "删除后应无记录");
     }
 
-    /**
-     * 用例 11：历史记录持久保存在数据库中，新实例仍可读出。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证新服务实例仍能查询到已写入的历史记录。 */
     @Test("消息持久化：重启（新实例）后历史记录仍可查询")
     public void testHistoryReload() throws Exception {
         if (!TestDatabase.isAvailable()) {
@@ -301,7 +239,6 @@ public class MessageServiceTest {
         service.saveMessage(ChatMessageFactory.text("alice", "bob", "重启前写入",
                 MessageType.TEXT_PRIVATE));
 
-        // 换一个全新的 DAO 与服务实例：数据必须来自数据库，而不是上一个实例的内存状态
         JdbcMessageDao reloadedDao = new JdbcMessageDao(TestDatabase.driver(), TestDatabase.url(),
                 TestDatabase.user(), TestDatabase.password());
         MessageService reloadedService = new MessageService(reloadedDao);
@@ -313,11 +250,7 @@ public class MessageServiceTest {
         TestRunner.assertEquals("重启前写入", ((TextMessage) restored).getContent(), "正文应完整保留");
     }
 
-    /**
-     * 用例 12：空消息保存被拒绝。
-     *
-     * @throws Exception 测试异常
-     */
+    /** 验证保存空消息返回失败且不产生记录。 */
     @Test("消息服务：保存空消息返回失败且不抛异常")
     public void testSaveNull() throws Exception {
         if (!TestDatabase.isAvailable()) {

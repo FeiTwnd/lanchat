@@ -36,300 +36,175 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 聊天客户端（网络层）。
- *
- * <p>职责：</p>
- * <ol>
- *   <li>连接服务器并完成登录；</li>
- *   <li>在独立线程中持续接收消息，通过 {@link ChatListener} 回调界面；</li>
- *   <li>提供发送私聊、群聊、文件、心跳等高层方法，界面层无需接触 Socket 与流；</li>
- *   <li>管理文件发送线程与会话状态（被 {@link FileService} 复用，避免重复实现分块逻辑）。</li>
- * </ol>
- *
- * <p>线程模型：</p>
- * <ul>
- *   <li>接收线程 1 个（{@code chat-receiver}），独占 {@link ObjectInputStream}；</li>
- *   <li>发送线程池 1 个（固定 2 线程），串行化 {@link ObjectOutputStream} 的写入；</li>
- *   <li>心跳调度器 1 个，定期发送心跳包并检测心跳应答是否超时；</li>
- *   <li>待确认消息扫描器 1 个（{@code chat-ack-scanner}），按固定周期重发超时未确认的私聊消息；</li>
- *   <li>重连线程按需创建 1 个（{@code chat-reconnect}），连接失效时按退避序列重连并在成功后恢复会话；</li>
- *   <li>文件发送线程按需创建，避免大文件阻塞聊天消息。</li>
- * </ul>
- *
- * <p>可靠性说明：私聊消息带稳定 {@code messageId}，未在 5 秒内收到 {@code MSG_ACK} 会复用同一标识重发，
- * 因此服务端可以幂等去重；接收侧用有界的已渲染标识集合去重，实现"至少一次投递 + 本地去重"。
- * 断线后自动指数退避重连，并用登录时服务端下发的会话令牌恢复登录态（令牌只保存在内存中）。</p>
- *
- * <p>设计说明：本类同时被 GUI 客户端与集成测试使用，
- * 因此不包含任何 Swing 依赖，测试可直接以“无界面客户端”方式驱动。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 客户端网络层，负责连接服务器、收发消息、处理文件传输以及断线重连与会话恢复。
  */
 public class ChatClient {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".ChatClient");
 
-    /**
-     * 私聊消息等待确认的超时时间（毫秒）。
-     *
-     * <p>取 5 秒：局域网内一次往返通常在毫秒级，5 秒既能容忍偶发卡顿，
-     * 又不会让"消息发不出去"这件事长时间没有反馈。该值刻意不放进 {@code Constants}：
-     * 本轮协议契约要求两侧各自定义私有常量，避免并行开发时改同一文件产生冲突。</p>
-     */
+    /** 等待消息确认的超时时间，单位毫秒。 */
     private static final long ACK_TIMEOUT_MS = 5000L;
 
-    /** 私聊消息在首次发送之后允许的最大重发次数；超过仍未确认即标记失败 */
+    /** 消息未确认时的最大重发次数。 */
     private static final int MAX_RETRY_COUNT = 3;
 
-    /** 待确认表扫描周期（毫秒），决定状态反馈的实时程度 */
+    /** 待确认消息的扫描间隔，单位毫秒。 */
     private static final long ACK_SCAN_INTERVAL_MS = 1000L;
 
-    /** 已渲染消息标识的容量上限 */
+    /** 已渲染消息 ID 的保留上限，用于去重。 */
     private static final int RENDERED_ID_LIMIT = 2000;
 
-    /** 连续多少个心跳周期收不到应答即判定连接失效 */
+    /** 连续多少个心跳周期未收到应答即判定连接失效。 */
     private static final int HEARTBEAT_MISS_LIMIT = 3;
 
-    /** 重连退避序列（毫秒），超出序列长度后按最后一个值（30 秒）持续重试 */
+    /** 每次重连前的退避等待时间，单位毫秒。 */
     private static final long[] RECONNECT_BACKOFF_MS = {1000L, 2000L, 4000L, 8000L, 16000L, 30000L};
 
-    /** 会话恢复应答的等待时间（毫秒） */
+    /** 等待会话恢复应答的超时时间，单位毫秒。 */
     private static final long RESUME_TIMEOUT_MS = 5000L;
 
-    /** ACK 状态：接收方在线且已转发 */
     private static final String ACK_STATE_DELIVERED = "DELIVERED";
 
-    /** ACK 状态：接收方离线，已入库待补投 */
     private static final String ACK_STATE_OFFLINE = "OFFLINE";
 
-    /** ACK 状态：该 messageId 已处理过（幂等，按已送达处理） */
     private static final String ACK_STATE_DUPLICATE = "DUPLICATE";
 
-    /** ACK 状态：既未送达也未入库 */
     private static final String ACK_STATE_FAILED = "FAILED";
 
-    /** 会话恢复成功的应答正文 */
     private static final String RESUME_OK = "OK";
 
-    /** 会话恢复失败（令牌过期）的应答前缀 */
     private static final String RESUME_EXPIRED_PREFIX = "EXPIRED";
 
-    /** 历史记录分页请求使用的默认每页条数；与设计文档保持一致 */
+    /** 历史消息的默认分页条数。 */
     private static final String DEFAULT_PAGE_SIZE = "50";
 
-    /** 消息监听器列表 */
     private final List<ChatListener> listeners = new CopyOnWriteArrayList<>();
 
-    /** 文件业务服务，复用于分块与校验逻辑 */
     private final FileService fileService = new FileService();
 
-    /** 待发送文件会话：传输编号 -> 请求消息 */
+    /** 已发出、等待对方同意的文件传输请求，键为传输 ID。 */
     private final Map<String, FileMessage> pendingSends = new ConcurrentHashMap<>();
 
-    /** 已完成/进行中的文件接收会话：传输编号 -> 请求消息（提供文件名与大小用于进度展示） */
+    /** 正在接收的文件传输会话，键为传输 ID。 */
     private final Map<String, FileMessage> receivingSessions = new ConcurrentHashMap<>();
 
-    /** 接收文件保存目录 */
     private String receiveDir = Config.receivedDir();
 
-    /** Socket 连接 */
     private Socket socket;
 
-    /** 对象输出流 */
     private ObjectOutputStream out;
 
-    /** 对象输入流 */
     private ObjectInputStream in;
 
-    /**
-     * 反序列化过滤器（带每条消息独立预算）。
-     *
-     * <p>保留引用是为了在每次 {@code readObject} 之前调用 {@link com.chat.common.MessageFilter#beginMessage()}
-     * 重置预算基线：不重置的话预算会退化成"整条连接累计上限"，长会话会被误判成攻击
-     * （正是缺陷 D-23 的表现）。</p>
-     */
     private com.chat.common.MessageFilter inputFilter;
 
-    /** 接收线程 */
     private Thread receiverThread;
 
-    /** 发送线程池 */
     private ExecutorService senderPool;
 
-    /** 心跳调度器 */
     private ScheduledExecutorService heartbeatScheduler;
 
-    /** 待确认消息扫描器（单线程即可：扫描只做重发判断，不需要并发） */
     private ScheduledExecutorService ackScheduler;
 
-    /** 私聊待确认表：messageId -> 待确认项，重发与状态标记都以此为准 */
     private final Map<String, PendingMessage> pendingMessages = new ConcurrentHashMap<>();
 
-    /**
-     * 已渲染消息标识集合（上限 {@value #RENDERED_ID_LIMIT}，按插入顺序淘汰最旧）。
-     *
-     * <p>为什么要用带淘汰顺序的 {@link LinkedHashMap}：重连与离线补投可能让同一条消息到达两次，
-     * 必须去重；而集合若永不清理，长时间运行的客户端会持续增长直至内存耗尽。
-     * 淘汰最旧而非最新，是因为最旧的消息再次到达的概率最低。</p>
-     */
+    /** 已渲染的文本消息 ID 集合，超出上限时淘汰最旧的记录。 */
     private final Set<String> renderedMessageIds = Collections.newSetFromMap(
             Collections.synchronizedMap(new LinkedHashMap<String, Boolean>(64, 0.75f, false) {
-
-                /** 序列化版本号（本集合不参与序列化，仅为消除编译告警） */
                 private static final long serialVersionUID = 20260920L;
 
-                /**
-                 * 超过上限时淘汰最早插入的标识。
-                 *
-                 * @param eldest 最早插入的条目
-                 * @return 需要淘汰返回 true
-                 */
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
                     return size() > RENDERED_ID_LIMIT;
                 }
             }));
 
-    /** 已发送私聊消息的接收者：messageId -> 对端用户名，供界面把发送状态路由到对应会话窗口 */
+    /** 消息 ID 到接收者的映射，供撤回等操作使用。 */
     private final Map<String, String> sentMessagePeers = new ConcurrentHashMap<>();
 
-    /** 发送状态监听器列表 */
     private final List<MessageStateListener> stateListeners = new CopyOnWriteArrayList<>();
 
-    /** 是否处于重连流程中；界面据此区分"正在重连"与"已彻底断开" */
     private volatile boolean reconnecting;
 
-    /** 触发重连的原因，重连期间反复展示 */
     private volatile String reconnectReason = "与服务器的连接已断开";
 
-    /** 重连线程；用户主动退出时会被中断，保证不留残余线程 */
     private Thread reconnectThread;
 
-    /** 重连状态的保护锁，保证同一时刻只有一个重连线程 */
     private final Object reconnectLock = new Object();
 
-    /** 用户是否已主动退出；置位后重连循环必须立即终止 */
     private volatile boolean userClosed;
 
-    /** 会话恢复应答闩，非空表示当前正在等待 SESSION_RESUME 应答 */
     private volatile CountDownLatch resumeLatch;
 
-    /** 会话恢复应答正文，取值为 {@code OK} 或 {@code EXPIRED|<原因>} */
     private volatile String resumeResult;
 
-    /** 会话令牌，只保存在内存，禁止落盘与写入日志 */
     private volatile String sessionToken;
 
-    /** 最近一次收到心跳应答的时刻（毫秒），用于判断连接是否已经失效 */
     private volatile long lastHeartbeatAckAt;
 
-    /** 是否处于已登录的会话中；控制心跳的发送时机，未登录时不发心跳 */
     private volatile boolean sessionActive;
 
-    /**
-     * 是否曾经登录成功（或恢复成功）。
-     *
-     * <p>重连的前提是"有一个可以恢复的会话"：登录界面在真正登录之前也可能连上服务器，
-     * 此时若断线就自动重连，会在登录窗口背后制造一个用户既看不见也无法停止的重连循环。</p>
-     */
     private volatile boolean sessionEstablished;
 
-    /** 连接状态 */
     private volatile boolean connected;
 
-    /** 当前登录用户名 */
     private volatile String username;
 
-    /** 当前登录昵称，登录成功后由服务器下发 */
     private volatile String nickname;
 
-    /** 最近一次登录失败原因，供界面与自动化测试读取 */
     private volatile String lastLoginFailure = "";
 
-    /** 登录结果等待锁，便于命令行与测试同步等待登录完成（volatile：由接收线程计数、工作线程等待） */
     private transient volatile CountDownLatch loginLatch;
 
-    /** 最近一次连接的服务器地址，供退出登录后回填登录窗口 */
     private volatile String serverHost = "";
 
-    /** 最近一次连接的服务器端口，供退出登录后回填登录窗口 */
     private volatile int serverPort;
 
     /**
-     * 消息发送状态。
-     *
-     * <p>刻意定义为 {@link ChatClient} 的公开嵌套枚举，而不是新建模型类：
-     * 状态只在"网络层通知界面"这一处流转，单独建类会多一层没有实际价值的抽象。</p>
+     * 单条消息的发送状态。
      */
     public enum SendState {
-
-        /** 已发出，等待服务端确认 */
         SENDING("发送中"),
-        /** 服务端确认接收方在线且已转发 */
+
         DELIVERED("已送达"),
-        /** 接收方离线，消息已入库，待其上线后补投 */
+
         OFFLINE("对方离线"),
-        /** 重发次数耗尽或服务端明确回执失败 */
+
         FAILED("发送失败");
 
-        /** 状态的中文描述，用于界面展示 */
         private final String description;
 
         SendState(String description) {
             this.description = description;
         }
 
-        /**
-         * 获取状态的中文描述。
-         *
-         * @return 中文描述，例如“已送达”
-         */
         public String getDescription() {
             return description;
         }
     }
 
     /**
-     * 消息发送状态监听器。
-     *
-     * <p>由界面层实现：网络层只负责判定状态变化，具体如何展示交给界面决定，
-     * 这样 {@link ChatClient} 可以继续保持零 Swing 依赖，能被集成测试直接驱动。</p>
+     * 发送状态变化回调。
      */
     public interface MessageStateListener {
-
         /**
-         * 某条私聊消息的发送状态发生变化。
+         * 消息状态变化时回调。
          *
-         * <p>回调发生在网络接收线程或扫描线程中，实现方更新界面前必须自行切换到事件分发线程。
-         * 本方法可能对同一个 {@code messageId} 被多次调用（发送中 -> 已送达/对方离线/发送失败）。</p>
-         *
-         * @param messageId 稳定消息标识
-         * @param state     新状态
-         * @param detail    补充说明，无补充时为空字符串
+         * @param messageId 消息 ID
+         * @param state 新的发送状态
+         * @param detail 状态说明，没有说明时为空字符串
          */
         void onMessageState(String messageId, SendState state, String detail);
     }
 
-    /**
-     * 构造客户端。
-     */
     public ChatClient() {
-        // 无状态初始化，连接时再创建线程与流
     }
 
     /**
-     * 建立与服务器的连接（不发送任何业务请求）。
+     * 建立到服务器的连接并启动收发线程。
      *
-     * <p>把"连接"与"登录"拆成两步，是因为登录界面还需要在未登录状态下做两件事：
-     * 注册新账号、修改密码（需先登录校验原密码）。若连接时隐式带上登录请求，
-     * 注册会把一个尚不存在的账号拿去登录，修改密码则会让用户凭一次改密动作"顺便上线"，
-     * 在其它客户端的在线列表里留下一个看不见的幽灵用户。</p>
-     *
-     * @param host 服务器地址
+     * @param host 服务器主机
      * @param port 服务器端口
-     * @return 连接成功返回 true；失败时通过监听器回调原因
+     * @return 连接成功返回 true
      */
     public boolean openConnection(String host, int port) {
         if (connected) {
@@ -347,30 +222,20 @@ public class ChatClient {
         return true;
     }
 
-    /**
-     * 建立底层连接并启动接收线程（不创建任何线程池）。
-     *
-     * <p>从 {@link #openConnection(String, int)} 中抽出来，是为了让重连流程复用同一段建连逻辑：
-     * 重连只需要重新建连与会话恢复，不需要重建已经存在的发送池与调度器，
-     * 否则每重连一次就多出一组常驻线程。</p>
-     *
-     * @param host 服务器地址
-     * @param port 服务器端口
-     * @return 成功返回 null；失败返回可直接展示给用户的中文原因
-     */
+    /** 创建套接字与对象流并启动接收线程，失败时返回错误说明。 */
     private String openSocket(String host, int port) {
         try {
+            // 建立连接，关闭 Nagle 并开启保活
             Socket newSocket = new Socket();
             newSocket.connect(new InetSocketAddress(host, port), Constants.CONNECT_TIMEOUT_MS);
             newSocket.setTcpNoDelay(true);
             newSocket.setKeepAlive(true);
-            // 先构造输出流并 flush，再构造输入流，避免两端同时等待对象流头部
+
             ObjectOutputStream newOut = new ObjectOutputStream(newSocket.getOutputStream());
             newOut.flush();
             ObjectInputStream newIn = new ObjectInputStream(newSocket.getInputStream());
-            // 绑定反序列化过滤器必须紧跟在创建之后：服务器返回的第一帧就可能携带恶意类型，
-            // 任意一次 readObject 之前都必须完成绑定，否则过滤器形同虚设。
-            // 每次建流都新建一份，顺带让预算基线归零
+
+            // 安装反序列化过滤器，限制可接收的类
             inputFilter = com.chat.common.MessageFilter.forClientInput();
             newIn.setObjectInputFilter(inputFilter);
             socket = newSocket;
@@ -391,11 +256,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 创建发送线程池、心跳调度器与待确认消息扫描器。
-     *
-     * <p>只在首次连接时调用一次：重连复用这些线程，避免线程数量随重连次数增长。</p>
-     */
+    /** 启动发送线程池、确认扫描任务与心跳任务。 */
     private void startWorkers() {
         senderPool = Executors.newFixedThreadPool(2, runnable -> {
             Thread thread = new Thread(runnable, "chat-sender");
@@ -409,15 +270,16 @@ public class ChatClient {
         });
         ackScheduler.scheduleWithFixedDelay(this::scanPendingMessages,
                 ACK_SCAN_INTERVAL_MS, ACK_SCAN_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        // 心跳与确认扫描都由守护线程执行
         startHeartbeat();
     }
 
     /**
-     * 在已建立的连接上发送登录请求。
+     * 发送登录请求。
      *
-     * @param name     用户名
-     * @param password 明文密码
-     * @return 请求已提交返回 true；尚未连接时返回 false
+     * @param name 用户名
+     * @param password 密码
+     * @return 请求已进入发送队列返回 true
      */
     public boolean login(String name, String password) {
         if (!connected || out == null) {
@@ -425,32 +287,25 @@ public class ChatClient {
             return false;
         }
         this.username = name;
-        // 先重置等待锁再发送登录请求，避免服务器响应比锁初始化更快导致永久等待
+
         loginLatch = new CountDownLatch(1);
         lastLoginFailure = "";
         return send(loginMessage(name, password));
     }
 
     /**
-     * 连接服务器并发送登录请求。
+     * 先建立连接再发送登录请求。
      *
-     * @param host     服务器地址
-     * @param port     服务器端口
-     * @param name     用户名
-     * @param password 明文密码
-     * @return 连接成功返回 true；失败时通过监听器回调原因
+     * @param host 服务器主机
+     * @param port 服务器端口
+     * @param name 用户名
+     * @param password 密码
+     * @return 两步都成功返回 true
      */
     public boolean connect(String host, int port, String name, String password) {
         return openConnection(host, port) && login(name, password);
     }
 
-    /**
-     * 构造登录请求消息。
-     *
-     * @param name     用户名
-     * @param password 密码
-     * @return 登录消息，正文格式为 {@code 用户名|密码}
-     */
     private TextMessage loginMessage(String name, String password) {
         TextMessage message = ChatMessageFactory.text(name, Constants.SYSTEM_SENDER,
                 name + "|" + password, MessageType.TEXT_PRIVATE);
@@ -461,13 +316,10 @@ public class ChatClient {
     /**
      * 发送注册请求。
      *
-     * <p>注册与登录共用同一条连接前的请求通道，通过独立的消息类型区分，
-     * 这样登录界面的“注册”按钮无需先建立会话即可使用。</p>
-     *
-     * @param name     用户名
+     * @param name 用户名
      * @param password 密码
-     * @param nickname 昵称
-     * @return 发送成功返回 true
+     * @param nickname 昵称，可以为空
+     * @return 请求已进入发送队列返回 true
      */
     public boolean sendRegister(String name, String password, String nickname) {
         TextMessage message = ChatMessageFactory.text(name, Constants.SYSTEM_SENDER,
@@ -476,16 +328,11 @@ public class ChatClient {
         return send(message);
     }
 
-    /**
-     * 接收循环：持续读取服务器消息并回调监听器。
-     *
-     * <p>读取失败即视为连接失效，交由 {@link #handleConnectionLost(String)} 决定是重连还是彻底断开；
-     * 本方法自身的 {@code finally} 只负责关闭本次连接的流，关闭后重连线程会新建一组流。</p>
-     */
+    /** 循环读取服务器消息，连接异常时转入断线处理。 */
     private void receiveLoop() {
         try {
             while (connected) {
-                // 每条消息单独计预算：必须在 readObject 之前重置基线
+                // 逐条读取并交给分发逻辑
                 inputFilter.beginMessage();
                 Object received = in.readObject();
                 if (received instanceof Message) {
@@ -505,18 +352,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 处理收到的消息。
-     *
-     * <p>处理顺序说明：心跳应答、消息确认、会话恢复应答都属于协议控制信息，
-     * 必须先于"是否重复"的判断处理并提前返回，否则它们会流到界面层，
-     * 在状态栏里刷出"收到消息: 心跳应答"之类的噪音。</p>
-     *
-     * <p>文件数据块先交给本地接收会话落盘，再继续回调界面，
-     * 保证界面读到的进度与磁盘状态一致。</p>
-     *
-     * @param message 消息
-     */
+    /** 按消息类型分发处理，其余消息交给监听器。 */
     private void handleIncoming(Message message) {
         MessageType type = message.getType();
         if (type == MessageType.HEARTBEAT_ACK) {
@@ -532,8 +368,7 @@ public class ChatClient {
             return;
         }
         if (type == MessageType.OFFLINE_MESSAGE) {
-            // 必须先回确认再判断是否重复：若因重复而跳过确认，
-            // 服务端会一直认为该消息未投递，从而在每次上线时无限重发
+            // 离线消息先回送确认，再按普通消息继续处理
             acknowledgeOfflineMessage(message);
         }
         if (!acceptIncoming(message)) {
@@ -557,15 +392,7 @@ public class ChatClient {
         notifyMessage(message);
     }
 
-    /**
-     * 判断入站消息是否应当渲染（按 {@code messageId} 去重）。
-     *
-     * <p>只对承载聊天内容的消息去重：控制类报文数量少且每次语义独立，
-     * 若一并去重，一旦服务端复用标识就可能丢掉登录结果或用户列表这类关键响应。</p>
-     *
-     * @param message 消息
-     * @return 首次到达返回 true；重复返回 false
-     */
+    /** 对文本与离线消息按消息 ID 去重，返回是否继续处理。 */
     private boolean acceptIncoming(Message message) {
         MessageType type = message.getType();
         if (type != MessageType.TEXT_PRIVATE && type != MessageType.TEXT_GROUP
@@ -574,7 +401,7 @@ public class ChatClient {
         }
         String messageId = message.getMessageId();
         if (messageId == null || messageId.trim().isEmpty()) {
-            // 旧版服务端不下发稳定标识，无法去重；宁可重复渲染也不要丢消息
+            // 没有消息 ID 时无法去重，直接放行
             return true;
         }
         synchronized (renderedMessageIds) {
@@ -582,22 +409,15 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 处理服务端下发的消息确认。
-     *
-     * <p>正文格式 {@code messageId|state|detail}，其中 {@code detail} 可为空。
-     * 收到确认即从待确认表移除，扫描线程不会再重发；{@code DUPLICATE} 表示服务端此前已处理过，
-     * 与 {@code DELIVERED} 同样停止重试。</p>
-     *
-     * @param message 确认消息
-     */
+    /** 解析消息确认并把结果转换为发送状态。 */
     private void handleMessageAck(Message message) {
         if (!(message instanceof TextMessage)) {
             LOGGER.warning("消息确认的实际类型不是文本消息，已忽略");
             return;
         }
         String content = ((TextMessage) message).getContent();
-        // 限制切分次数，保证 detail 中若含竖线也能完整保留在最后一个字段
+
+        // 确认内容格式为 消息ID|状态|说明
         String[] fields = content == null ? new String[0] : content.split("\\|", 3);
         if (fields.length < 2 || fields[0].trim().isEmpty()) {
             LOGGER.warning("消息确认格式非法，已忽略");
@@ -622,15 +442,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 处理会话恢复相关消息。
-     *
-     * <p>同一个消息类型承载两种语义：登录成功后服务端下发的会话令牌（正文即令牌），
-     * 以及重连时服务端对恢复请求的应答（正文为 {@code OK} 或 {@code EXPIRED|<原因>}）。
-     * 用"当前是否正在等待应答"来区分，可以把协议的消息类型数量控制在最小。</p>
-     *
-     * @param message 会话恢复消息
-     */
+    /** 处理会话恢复应答，或在没有对应请求时保存服务器下发的会话令牌。 */
     private void handleSessionResume(Message message) {
         if (!(message instanceof TextMessage)) {
             return;
@@ -639,6 +451,7 @@ public class ChatClient {
         String value = content == null ? "" : content.trim();
         CountDownLatch latch = resumeLatch;
         if (latch != null) {
+            // 存在等待中的恢复请求，记录结果并唤醒等待线程
             resumeResult = value;
             latch.countDown();
             return;
@@ -647,16 +460,13 @@ public class ChatClient {
             LOGGER.warning("收到没有对应请求的会话恢复应答，已忽略");
             return;
         }
-        // 令牌只保存在内存字段中，不写日志、不落盘
+
+        // 没有对应请求时，把内容当作服务器下发的会话令牌
         sessionToken = value;
         LOGGER.info("已接收会话令牌，断线后可用其恢复会话");
     }
 
-    /**
-     * 为收到的离线消息回确认，服务端据此把消息标记为已投递。
-     *
-     * @param message 离线消息
-     */
+    /** 为离线消息回送已送达确认。 */
     private void acknowledgeOfflineMessage(Message message) {
         String messageId = message.getMessageId();
         if (messageId == null || messageId.trim().isEmpty()) {
@@ -668,11 +478,7 @@ public class ChatClient {
         send(ack);
     }
 
-    /**
-     * 处理收到的文件数据块。
-     *
-     * @param chunk 数据块消息
-     */
+    /** 把文件数据块写入接收缓存，进度每变化百分之一就通知一次。 */
     private void handleIncomingChunk(FileMessage chunk) {
         if (!receivingSessions.containsKey(chunk.getTransferId())) {
             LOGGER.warning(() -> "收到未知传输会话的数据块，已忽略: " + chunk.getTransferId());
@@ -682,7 +488,7 @@ public class ChatClient {
             double before = fileService.progressOf(chunk.getTransferId());
             fileService.appendChunk(chunk);
             double after = fileService.progressOf(chunk.getTransferId());
-            // 进度变化超过 1% 才回调，避免每个数据块都触发一次界面重绘
+
             if (after - before >= 0.01 || after >= 1.0) {
                 notifyMessage(progressMessage(chunk, after));
             }
@@ -692,11 +498,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 处理文件传输结束消息：校验并存盘。
-     *
-     * @param end 结束消息
-     */
+    /** 结束接收并保存文件，随后回送传输结果。 */
     private void handleIncomingEnd(FileMessage end) {
         FileMessage request = receivingSessions.remove(end.getTransferId());
         if (request == null) {
@@ -710,7 +512,6 @@ public class ChatClient {
             sendSync(result);
             notifyMessage(result);
         } catch (FileTransferException e) {
-            // 接收失败同样必须回执，否则发送方会一直等待确认
             FileMessage failure = resultMessage(request, end.getSender(), false,
                     "文件接收失败: " + e.getMessage());
             try {
@@ -724,20 +525,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 构造文件传输结果消息。
-     *
-     * <p>方向约定：结果消息永远由“本客户端”发出、发给对端，
-     * 因此发送者固定为当前登录用户，接收者是对端用户名。
-     * 不能从源消息“借”sender/receiver 字段：源消息在本端与对端眼中的方向恰好相反，
-     * 借字段会导致结果被投递回自己（本项目中确实踩过这个坑，故显式传参）。</p>
-     *
-     * @param source  原始文件消息（提供传输编号与文件元信息）
-     * @param peer    对端用户名
-     * @param success 是否成功
-     * @param text    结果描述
-     * @return 结果消息
-     */
+    /** 按源消息构造一条文件传输结果消息。 */
     private FileMessage resultMessage(FileMessage source, String peer, boolean success, String text) {
         FileMessage message = ChatMessageFactory.file(username, peer, MessageType.FILE_RESULT);
         message.setTransferId(source.getTransferId());
@@ -749,11 +537,7 @@ public class ChatClient {
         return message;
     }
 
-    /**
-     * 处理接收方的同意应答：启动文件发送线程。
-     *
-     * @param accept 同意消息
-     */
+    /** 对方同意接收后启动独立线程发送文件。 */
     private void handleIncomingAccept(FileMessage accept) {
         FileMessage request = pendingSends.remove(accept.getTransferId());
         if (request == null) {
@@ -766,12 +550,7 @@ public class ChatClient {
         sender.start();
     }
 
-    /**
-     * 依次发送文件全部分块并发送结束帧。
-     *
-     * @param request   文件请求消息
-     * @param receiver  接收者用户名
-     */
+    /** 逐块发送文件并回报进度，结束时发送结束帧。 */
     private void sendFileChunks(FileMessage request, String receiver) {
         try {
             for (int index = 0; index < request.getTotalChunks(); index++) {
@@ -791,7 +570,6 @@ public class ChatClient {
             LOGGER.log(Level.WARNING, "文件发送失败: " + e.getMessage(), e);
             notifyMessage(resultMessage(request, receiver, false, "文件发送失败: " + e.getMessage()));
         } catch (IOException e) {
-            // 分块写出失败意味着本次传输无法继续，按业务失败处理并回执界面
             LOGGER.log(Level.WARNING, "文件分块发送失败: " + e.getMessage(), e);
             notifyMessage(resultMessage(request, receiver, false, "文件发送失败: " + e.getMessage()));
         } finally {
@@ -799,13 +577,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 构造一条仅用于本地界面刷新的进度消息。
-     *
-     * @param source   源文件消息
-     * @param progress 进度比例
-     * @return 携带进度的文件消息
-     */
+    /** 复制文件信息并附上进度值，供界面刷新进度条。 */
     private FileMessage progressMessage(FileMessage source, double progress) {
         FileMessage message = ChatMessageFactory.file(source.getSender(), source.getReceiver(),
                 MessageType.FILE_CHUNK);
@@ -814,33 +586,26 @@ public class ChatClient {
         message.setFileSize(source.getFileSize());
         message.setTotalChunks(source.getTotalChunks());
         message.setChunkIndex(source.getChunkIndex());
-        // 进度通过 message 字段传递：data 字段承载二进制块，不适合再复用，
-        // 而新增一个 double 字段会让每帧都多传 8 字节且污染协议，故采用文本形式
+
         message.setMessage(String.valueOf(progress));
         return message;
     }
 
-    /**
-     * 接收失败时清理并通知界面。
-     *
-     * @param source 源消息
-     * @param reason 失败原因
-     */
+    /** 中止接收，回送失败结果并通知界面。 */
     private void finishFailedTransfer(FileMessage source, String reason) {
         receivingSessions.remove(source.getTransferId());
         fileService.cancelReceive(source.getTransferId());
         FileMessage failure = resultMessage(source, source.getSender(), false, "文件接收失败: " + reason);
         notifyMessage(failure);
-        // 回执同样要发给发送方：与结束帧失败的处理保持一致。
-        // 只通知本端界面会让发送方一直停在"传输中"，服务器也无从记录这次失败的传输
+
         send(failure);
     }
 
     /**
-     * 异步发送一条消息。
+     * 把消息交给发送线程池异步写出。
      *
-     * @param message 消息
-     * @return 已提交发送任务返回 true
+     * @param message 待发送的消息
+     * @return 已提交发送返回 true，未连接或线程池已关闭返回 false
      */
     public boolean send(Message message) {
         if (!connected || out == null) {
@@ -850,7 +615,7 @@ public class ChatClient {
         if (senderPool == null || senderPool.isShutdown()) {
             return false;
         }
-        // 每条出站消息都带稳定标识：服务端据此去重，确认与离线补投也依赖它
+
         message.ensureMessageId();
         senderPool.execute(() -> {
             try {
@@ -864,11 +629,11 @@ public class ChatClient {
     }
 
     /**
-     * 同步发送一条消息，用于必须保证顺序的文件分块。
+     * 在当前线程同步写出消息。
      *
-     * @param message 消息
-     * @return 发送成功返回 true
-     * @throws IOException 写入失败时抛出
+     * @param message 待发送的消息
+     * @return 写出成功返回 true
+     * @throws IOException 未连接或写出失败时抛出
      */
     public boolean sendSync(Message message) throws IOException {
         if (!connected || out == null) {
@@ -879,15 +644,7 @@ public class ChatClient {
         return true;
     }
 
-    /**
-     * 写入对象并刷新缓冲。
-     *
-     * <p>对象流不是线程安全的，因此用 {@code out} 自身作为监视器串行化写入；
-     * 同时周期性 {@code reset()}，避免长时间连接持有已发送对象的强引用。</p>
-     *
-     * @param message 消息
-     * @throws IOException 写入失败时抛出
-     */
+    /** 串行写入对象流并重置流状态。 */
     private void writeObject(Message message) throws IOException {
         synchronized (out) {
             out.writeObject(message);
@@ -897,30 +654,24 @@ public class ChatClient {
     }
 
     /**
-     * 发送私聊文本消息。
-     *
-     * <p>私聊消息会登记到待确认表：服务端对每条私聊回 {@code MSG_ACK}，
-     * 客户端据此实现超时重发与状态展示。群聊是广播语义，没有单一接收方，因此不做等待确认。</p>
+     * 发送私聊文本。
      *
      * @param receiver 接收者用户名
-     * @param content  正文
-     * @return 发送成功返回 true
+     * @param content 文本内容
+     * @return 已提交发送返回 true
      */
     public boolean sendPrivateText(String receiver, String content) {
         return sendPrivateText(receiver, content, null, null);
     }
 
     /**
-     * 发送带引用信息的私聊文本消息。
+     * 发送带引用信息的私聊文本。
      *
-     * <p>仍然走 {@link #sendTracked} 这条唯一通道：引用只是随消息一起发送的附加信息，
-     * 不能因为它另开一条发送路径，否则这条消息会丢掉确认登记、超时重发与发送状态展示。</p>
-     *
-     * @param receiver     接收者用户名
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @return 发送成功返回 true
+     * @param receiver 接收者用户名
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @return 已提交发送返回 true
      */
     public boolean sendPrivateText(String receiver, String content, String quoteId, String quoteSummary) {
         if (content == null || content.trim().isEmpty()) {
@@ -936,18 +687,13 @@ public class ChatClient {
     }
 
     /**
-     * 发送私聊文本消息并返回其稳定消息标识。
+     * 发送带引用信息的私聊文本并返回消息 ID。
      *
-     * <p>与 {@link #sendPrivateText(String, String, String, String)} 是同一条发送通道、
-     * 同一套校验，唯一区别是把标识交回给调用方。界面需要在气泡上就地撤回自己刚发出的消息，
-     * 而撤回请求只认标识、不认正文，因此发送方必须拿得到它：消息在 {@code sendTracked}
-     * 内部才被分配标识，调用方从返回值之外没有别的途径能知道是哪一条。</p>
-     *
-     * @param receiver     接收者用户名
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     * @param receiver 接收者用户名
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @return 消息 ID，内容为空或发送失败时返回 null
      */
     public String sendPrivateTextReturningId(String receiver, String content, String quoteId,
                                              String quoteSummary) {
@@ -955,14 +701,14 @@ public class ChatClient {
     }
 
     /**
-     * 发送带完整引用信息（含被引用者）的私聊消息，并返回其稳定消息标识。
+     * 发送带引用信息的私聊文本并返回消息 ID。
      *
-     * @param receiver     接收者用户名
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @param quoteSender  被引用消息的发送者显示名，可为 null
-     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     * @param receiver 接收者用户名
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @param quoteSender 被引用消息的原发送者，可以为 null
+     * @return 消息 ID，内容为空或发送失败时返回 null
      */
     public String sendPrivateTextReturningId(String receiver, String content, String quoteId,
                                              String quoteSummary, String quoteSender) {
@@ -978,41 +724,12 @@ public class ChatClient {
                 quoteId, quoteSummary, quoteSender));
     }
 
-    /**
-     * 构造一条出站文本消息。
-     *
-     * <p>不带引用时仍走 {@link ChatMessageFactory}：那里统一分配本地消息编号，
-     * 让日志与调试信息能看出先后顺序；带引用时必须用五参构造器，因为引用字段是 final，
-     * 只能在构造时确定。两条路径最终都交给同一个发送通道。</p>
-     *
-     * @param sender       发送者用户名
-     * @param receiver     接收者用户名，群聊传空字符串
-     * @param content      正文
-     * @param type         消息类型
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @return 文本消息
-     */
+    /** 构造文本消息，带引用信息时使用完整构造函数。 */
     private TextMessage buildText(String sender, String receiver, String content, MessageType type,
                                   String quoteId, String quoteSummary) {
         return buildText(sender, receiver, content, type, quoteId, quoteSummary, null);
     }
 
-    /**
-     * 构造一条出站文本消息（含被引用者）。
-     *
-     * <p>两个重载的区别只在于是否携带被引用消息的发送者：引用块要按"谁：内容"展示，
-     * 缺了它就只剩一行无主的内容。旧的三参调用点（不引用任何消息）保持原样。</p>
-     *
-     * @param sender       发送者用户名
-     * @param receiver     接收者用户名，群聊传空字符串
-     * @param content      正文
-     * @param type         消息类型
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @param quoteSender  被引用消息的发送者显示名，可为 null
-     * @return 文本消息
-     */
     private TextMessage buildText(String sender, String receiver, String content, MessageType type,
                                   String quoteId, String quoteSummary, String quoteSender) {
         if (quoteId == null && quoteSummary == null && quoteSender == null) {
@@ -1023,29 +740,12 @@ public class ChatClient {
         return message;
     }
 
-    /**
-     * 发送需要确认的私聊消息：先登记待确认项，再写入连接。
-     *
-     * <p>登记必须先于写入：若先写入再登记，服务端的确认可能在登记之前就回到接收线程，
-     * 那条确认会因为找不到待确认项而被当成"未知确认"丢弃，消息随后被误判为超时。</p>
-     *
-     * @param message 待发送的私聊消息
-     * @return 发送成功返回 true
-     */
+    /** 登记消息 ID 与接收者后发送，返回是否成功拿到消息 ID。 */
     private boolean sendTracked(TextMessage message) {
         return sendTrackedId(message) != null;
     }
 
-    /**
-     * 发送需要确认的私聊消息，并把稳定消息标识交回调用方。
-     *
-     * <p>标识在这里分配而不是由调用方预置：{@code ensureMessageId()} 只在消息还没有标识时
-     * 才分配，因此这是"这条消息最终用哪个标识发出去"的唯一权威点。界面侧撤回自己的消息时
-     * 需要凭这个标识定位气泡，从返回值拿比事后猜更可靠。</p>
-     *
-     * @param message 待发送的私聊消息
-     * @return 稳定消息标识；未连接导致发送失败时返回 null
-     */
+    /** 登记待确认消息并返回消息 ID，发送失败时标记为发送失败。 */
     private String sendTrackedId(TextMessage message) {
         String messageId = message.ensureMessageId();
         pendingMessages.put(messageId, new PendingMessage(message));
@@ -1054,64 +754,53 @@ public class ChatClient {
         if (send(message)) {
             return messageId;
         }
-        // 未连接时立即给出失败结论，避免界面一直停留在"发送中"
+
         failPending(messageId, "尚未连接服务器");
         return null;
     }
 
     /**
-     * 发送群聊消息。
+     * 发送群聊文本。
      *
-     * @param content 正文
-     * @return 发送成功返回 true
+     * @param content 文本内容
+     * @return 已提交发送返回 true
      */
     public boolean sendGroupText(String content) {
         return sendGroupText(content, null, null);
     }
 
     /**
-     * 发送带引用信息的群聊文本消息。
+     * 发送带引用信息的群聊文本。
      *
-     * <p>群聊是广播语义，没有单一接收方，因此服务端不会回 {@code MSG_ACK}，
-     * 这里也不做待确认登记；引用信息随消息一起广播给全部在线成员。</p>
-     *
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @return 发送成功返回 true
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @return 已提交发送返回 true
      */
     public boolean sendGroupText(String content, String quoteId, String quoteSummary) {
         return sendGroupTextReturningId(content, quoteId, quoteSummary) != null;
     }
 
     /**
-     * 发送群聊文本消息并返回其稳定消息标识。
+     * 发送带引用信息的群聊文本并返回消息 ID。
      *
-     * <p>与 {@link #sendGroupText(String, String, String)} 是同一条广播通道、同一套校验，
-     * 唯一区别是把标识交回给调用方。标识的用途与私聊一致：界面要凭它给"自己刚发出的这一条"
-     * 装上右键菜单，并凭它把服务端回来的撤回通知定位到具体的那个气泡。</p>
-     *
-     * <p>标识必须由本端在发送前分配：群聊是广播语义，服务端不回 {@code MSG_ACK}，
-     * 消息标识只会在落库时补生成，发送方无从得知，气泡也就永远拿不到标识。
-     * 这与私聊那条 {@code sendTrackedId} 取模型的理由相同。</p>
-     *
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @return 消息 ID，内容为空或发送失败时返回 null
      */
     public String sendGroupTextReturningId(String content, String quoteId, String quoteSummary) {
         return sendGroupTextReturningId(content, quoteId, quoteSummary, null);
     }
 
     /**
-     * 发送带完整引用信息（含被引用者）的群聊消息，并返回其稳定消息标识。
+     * 发送带引用信息的群聊文本并返回消息 ID。
      *
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识，可为 null
-     * @param quoteSummary 被引用消息的摘要，可为 null
-     * @param quoteSender  被引用消息的发送者显示名，可为 null
-     * @return 稳定消息标识；正文非法、超长或未连接导致发送失败时返回 null
+     * @param content 文本内容
+     * @param quoteId 被引用消息的 ID，可以为 null
+     * @param quoteSummary 被引用消息的摘要，可以为 null
+     * @param quoteSender 被引用消息的原发送者，可以为 null
+     * @return 消息 ID，内容为空或发送失败时返回 null
      */
     public String sendGroupTextReturningId(String content, String quoteId, String quoteSummary,
                                            String quoteSender) {
@@ -1130,11 +819,11 @@ public class ChatClient {
     }
 
     /**
-     * 发起文件传输请求。
+     * 准备文件并发送传输请求。
      *
      * @param receiver 接收者用户名
-     * @param file     待发送文件
-     * @return 成功时返回传输编号；失败返回 null
+     * @param file 待发送的文件
+     * @return 传输 ID，准备失败时返回 null
      */
     public String sendFile(String receiver, File file) {
         try {
@@ -1152,12 +841,12 @@ public class ChatClient {
     }
 
     /**
-     * 应答收到的文件请求。
+     * 回应文件传输请求，同意时同时打开本地接收会话。
      *
-     * @param request  文件请求（来自服务器转发的文本消息，需先经 {@link #decodeRequest} 还原）
+     * @param request 对方的传输请求
      * @param accepted 是否同意接收
-     * @param reason   拒绝原因，同意时传空字符串
-     * @return 发送成功返回 true
+     * @param reason 拒绝原因，同意时可以为空
+     * @return 应答已提交发送返回 true
      */
     public boolean respondFileRequest(FileMessage request, boolean accepted, String reason) {
         if (request == null) {
@@ -1185,10 +874,10 @@ public class ChatClient {
     }
 
     /**
-     * 从 FILE_REQUEST 文本消息还原文件请求对象。
+     * 从文本消息中解析文件传输请求。
      *
-     * @param message 服务器转发来的文本消息
-     * @return 文件请求对象；格式非法时返回 null
+     * @param message 携带请求内容的文本消息
+     * @return 解析出的文件消息，解析失败或参数为 null 时返回 null
      */
     public static FileMessage decodeRequest(TextMessage message) {
         if (message == null) {
@@ -1198,9 +887,9 @@ public class ChatClient {
     }
 
     /**
-     * 请求刷新在线用户列表。
+     * 请求服务器下发在线用户列表。
      *
-     * @return 发送成功返回 true
+     * @return 请求已提交发送返回 true
      */
     public boolean requestUserList() {
         SystemMessage message = ChatMessageFactory.control(username, Constants.SYSTEM_SENDER,
@@ -1211,25 +900,18 @@ public class ChatClient {
     /**
      * 请求修改昵称。
      *
-     * <p>把协议拼装收敛到客户端里：设置界面只关心"填了什么、发出去没有"，
-     * 不该自己拼 {@code CHANGE_NICK|} 这类线格式，否则线格式一改就要满界面找调用点。</p>
-     *
      * @param nickname 新昵称
-     * @return 发送成功返回 true
+     * @return 请求已提交发送返回 true
      */
     public boolean requestNicknameChange(String nickname) {
         return sendUserUpdate("CHANGE_NICK", nickname);
     }
 
     /**
-     * 请求修改头像。
+     * 请求修改头像，提交前检查 Base64 数据长度。
      *
-     * <p>先在本地做长度闸门再发送：超过 {@link Constants#AVATAR_MAX_LENGTH} 的报文
-     * 一定会被服务端拒绝，先在本地拦下可以省掉一次往返，也让提示来得更即时。
-     * 这里不重复做图片格式校验——那是服务端的职责，客户端校验只是体验优化。</p>
-     *
-     * @param base64 头像 PNG 的 Base64 文本；传 null 或空串表示恢复默认头像
-     * @return 发送成功返回 true；本地即判定为过大时返回 false
+     * @param base64 头像图片的 Base64 文本
+     * @return 请求已提交发送返回 true，数据超长返回 false
      */
     public boolean requestAvatarChange(String base64) {
         if (base64 != null && base64.length() > Constants.AVATAR_MAX_LENGTH) {
@@ -1243,32 +925,18 @@ public class ChatClient {
     /**
      * 请求修改密码。
      *
-     * <p>已登录会话即可完成，不需要重新登录：服务端会校验原密码，
-     * 通过后直接更新散列与盐，当前会话不受影响。</p>
-     *
      * @param oldPassword 原密码
      * @param newPassword 新密码
-     * @return 发送成功返回 true
+     * @return 请求已提交发送返回 true
      */
     public boolean requestPasswordChange(String oldPassword, String newPassword) {
-        // 与其它控制报文一样用 TextMessage 作载体（control 造出来的对象没有正文可放）
         TextMessage text = new TextMessage(username, Constants.SYSTEM_SENDER,
                 (oldPassword == null ? "" : oldPassword) + "|" + (newPassword == null ? "" : newPassword));
         text.setType(MessageType.PASSWORD_CHANGE);
         return send(text);
     }
 
-    /**
-     * 发送一条用户资料变更请求。
-     *
-     * <p>照既有 {@code changeNickname} 的写法：先按文本消息构造（正文格式为
-     * {@code 命令|参数}），再把类型改成 {@link MessageType#USER_UPDATE}。
-     * 复用文本消息作为载体而不是新增消息类，是因为资料变更本质上就是"一条命令 + 一个参数"。</p>
-     *
-     * @param command  命令名，例如 {@code CHANGE_NICK}
-     * @param argument 命令参数，可为 null
-     * @return 发送成功返回 true
-     */
+    /** 发送带命令与参数的用户信息更新请求。 */
     private boolean sendUserUpdate(String command, String argument) {
         TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
                 command + "|" + (argument == null ? "" : argument), MessageType.TEXT_PRIVATE);
@@ -1277,50 +945,43 @@ public class ChatClient {
     }
 
     /**
-     * 请求历史聊天记录。
+     * 请求历史消息，使用默认分页条数。
      *
-     * @param target   目标用户名，为空表示查询全部
-     * @param fromDate 起始日期，格式 yyyy-MM-dd，可为空
-     * @param toDate   结束日期，格式 yyyy-MM-dd，可为空
-     * @return 发送成功返回 true
+     * @param target 查询目标，群聊或用户名
+     * @param fromDate 起始日期
+     * @param toDate 结束日期
+     * @return 请求已提交发送返回 true
      */
     public boolean requestHistory(String target, String fromDate, String toDate) {
         return requestHistory(target, fromDate, toDate, "");
     }
 
     /**
-     * 请求历史聊天记录（可限定会话对象）。
+     * 请求指定会话的历史消息，使用默认分页条数。
      *
-     * @param target   目标用户名，为空表示查询全部
-     * @param fromDate 起始日期，格式 yyyy-MM-dd，可为空
-     * @param toDate   结束日期，格式 yyyy-MM-dd，可为空
-     * @param peer     会话对象用户名；非空时只返回 target 与该用户之间的私聊记录，
-     *                 为空时保持"本人全部收发 + 广播"的旧语义
-     * @return 发送成功返回 true
+     * @param target 查询目标，群聊或用户名
+     * @param fromDate 起始日期
+     * @param toDate 结束日期
+     * @param peer 会话对端
+     * @return 请求已提交发送返回 true
      */
     public boolean requestHistory(String target, String fromDate, String toDate, String peer) {
         return requestHistory(target, fromDate, toDate, peer, "", DEFAULT_PAGE_SIZE);
     }
 
     /**
-     * 请求历史聊天记录（键集分页）。
+     * 按分页条件请求历史消息。
      *
-     * <p>为什么用"上一页最小主键"而不是页码偏移：本项目的聊天记录会持续增长，
-     * 用 OFFSET 翻页时数据库必须先扫过前面所有行，越翻越慢；按主键向前取一页
-     * 每次都能走索引，代价恒定。首次加载传空游标，服务端返回最新一页。</p>
-     *
-     * @param target   目标用户名，为空表示查询全部
-     * @param fromDate 起始日期，格式 yyyy-MM-dd，可为空
-     * @param toDate   结束日期，格式 yyyy-MM-dd，可为空
-     * @param peer     会话对象用户名；非空时只返回 target 与该用户之间的私聊记录
-     * @param beforeId 上一页最小主键，空串表示取最新一页
-     * @param pageSize 每页条数，空串表示由服务端取默认值
-     * @return 发送成功返回 true
+     * @param target 查询目标，群聊或用户名
+     * @param fromDate 起始日期
+     * @param toDate 结束日期
+     * @param peer 会话对端
+     * @param beforeId 只取该消息 ID 更早的记录，为空表示从最新开始
+     * @param pageSize 分页条数，为空时使用默认值
+     * @return 请求已提交发送返回 true
      */
     public boolean requestHistory(String target, String fromDate, String toDate, String peer,
                                   String beforeId, String pageSize) {
-        // 追加两个字段而不是新增消息类型：旧版服务端只读取前四个字段，
-        // 多出来的内容会被忽略，因此新旧两端可以各自升级而不会互相打断
         String body = (target == null ? "" : target) + "|" + (fromDate == null ? "" : fromDate)
                 + "|" + (toDate == null ? "" : toDate) + "|" + (peer == null ? "" : peer)
                 + "|" + (beforeId == null ? "" : beforeId)
@@ -1332,13 +993,10 @@ public class ChatClient {
     }
 
     /**
-     * 请求按关键字搜索本人的聊天记录。
+     * 按关键词搜索消息。
      *
-     * <p>搜索在服务端完成：正文以密文入库，只有服务端能在解密后做匹配，
-     * 客户端不持有任何数据库连接。</p>
-     *
-     * @param keyword 关键字，空白串直接拒绝
-     * @return 发送成功返回 true
+     * @param keyword 搜索关键词
+     * @return 请求已提交发送返回 true，关键词为空返回 false
      */
     public boolean requestSearch(String keyword) {
         if (keyword == null || keyword.trim().isEmpty()) {
@@ -1351,13 +1009,10 @@ public class ChatClient {
     }
 
     /**
-     * 请求撤回自己发出的某条私聊消息。
+     * 请求撤回指定消息。
      *
-     * <p>是否允许撤回（例如是否在时限内）由服务端判定，
-     * 客户端只负责提交请求并展示服务端回执，避免两端各写一套规则后互相矛盾。</p>
-     *
-     * @param messageId 稳定消息标识
-     * @return 发送成功返回 true
+     * @param messageId 待撤回的消息 ID
+     * @return 请求已提交发送返回 true，消息 ID 为空返回 false
      */
     public boolean requestRecall(String messageId) {
         if (messageId == null || messageId.trim().isEmpty()) {
@@ -1370,26 +1025,19 @@ public class ChatClient {
     }
 
     /**
-     * 请求导出本人的全部聊天记录。
+     * 请求导出全部聊天记录。
      *
-     * <p>导出内容由服务端查库并渲染后回传，客户端只负责把文本写到自己的磁盘上。
-     * 客户端刻意不持有数据库连接：换一台机器登录，同样能导出自己的记录。</p>
-     *
-     * @return 发送成功返回 true
+     * @return 请求已提交发送返回 true
      */
     public boolean requestExport() {
         return requestExport("");
     }
 
     /**
-     * 请求导出指定会话的聊天记录。
+     * 请求导出指定范围的聊天记录。
      *
-     * <p>范围由界面按当前窗口给出：私聊窗口传 {@code @对端用户名}，群聊窗口传
-     * {@code @ALL}，不传则保持"本人全部记录"的旧语义。服务端只在这个范围内筛选
-     * 已经查出的本人记录，范围参数无法用来扩大可见范围。</p>
-     *
-     * @param scope 导出范围，取值见 {@link Constants#EXPORT_SCOPE_PREFIX}；空串表示全部
-     * @return 发送成功返回 true
+     * @param scope 导出范围，为空表示全部
+     * @return 请求已提交发送返回 true
      */
     public boolean requestExport(String scope) {
         TextMessage message = ChatMessageFactory.text(username, Constants.SYSTEM_SENDER,
@@ -1399,17 +1047,11 @@ public class ChatClient {
     }
 
     /**
-     * 发送退出登录请求。
+     * 发送退出登录请求并标记为主动关闭。
      *
-     * <p>刻意使用同步发送：退出后马上就要关闭连接，若走异步发送队列，
-     * 报文可能还没写出连接就断了，服务器只能等探测到 socket 关闭才清理在线状态。
-     * 虽然最终结果一样，但其它客户端要多等一个心跳周期才能看到下线通知。</p>
-     *
-     * @return 发送成功返回 true；未连接或写入失败返回 false
+     * @return 请求发送成功返回 true
      */
     public boolean sendLogout() {
-        // 退出登录意味着本次会话就此结束：先关掉重连开关，
-        // 否则服务端处理完 LOGOUT 关闭连接后，客户端会立刻开始重连并再次占用该账号
         userClosed = true;
         if (!connected || out == null) {
             return false;
@@ -1423,31 +1065,15 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 获取最近一次连接的服务器地址。
-     *
-     * @return 服务器地址；从未连接过时为空字符串
-     */
     public String getServerHost() {
         return serverHost;
     }
 
-    /**
-     * 获取最近一次连接的服务器端口。
-     *
-     * @return 服务器端口；从未连接过时为 0
-     */
     public int getServerPort() {
         return serverPort;
     }
 
-    /**
-     * 启动心跳任务：定期发送心跳，并在连续多个周期收不到应答时判定连接失效。
-     *
-     * <p>为什么用"收不到应答"而不是"写失败"来判定断线：TCP 连接在对端主机掉电、
-     * 网线拔出等情况下不会立刻报错，写入仍会成功进入内核缓冲；只有应答的缺失
-     * 才能在有限时间内暴露连接已经不可用。</p>
-     */
+    /** 按配置间隔发送心跳，连续多个周期无应答时判定连接失效。 */
     private void startHeartbeat() {
         heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "chat-heartbeat");
@@ -1467,12 +1093,7 @@ public class ChatClient {
         }, interval, interval, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * 扫描待确认消息：超时未确认的消息重发，重发次数耗尽的标记失败。
-     *
-     * <p>由单线程调度器周期执行，因此不需要额外加锁；对共享表使用弱一致的遍历拷贝，
-     * 避免在遍历过程中因接收线程移除条目而抛异常。</p>
-     */
+    /** 扫描超时未确认的消息，重发或标记为发送失败。 */
     private void scanPendingMessages() {
         long now = System.currentTimeMillis();
         for (String messageId : new ArrayList<>(pendingMessages.keySet())) {
@@ -1485,7 +1106,7 @@ public class ChatClient {
                 continue;
             }
             if (!connected || out == null) {
-                // 断线期间不重发：既写不出去，也会白白消耗重发次数；重连成功后计时自然到期即会重发
+                // 连接断开时保留记录，等重连后再继续
                 continue;
             }
             pending.retryCount++;
@@ -1500,34 +1121,20 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 把一条待确认消息标记为发送失败并通知界面。
-     *
-     * @param messageId 稳定消息标识
-     * @param detail    失败原因
-     */
+    /** 移除待确认记录并通知发送失败。 */
     private void failPending(String messageId, String detail) {
         pendingMessages.remove(messageId);
         sentMessagePeers.remove(messageId);
         notifyMessageState(messageId, SendState.FAILED, detail);
     }
 
-    /**
-     * 处理连接失效：进入重连流程，或在用户已退出时静默结束。
-     *
-     * <p>关键顺序：先把 {@code reconnecting} 置位并关闭旧连接，再启动重连线程。
-     * 先置位可以让接收线程因旧连接被关闭而再次触发本方法时直接返回，避免拉起第二个重连线程；
-     * 先关旧连接则能让阻塞在 {@code readObject} 上的接收线程立即退出，
-     * 否则重连线程无法安全地复用同一组流字段。</p>
-     *
-     * @param reason 失效原因，会展示在界面上
-     */
+    /** 处理连接中断，已建立会话时启动重连线程，否则直接通知界面。 */
     private void handleConnectionLost(String reason) {
         if (userClosed) {
             return;
         }
         if (!sessionEstablished) {
-            // 尚未建立可恢复的会话（例如仍停留在登录窗口），只上报断开，不擅自重连
+            // 尚未登录成功，不再重连
             connected = false;
             sessionActive = false;
             closeQuietly();
@@ -1557,12 +1164,7 @@ public class ChatClient {
         thread.start();
     }
 
-    /**
-     * 重连循环：按退避序列反复尝试建连并恢复会话。
-     *
-     * <p>循环终止条件只有三个：会话恢复成功、会话已过期、用户主动退出。
-     * 其余失败一律继续重试，符合"持续重试直到成功或用户主动退出"的契约。</p>
-     */
+    /** 按退避间隔反复重连，会话恢复成功后退出循环。 */
     private void reconnectLoop() {
         int attempt = 0;
         try {
@@ -1583,7 +1185,7 @@ public class ChatClient {
                 if (resumeSession()) {
                     return;
                 }
-                // 本次建连成功但恢复失败：关闭它，下一轮重新建连，避免在半可用连接上继续等待
+
                 connected = false;
                 closeQuietly();
             }
@@ -1595,18 +1197,11 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 用会话令牌请求服务端恢复登录态。
-     *
-     * <p>令牌只从内存字段读取，全过程不写日志、不落盘：它等价于一次登录凭据，
-     * 泄露即可被他人冒用。</p>
-     *
-     * @return 重连流程应当结束（已恢复或已确定会话过期）返回 true；仅本次尝试失败返回 false
-     */
+    /** 用会话令牌申请恢复会话并等待应答，返回是否结束重连。 */
     private boolean resumeSession() {
         String token = sessionToken;
         if (token == null || token.isEmpty()) {
-            // 没有令牌就无法恢复：继续重试也没有意义，按会话过期处理并让用户重新登录
+            // 没有会话令牌时无法恢复，按会话过期处理
             LOGGER.warning("未持有会话令牌，无法恢复会话");
             finishSessionExpired();
             return true;
@@ -1643,28 +1238,23 @@ public class ChatClient {
             sessionEstablished = true;
             lastHeartbeatAckAt = System.currentTimeMillis();
             LOGGER.info("会话已恢复，重新拉取在线用户列表");
-            // 断线期间的用户上下线变化已错过，恢复后必须重新取一份最新快照
+
             requestUserList();
             notifyConnection(true, "已重新连接，会话已恢复");
             return true;
         }
         if (result.startsWith(RESUME_EXPIRED_PREFIX)) {
-            // 只记录原因，不记录应答里可能携带的其它内容
+            // 服务器拒绝恢复会话，停止重连
             LOGGER.warning("会话恢复被拒绝，停止重连");
             finishSessionExpired();
             return true;
         }
-        // 刻意不打印应答正文：万一服务端把新令牌当作应答正文返回，正文入日志就会泄露凭据
+
         LOGGER.warning("会话恢复应答无法识别，稍后重试");
         return false;
     }
 
-    /**
-     * 结束重连并提示用户重新登录。
-     *
-     * <p>复用既有的断开通知路径：界面收到"未连接"事件后会走原有提示与退出登录界面的处理，
-     * 不额外新增弹窗层级。先把 {@code reconnecting} 清掉，界面才能把它当成终态而非重连中间态。</p>
-     */
+    /** 清理连接状态并通知界面会话已过期。 */
     private void finishSessionExpired() {
         synchronized (reconnectLock) {
             reconnecting = false;
@@ -1675,13 +1265,7 @@ public class ChatClient {
         notifyConnection(false, "会话已过期，请重新登录");
     }
 
-    /**
-     * 等待上一轮的接收线程退出。
-     *
-     * <p>接收线程的 {@code finally} 会关闭"当前字段上的流"。若它在新连接建立之后才执行，
-     * 就会把刚建好的新连接关掉；因此在每次建连前显式等待它结束。
-     * 旧连接已在 {@link #handleConnectionLost(String)} 中关闭，这里通常只会等待极短时间。</p>
-     */
+    /** 等待接收线程结束，最多等一个连接超时时间。 */
     private void joinReceiverThread() {
         Thread thread = receiverThread;
         if (thread == null || thread == Thread.currentThread()) {
@@ -1694,23 +1278,13 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 计算第 n 次重连前的退避时间。
-     *
-     * @param attempt 重连次数，从 1 开始
-     * @return 退避毫秒数；超出序列长度后返回序列最后一个值
-     */
+    /** 返回第若干次重连应等待的退避时间。 */
     private long backoffOf(int attempt) {
         int index = Math.min(attempt, RECONNECT_BACKOFF_MS.length) - 1;
         return RECONNECT_BACKOFF_MS[Math.max(index, 0)];
     }
 
-    /**
-     * 可中断的休眠。
-     *
-     * @param millis 休眠毫秒数
-     * @return 正常结束返回 true；被中断返回 false（调用方应立即结束重连）
-     */
+    /** 休眠指定时间，被中断时恢复中断标记并返回 false。 */
     private boolean sleepQuietly(long millis) {
         try {
             Thread.sleep(millis);
@@ -1724,7 +1298,7 @@ public class ChatClient {
     /**
      * 注册发送状态监听器。
      *
-     * @param listener 监听器
+     * @param listener 待注册的监听器，null 时忽略
      */
     public void addMessageStateListener(MessageStateListener listener) {
         if (listener != null && !stateListeners.contains(listener)) {
@@ -1735,19 +1309,13 @@ public class ChatClient {
     /**
      * 注销发送状态监听器。
      *
-     * @param listener 监听器
+     * @param listener 待注销的监听器
      */
     public void removeMessageStateListener(MessageStateListener listener) {
         stateListeners.remove(listener);
     }
 
-    /**
-     * 回调所有监听器的发送状态事件。
-     *
-     * @param messageId 稳定消息标识
-     * @param state     状态
-     * @param detail    补充说明
-     */
+    /** 通知所有发送状态监听器，单个监听器异常不影响其他监听器。 */
     private void notifyMessageState(String messageId, SendState state, String detail) {
         String text = detail == null ? "" : detail;
         for (MessageStateListener listener : stateListeners) {
@@ -1760,24 +1328,20 @@ public class ChatClient {
     }
 
     /**
-     * 查询某个已发送消息的接收者，供界面把发送状态路由到对应会话窗口。
+     * 返回待确认消息的接收者。
      *
-     * @param messageId 稳定消息标识
-     * @return 接收者用户名；消息已完成（或不是本端发送的私聊消息）时返回 null
+     * @param messageId 消息 ID
+     * @return 接收者用户名，消息不在待确认列表中时返回 null
      */
     public String getMessageReceiver(String messageId) {
         return messageId == null ? null : sentMessagePeers.get(messageId);
     }
 
     /**
-     * 查询某条"本端刚发出"消息的正文。
+     * 返回待确认消息的文本内容。
      *
-     * <p>供界面在撤回时把气泡与消息标识对应起来：界面上渲染的本地回显只带正文，
-     * 不带标识，需要借助待确认表把两者关联。消息确认到达后待确认项即被移除，
-     * 因此本方法只对刚发送、尚未确认的消息有效——正好覆盖"2 分钟内可撤回"的场景。</p>
-     *
-     * @param messageId 稳定消息标识
-     * @return 正文；消息不存在、已确认或不是文本消息时返回 null
+     * @param messageId 消息 ID
+     * @return 文本内容，消息不存在或不是文本消息时返回 null
      */
     public String getMessageContent(String messageId) {
         PendingMessage pending = messageId == null ? null : pendingMessages.get(messageId);
@@ -1788,36 +1352,24 @@ public class ChatClient {
     }
 
     /**
-     * 是否正在重连。
+     * 返回当前是否处于重连流程。
      *
-     * @return 重连流程进行中返回 true
+     * @return 正在重连返回 true
      */
     public boolean isReconnecting() {
         return reconnecting;
     }
 
     /**
-     * 待确认的私聊消息。
-     *
-     * <p>只保存消息对象、重发次数与上次发送时刻三项——重发必须复用同一个消息对象，
-     * 这样 {@code messageId} 与时间戳都不会变化，服务端才能据此识别为同一条消息。</p>
+     * 等待服务器确认的消息，记录重发次数与最近发送时间。
      */
     private static final class PendingMessage {
-
-        /** 待确认的消息对象 */
         private final Message message;
 
-        /** 已重发次数 */
         private int retryCount;
 
-        /** 最近一次发送时刻（毫秒） */
         private long lastSentAt;
 
-        /**
-         * 构造待确认项。
-         *
-         * @param message 消息对象
-         */
         private PendingMessage(Message message) {
             this.message = message;
             this.lastSentAt = System.currentTimeMillis();
@@ -1825,9 +1377,9 @@ public class ChatClient {
     }
 
     /**
-     * 注册消息监听器。
+     * 注册消息与连接状态监听器。
      *
-     * @param listener 监听器
+     * @param listener 待注册的监听器，null 时忽略
      */
     public void addListener(ChatListener listener) {
         if (listener != null && !listeners.contains(listener)) {
@@ -1836,19 +1388,15 @@ public class ChatClient {
     }
 
     /**
-     * 注销消息监听器。
+     * 注销消息与连接状态监听器。
      *
-     * @param listener 监听器
+     * @param listener 待注销的监听器
      */
     public void removeListener(ChatListener listener) {
         listeners.remove(listener);
     }
 
-    /**
-     * 回调所有监听器的消息事件。
-     *
-     * @param message 消息
-     */
+    /** 通知所有监听器收到消息，单个监听器异常不影响其他监听器。 */
     private void notifyMessage(Message message) {
         for (ChatListener listener : listeners) {
             try {
@@ -1859,12 +1407,7 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 回调所有监听器的连接状态事件。
-     *
-     * @param connected 是否连接
-     * @param reason    原因
-     */
+    /** 通知所有监听器连接状态变化，单个监听器异常不影响其他监听器。 */
     private void notifyConnection(boolean connected, String reason) {
         for (ChatListener listener : listeners) {
             try {
@@ -1876,11 +1419,7 @@ public class ChatClient {
     }
 
     /**
-     * 关闭连接并释放全部线程资源。
-     *
-     * <p>先把 {@link #userClosed} 置位再动手清理：重连循环与接收线程都以该标志为终止条件，
-     * 这样"用户主动退出"不会被随后到来的连接断开事件误判为需要重连，
-     * 重连线程也会在退避休眠中被立刻中断，不留残余线程。</p>
+     * 关闭客户端，停止全部线程并断开连接。
      */
     public void close() {
         userClosed = true;
@@ -1914,9 +1453,7 @@ public class ChatClient {
         LOGGER.info("客户端已关闭");
     }
 
-    /**
-     * 静默关闭网络资源。
-     */
+    /** 依次关闭输出流、输入流与套接字，忽略关闭异常。 */
     private void closeQuietly() {
         try {
             if (out != null) {
@@ -1944,85 +1481,50 @@ public class ChatClient {
         socket = null;
     }
 
-    /**
-     * 是否已连接。
-     *
-     * @return 连接中返回 true
-     */
     public boolean isConnected() {
         return connected;
     }
 
-    /**
-     * 获取当前登录用户名。
-     *
-     * @return 用户名
-     */
     public String getUsername() {
         return username;
     }
 
-    /**
-     * 获取当前登录昵称。
-     *
-     * @return 昵称；登录结果尚未到达时返回用户名
-     */
     public String getNickname() {
         return nickname == null ? username : nickname;
     }
 
-    /**
-     * 设置当前登录昵称，由登录结果解析处调用。
-     *
-     * @param nickname 昵称
-     */
     public void setNickname(String nickname) {
         this.nickname = nickname;
     }
 
-    /**
-     * 获取接收文件保存目录。
-     *
-     * @return 目录路径
-     */
     public String getReceiveDir() {
         return receiveDir;
     }
 
-    /**
-     * 设置接收文件保存目录。
-     *
-     * @param receiveDir 目录路径
-     */
     public void setReceiveDir(String receiveDir) {
         if (receiveDir != null && !receiveDir.trim().isEmpty()) {
             this.receiveDir = receiveDir.trim();
         }
     }
 
-    /**
-     * 获取文件服务实例（供界面查询进度）。
-     *
-     * @return 文件服务
-     */
     public FileService getFileService() {
         return fileService;
     }
 
     /**
-     * 获取待发送会话编号列表，用于测试断言。
+     * 返回仍在等待对方同意的文件传输 ID 列表。
      *
-     * @return 传输编号列表
+     * @return 传输 ID 列表
      */
     public List<String> pendingTransferIds() {
         return new ArrayList<>(pendingSends.keySet());
     }
 
     /**
-     * 解析服务器下发的登录结果正文。
+     * 解析登录结果文本，返回成功标记与失败原因。
      *
-     * @param content 登录结果正文，格式 {@code 成功标志|说明|用户名|昵称|角色}
-     * @return 长度为 2 的数组 {@code [是否成功, 说明]}；格式非法时返回 {@code ["0", "登录响应格式错误"]}
+     * @param content 服务器返回的结果文本
+     * @return 长度为 2 的数组，依次为成功标记与失败原因
      */
     public static String[] parseLoginResult(String content) {
         if (content == null || content.isEmpty()) {
@@ -2035,10 +1537,10 @@ public class ChatClient {
     }
 
     /**
-     * 从登录结果正文中解析用户资料。
+     * 从登录结果文本中取出用户名、昵称与角色字段。
      *
-     * @param content 登录结果正文，格式 {@code 成功标志|说明|用户名|昵称|角色}
-     * @return 长度为 3 的数组 {@code [用户名, 昵称, 角色]}；解析失败返回 null
+     * @param content 服务器返回的结果文本
+     * @return 长度为 3 的数组，依次为用户名、昵称与角色，字段不足时返回 null
      */
     public static String[] parseLoginUser(String content) {
         if (content == null) {
@@ -2051,21 +1553,11 @@ public class ChatClient {
         return new String[]{parts[2], parts[3], parts[4]};
     }
 
-    /**
-     * 解析服务器下发的注册结果正文，语义与登录结果一致。
-     *
-     * @param content 注册结果正文
-     * @return 长度为 2 的数组 {@code [是否成功, 说明]}
-     */
     public static String[] parseRegisterResult(String content) {
         return parseLoginResult(content);
     }
 
-    /**
-     * 处理登录结果：记录失败原因并唤醒等待中的线程。
-     *
-     * @param message 登录结果消息
-     */
+    /** 更新登录状态与用户信息，并唤醒等待登录结果的线程。 */
     private void handleLoginResult(Message message) {
         if (!(message instanceof TextMessage)) {
             return;
@@ -2078,7 +1570,8 @@ public class ChatClient {
                 this.nickname = user[1];
             }
             lastLoginFailure = "";
-            // 登录成功后心跳才有意义：服务端的掉线判定只针对已登录会话
+
+            // 登录成功后记录会话状态，供心跳与重连使用
             sessionActive = true;
             sessionEstablished = true;
             lastHeartbeatAckAt = System.currentTimeMillis();
@@ -2091,13 +1584,10 @@ public class ChatClient {
     }
 
     /**
-     * 等待登录结果返回。
+     * 阻塞等待登录结果。
      *
-     * <p>主要服务于命令行模式与自动化测试；图形界面通过监听器异步处理，
-     * 不需要阻塞等待。</p>
-     *
-     * @param timeoutMillis 超时时间
-     * @return 登录成功返回 true；超时或登录失败返回 false
+     * @param timeoutMillis 最长等待时间，单位毫秒
+     * @return 登录成功且连接正常返回 true
      */
     public boolean waitForLoginResult(long timeoutMillis) {
         CountDownLatch latch = loginLatch;
@@ -2118,23 +1608,15 @@ public class ChatClient {
     }
 
     /**
-     * 等待满足条件的消息到达。
+     * 阻塞等待满足条件的消息，超时返回 null。
      *
-     * <p>实现方式：临时注册一个监听器，用 {@link java.util.concurrent.LinkedBlockingQueue}
-     * 把回调转换为阻塞取用；条件命中或超时后自动注销监听器，不会造成监听器泄漏。</p>
-     *
-     * @param condition     消息匹配条件
-     * @param timeoutMillis 超时时间
-     * @return 命中的消息；超时返回 null
+     * @param condition 消息筛选条件
+     * @param timeoutMillis 最长等待时间，单位毫秒
+     * @return 第一条满足条件的消息，超时或中断时返回 null
      */
     public Message waitForMessage(Predicate<Message> condition, long timeoutMillis) {
         java.util.concurrent.LinkedBlockingQueue<Message> queue = new java.util.concurrent.LinkedBlockingQueue<>();
         ChatListener waiter = new ChatListener() {
-            /**
-             * 命中条件时把消息放入队列。
-             *
-             * @param message 消息
-             */
             @Override
             public void onMessage(Message message) {
                 if (condition.test(message)) {
@@ -2142,15 +1624,8 @@ public class ChatClient {
                 }
             }
 
-            /**
-             * 连接状态回调，本等待器不需要处理。
-             *
-             * @param connected 是否连接
-             * @param reason    原因
-             */
             @Override
             public void onConnectionChanged(boolean connected, String reason) {
-                // 等待器只关心消息
             }
         };
         addListener(waiter);
@@ -2164,20 +1639,10 @@ public class ChatClient {
         }
     }
 
-    /**
-     * 获取最近一次登录失败原因。
-     *
-     * @return 失败原因；登录成功或尚未登录时为空字符串
-     */
     public String getLastLoginFailure() {
         return lastLoginFailure;
     }
 
-    /**
-     * 输出客户端状态摘要。
-     *
-     * @return 形如 {@code ChatClient{user=alice, connected=true}} 的字符串
-     */
     @Override
     public String toString() {
         return "ChatClient{user=" + username + ", connected=" + connected + "}";

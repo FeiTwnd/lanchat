@@ -13,31 +13,19 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * 群聊面板：接收群聊文本与系统通知，并支持把文件群发给所有在线用户。
- *
- * <p>继承 {@link BaseChatPanel} 复用渲染逻辑，本类只负责群聊特有的过滤条件
- * （接收者为空的群聊消息与系统通知）与发送目标（广播）。</p>
- *
- * <p>群发文件的接收方列表由外部注入（{@link Supplier}）而不是本类自己去查：
- * 在线名单属于主窗口的界面状态，面板只需要"点下去的那一刻有哪些人在线"这一份数据，
- * 注入比反向依赖主窗口或 JTree 更简单，也让面板可以脱离主窗口单独实例化。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 群聊消息面板，负责发送群消息、群发文件以及接收并展示群聊消息。
  */
 public class GroupChatPanel extends BaseChatPanel {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250117L;
 
-    /** 在线用户名提供者，取值为当前在线用户的用户名列表 */
+    /** 当前在线用户名列表的来源。 */
     private final transient Supplier<List<String>> onlineUsers;
 
     /**
-     * 构造群聊面板。
+     * 创建群聊面板。
      *
-     * @param client      客户端
-     * @param onlineUsers 在线用户名提供者，用于群发文件
+     * @param client 已登录的客户端
+     * @param onlineUsers 在线用户名列表的来源
      */
     public GroupChatPanel(ChatClient client, Supplier<List<String>> onlineUsers) {
         super(client);
@@ -45,17 +33,14 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 发送群聊消息。
+     * 发送一条群聊文本，成功后在消息区回显。
      *
-     * <p>必须取带标识的返回值而不是只看发送成功与否：本地回显的正文与时刻都由面板自己产生，
-     * 标识却由发送通道分配，不取回来的话，自己发的这一条在界面上永远没有标识，
-     * 也就装不出右键菜单——私聊那边同样的问题即缺陷 D-19，此处是群聊侧的同一根因。</p>
-     *
-     * @param content 正文
-     * @return 发送成功返回 true
+     * @param content 消息正文
+     * @return 是否发送成功
      */
     @Override
     protected boolean doSend(String content) {
+        // 发送群消息并取回服务端分配的消息编号
         String messageId = client.sendGroupTextReturningId(content, null, null);
         if (messageId != null) {
             appendMessage("我", content, COLOR_SELF, messageId);
@@ -66,13 +51,9 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 群聊里"能发文件"等价于"除自己外还有人在线"。
+     * 判断除自己之外是否还有在线用户。
      *
-     * <p>覆写为按在线名单实时判断而不是用主窗口写入的状态：群聊的接收方集合会随着
-     * 任何人上下线而变，名单是唯一权威来源，而状态是主窗口刷新的快照。
-     * 两者本来同源，实时判断只是让"点下去的那一刻"与判断结果一致。</p>
-     *
-     * @return 有其他在线用户返回 true
+     * @return 存在其他在线用户时返回 true
      */
     @Override
     protected boolean hasSendTarget() {
@@ -80,20 +61,17 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 群发文件：向当前在线且不是自己的每个用户各发起一次独立的文件传输。
+     * 向所有其他在线用户发起文件传输。
      *
-     * <p>本项目没有"群"实体，群聊本身就是全员广播，因此群文件的语义就是逐个发给每个在线用户：
-     * 每个接收方各自确认、各自显示进度，一个人拒收不影响其他人。</p>
-     *
-     * @param file 待发送文件
+     * @param file 待发送的文件
      */
     @Override
     protected void sendFileTo(File file) {
+        // 收集除自己之外的在线用户
         List<String> targets = onlineUsers.get().stream()
                 .filter(name -> !name.equals(client.getUsername()))
                 .toList();
-        // 兜底：打开选择框前的预检已经拦过一次，但文件也可以从主窗口直接拖进来，
-        // 那条路径不经过任何按钮，这里是它唯一的判断点
+
         if (targets.isEmpty()) {
             appendLine("[系统] " + noTargetReason(), COLOR_ERROR);
             return;
@@ -102,6 +80,7 @@ public class GroupChatPanel extends BaseChatPanel {
                 + targets.size() + " 位用户：\n" + String.join("、", targets) + "\n\n是否继续？")) {
             return;
         }
+        // 逐个用户打开传输窗口并直接发送
         for (String target : targets) {
             FileTransferUI window = FileTransferUI.windowFor(client, target);
             window.setVisible(true);
@@ -112,11 +91,9 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * @ 补全候选：当前在线的其他用户。
+     * 返回可以 @ 提及的在线用户名列表。
      *
-     * <p>排除自己：给自己 @ 提醒没有意义，留在候选里只会增加误选概率。</p>
-     *
-     * @return 在线用户名列表
+     * @return 除自己以外的非空用户名
      */
     @Override
     protected List<String> mentionCandidates() {
@@ -126,30 +103,18 @@ public class GroupChatPanel extends BaseChatPanel {
                 .toList();
     }
 
-    /**
-     * 群聊支持引用发送。
-     *
-     * @return 固定返回 true
-     */
     @Override
     protected boolean isQuoteSupported() {
         return true;
     }
 
     /**
-     * 发送带引用的群聊消息。
+     * 发送带引用信息的群聊消息。
      *
-     * <p>群聊本来就不做发送确认（见 {@code ChatClient.sendGroupText}），
-     * 因此这里直接用带引用参数的文本消息走同一条广播通道，不需要绕开任何重发机制。</p>
-     *
-     * <p>标识的分配与取回都交给客户端：发送通道是"这条消息最终用哪个标识发出去"的唯一权威点，
-     * 面板自己造一个标识再交给通道，等于把同一件事写两份；取回来的标识还要用于本地回显，
-     * 否则自己发的引用消息同样没有右键菜单。</p>
-     *
-     * @param content      正文
-     * @param quoteId      被引用消息的稳定标识
+     * @param content 消息正文
+     * @param quoteId 被引用消息的编号
      * @param quoteSummary 被引用消息的摘要
-     * @return 发送成功返回 true
+     * @return 是否发送成功
      */
     @Override
     protected boolean sendQuoted(String content, String quoteId, String quoteSummary) {
@@ -163,8 +128,6 @@ public class GroupChatPanel extends BaseChatPanel {
         String quoteSender = getPendingQuoteSender();
         String messageId = client.sendGroupTextReturningId(content, quoteId, quoteSummary, quoteSender);
         if (messageId != null) {
-            // 本地回显同样要带上引用块与头像归属：引用是自己写这条消息时的上下文，
-            // 发送方看不到它，就会以为引用压根没有发出去
             appendMessage("我", content, COLOR_SELF, messageId, quoteSummary, quoteSender,
                     client.getUsername());
         } else {
@@ -174,14 +137,11 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 判断正文是否 @ 了指定用户。
+     * 判断文本中是否 @ 了指定用户名，用户名之后不能紧跟名称字符。
      *
-     * <p>纯函数。必须要求名字后面是边界：否则 {@code @alice} 会在 {@code @alice2} 中被误判成提醒，
-     * 把提示音发给一个根本没被点名的人。</p>
-     *
-     * @param username 被判断的用户名
-     * @param content  消息正文
-     * @return 被提及返回 true
+     * @param username 用户名
+     * @param content 消息正文
+     * @return 命中提及时返回 true
      */
     static boolean mentions(String username, String content) {
         if (username == null || username.isEmpty() || content == null) {
@@ -202,31 +162,20 @@ public class GroupChatPanel extends BaseChatPanel {
         }
     }
 
-    /**
-     * 判断字符是否可作为用户名的一部分。
-     *
-     * @param value 字符
-     * @return 是字母、数字或下划线返回 true
-     */
     private static boolean isNameChar(char value) {
         return Character.isLetterOrDigit(value) || value == '_';
     }
 
-    /**
-     * 获取聊天对象名称。
-     *
-     * @return 固定返回“群聊”
-     */
     @Override
     public String getChatTarget() {
         return "群聊";
     }
 
     /**
-     * 接收群聊消息与系统通知。
+     * 判断消息是否属于群聊面板。
      *
-     * @param message 消息
-     * @return 应显示返回 true
+     * @param message 待判断的消息
+     * @return 群聊文本、系统消息或错误消息返回 true
      */
     @Override
     public boolean accepts(Message message) {
@@ -237,9 +186,9 @@ public class GroupChatPanel extends BaseChatPanel {
     }
 
     /**
-     * 群聊消息按发送者着色，系统通知使用灰色、错误使用红色。
+     * 处理服务端推送的群聊、系统与错误消息。
      *
-     * @param message 消息
+     * @param message 收到的消息
      */
     @Override
     public void onMessage(Message message) {
@@ -249,14 +198,13 @@ public class GroupChatPanel extends BaseChatPanel {
         if (message.getType() == MessageType.TEXT_GROUP && message instanceof TextMessage) {
             String sender = message.getSender();
             if (sender != null && sender.equals(client.getUsername())) {
-                // 自己在发送时已经本地回显（见 doSend），而服务器会把群聊广播回发送者，
-                // 这里忽略自己的回显，否则同一条消息会显示两遍
+                // 跳过自己发出的群聊消息
                 return;
             }
             String content = ((TextMessage) message).getContent();
             boolean mention = mentions(client.getUsername(), content);
             if (mention) {
-                // 被点名的消息用系统提示音提醒：不引入音频素材，只用标准库的蜂鸣
+                // 被 @ 时发出提示音
                 Toolkit.getDefaultToolkit().beep();
             }
             appendIncoming(sender, content, COLOR_OTHER, message, mention);

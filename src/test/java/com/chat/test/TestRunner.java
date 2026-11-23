@@ -11,48 +11,24 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * 轻量测试运行器。
- *
- * <p>职责：反射扫描测试类中标注了 {@link Test} 的方法并逐一执行，
- * 统计通过/失败数量，输出形如测试报告的汇总结果，失败时以非零退出码结束
- * 以便被脚本判断。</p>
- *
- * <p>为什么自研而不引入 JUnit：见 {@link Test} 的说明；自研运行器同时让
- * “测试用例表”的生成变得直接——运行输出即是测试报告的数据来源。</p>
- *
- * <p>计数口径：执行 = 通过 + 跳过 + 失败。跳过用于"环境不满足"（例如本机没有可用的
- * MySQL），与失败区分开，避免环境问题被误读成代码缺陷。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 反射执行带 Test 注解的方法，统计通过、跳过与失败，并提供断言与临时目录工具。
  */
 public final class TestRunner {
-
-    /** 已执行用例数 */
     private static int executed;
 
-    /** 通过用例数 */
     private static int passed;
 
-    /** 跳过用例数：环境不满足（例如数据库不可用）时用于如实统计 */
     private static int skipped;
 
-    /** 失败用例列表 */
     private static final List<String> failures = new ArrayList<>();
 
-    /** 临时目录前缀 */
     private static final String TEMP_PREFIX = "lanchat-test-";
 
-    /** 私有构造，禁止实例化 */
     private TestRunner() {
     }
 
     /**
-     * 跳过当前用例。
-     *
-     * <p>用于"环境不满足"而非"代码有问题"的场景：本项目的存储只保留数据库，
-     * 单元测试与集成测试都需要 MySQL，未安装或未启动时应当报告跳过，
-     * 而不是把 20 多个用例全部判为失败。</p>
+     * 抛出跳过标记，结束当前用例。
      *
      * @param reason 跳过原因
      */
@@ -61,27 +37,20 @@ public final class TestRunner {
     }
 
     /**
-     * 用例被跳过的信号。
+     * 用于中断当前用例并标记为跳过。
      */
     public static final class SkippedCaseException extends RuntimeException {
-
-        /** 序列化版本号 */
         private static final long serialVersionUID = 20260919L;
 
-        /**
-         * 构造跳过信号。
-         *
-         * @param reason 跳过原因
-         */
         SkippedCaseException(String reason) {
             super(reason);
         }
     }
 
     /**
-     * 主入口：执行全部测试类。
+     * 执行指定测试类，未指定时运行内置的单元测试清单。
      *
-     * @param args 可选的测试类全限定名；不传则执行全部内置测试
+     * @param args 测试类全限定名列表
      */
     public static void main(String[] args) {
         List<Class<?>> targets = new ArrayList<>();
@@ -110,7 +79,7 @@ public final class TestRunner {
     }
 
     /**
-     * 执行单个测试类。
+     * 执行一个测试类中的全部测试方法。
      *
      * @param testClass 测试类
      */
@@ -126,12 +95,6 @@ public final class TestRunner {
         }
     }
 
-    /**
-     * 收集测试类中标注了 {@link Test} 的方法，按方法名字典序排列以保证输出稳定。
-     *
-     * @param testClass 测试类
-     * @return 测试方法列表
-     */
     private static List<Method> collectTestMethods(Class<?> testClass) {
         List<Method> methods = new ArrayList<>();
         for (Method method : testClass.getDeclaredMethods()) {
@@ -143,12 +106,7 @@ public final class TestRunner {
         return methods;
     }
 
-    /**
-     * 执行单个测试方法。
-     *
-     * @param testClass 测试类
-     * @param method    测试方法
-     */
+    /** 调用单个测试方法并归类执行结果。 */
     private static void execute(Class<?> testClass, Method method) {
         Test annotation = method.getAnnotation(Test.class);
         String title = annotation.value();
@@ -178,9 +136,6 @@ public final class TestRunner {
         }
     }
 
-    /**
-     * 输出测试汇总。
-     */
     private static void printSummary() {
         System.out.println("\n========== 测试汇总 ==========");
         System.out.println("执行用例: " + executed);
@@ -201,20 +156,20 @@ public final class TestRunner {
     }
 
     /**
-     * 创建测试专用临时目录。
+     * 创建带指定名称片段的临时目录。
      *
-     * @param name 目录名后缀
+     * @param name 名称片段
      * @return 临时目录路径
-     * @throws IOException 创建失败时抛出
+     * @throws IOException 创建失败
      */
     public static Path createTempDir(String name) throws IOException {
         return Files.createTempDirectory(TEMP_PREFIX + name + "-");
     }
 
     /**
-     * 递归删除测试产生的临时目录。
+     * 递归删除目录及其内容，路径不存在时直接返回。
      *
-     * @param path 目录路径
+     * @param path 待删除路径
      */
     public static void deleteRecursively(Path path) {
         if (path == null || !Files.exists(path)) {
@@ -230,8 +185,8 @@ public final class TestRunner {
     /**
      * 断言条件为真。
      *
-     * @param condition 条件
-     * @param message   失败提示
+     * @param condition 待检查条件
+     * @param message 失败提示
      */
     public static void assertTrue(boolean condition, String message) {
         if (!condition) {
@@ -242,17 +197,17 @@ public final class TestRunner {
     /**
      * 断言条件为假。
      *
-     * @param condition 条件
-     * @param message   失败提示
+     * @param condition 待检查条件
+     * @param message 失败提示
      */
     public static void assertFalse(boolean condition, String message) {
         assertTrue(!condition, message);
     }
 
     /**
-     * 断言对象不为空。
+     * 断言对象不为 null。
      *
-     * @param value   待检查对象
+     * @param value 待检查对象
      * @param message 失败提示
      */
     public static void assertNotNull(Object value, String message) {
@@ -260,9 +215,9 @@ public final class TestRunner {
     }
 
     /**
-     * 断言对象为空。
+     * 断言对象为 null。
      *
-     * @param value   待检查对象
+     * @param value 待检查对象
      * @param message 失败提示
      */
     public static void assertNull(Object value, String message) {
@@ -273,8 +228,8 @@ public final class TestRunner {
      * 断言两个对象相等。
      *
      * @param expected 期望值
-     * @param actual   实际值
-     * @param message  失败提示
+     * @param actual 实际值
+     * @param message 失败提示
      */
     public static void assertEquals(Object expected, Object actual, String message) {
         boolean equal = expected == null ? actual == null : expected.equals(actual);
@@ -286,9 +241,9 @@ public final class TestRunner {
     /**
      * 断言两个对象不相等。
      *
-     * @param unexpected 不期望的值
-     * @param actual     实际值
-     * @param message    失败提示
+     * @param unexpected 不应出现的值
+     * @param actual 实际值
+     * @param message 失败提示
      */
     public static void assertNotEquals(Object unexpected, Object actual, String message) {
         boolean equal = unexpected == null ? actual == null : unexpected.equals(actual);
@@ -298,11 +253,11 @@ public final class TestRunner {
     }
 
     /**
-     * 断言字节数组内容一致，失败时输出长度差异便于定位。
+     * 断言两个字节数组长度与内容一致。
      *
-     * @param expected 期望字节
-     * @param actual   实际字节
-     * @param message  失败提示
+     * @param expected 期望数组
+     * @param actual 实际数组
+     * @param message 失败提示
      */
     public static void assertArrayEquals(byte[] expected, byte[] actual, String message) {
         assertNotNull(actual, message + "：实际值为 null");

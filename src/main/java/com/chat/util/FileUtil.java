@@ -17,34 +17,22 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 文件工具类。
- *
- * <p>职责：封装目录创建、大小格式化、SHA-256 计算、重名文件规避等重复性文件操作，
- * 让业务层只关注“传什么文件”，而不是“怎么开流、怎么关流”。</p>
- *
- * <p>资源管理：所有涉及流的方法一律使用 try-with-resources（或由调用方负责），
- * 满足课程对“资源必须关闭”的要求。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 文件与路径操作工具，提供目录创建、容量格式化、摘要计算和分块辅助方法。
  */
 public final class FileUtil {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".FileUtil");
 
-    /** 大小单位进位基数 */
+    /** 容量换算基数，1 KB 等于 1024 字节。 */
     private static final long UNIT_BASE = 1024L;
 
-    /** 私有构造，禁止实例化工具类 */
     private FileUtil() {
     }
 
     /**
-     * 确保目录存在，不存在则递归创建。
+     * 创建目录，已存在时直接返回。
      *
      * @param dir 目录路径
-     * @return 目录对应的 {@link File} 对象
+     * @return 目录对应的文件对象
      * @throws IOException 创建失败时抛出
      */
     public static File ensureDir(String dir) throws IOException {
@@ -54,10 +42,10 @@ public final class FileUtil {
     }
 
     /**
-     * 把字节数转换为人类可读的大小文本。
+     * 把字节数格式化为带单位的可读文本。
      *
      * @param bytes 字节数
-     * @return 形如 {@code 1.20 MB} 的字符串；负数返回 {@code 0 B}
+     * @return 形如 12 B 或 1.50 MB 的文本
      */
     public static String humanSize(long bytes) {
         if (bytes < 0) {
@@ -77,14 +65,11 @@ public final class FileUtil {
     }
 
     /**
-     * 计算文件的 SHA-256 校验和。
+     * 计算文件的 SHA-256 摘要。
      *
-     * <p>采用流式摘要（{@link DigestInputStream}），避免把整个大文件读入内存。</p>
-     *
-     * @param file 目标文件
-     * @return 十六进制小写校验和
-     * @throws IOException 读取失败时抛出
-     * @throws IllegalArgumentException 当 file 为 null 或不存在时抛出
+     * @param file 待计算的文件
+     * @return 十六进制摘要文本
+     * @throws IOException 文件不存在或读取失败时抛出
      */
     public static String sha256(File file) throws IOException {
         if (file == null || !file.isFile()) {
@@ -94,9 +79,9 @@ public final class FileUtil {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             try (InputStream in = Files.newInputStream(file.toPath());
                  DigestInputStream digestIn = new DigestInputStream(in, digest)) {
+                // 分块读入以更新摘要
                 byte[] buffer = new byte[Constants.FILE_CHUNK_SIZE];
                 while (digestIn.read(buffer) != -1) {
-                    // 读取过程即为摘要计算过程，此处无需额外处理
                 }
             }
             return HexFormat.of().formatHex(digest.digest());
@@ -106,25 +91,22 @@ public final class FileUtil {
     }
 
     /**
-     * 计算分块序号对应的字节偏移量。
+     * 计算分块在文件中的起始偏移。
      *
-     * @param chunkIndex 分块序号（从 0 开始）
-     * @param chunkSize  分块大小
-     * @return 文件中的起始偏移字节数
+     * @param chunkIndex 分块序号，从 0 开始
+     * @param chunkSize 每块字节数
+     * @return 起始字节偏移
      */
     public static long offsetOf(int chunkIndex, int chunkSize) {
         return (long) chunkIndex * chunkSize;
     }
 
     /**
-     * 根据文件大小计算分块总数。
+     * 计算文件需要划分的块数。
      *
-     * <p>空文件也视为 1 块，保证接收端至少收到一个结束信号，
-     * 否则长度为 0 的文件会永远等不到 FILE_END 之外的分块。</p>
-     *
-     * @param fileSize  文件字节数
-     * @param chunkSize 分块大小
-     * @return 分块总数
+     * @param fileSize 文件字节数
+     * @param chunkSize 每块字节数
+     * @return 分块总数，空文件按 1 块计
      */
     public static int chunkCount(long fileSize, int chunkSize) {
         if (chunkSize <= 0) {
@@ -137,13 +119,11 @@ public final class FileUtil {
     }
 
     /**
-     * 规避重名：若目标文件已存在，则追加 (1)、(2) 等序号。
+     * 在目录下生成不重名的目标文件，同名时追加序号。
      *
-     * <p>避免接收文件时静默覆盖用户已有文件，属于典型的数据安全考量。</p>
-     *
-     * @param dir      目标目录路径
+     * @param dir 目标目录
      * @param fileName 原始文件名
-     * @return 可安全写入的文件对象
+     * @return 可用的目标文件
      */
     public static File uniqueTarget(String dir, String fileName) {
         String safeName = sanitizeFileName(fileName);
@@ -158,6 +138,7 @@ public final class FileUtil {
             base = safeName.substring(0, dot);
             suffix = safeName.substring(dot);
         }
+        // 同名文件存在时按 (n) 递增序号
         for (int index = 1; index < Integer.MAX_VALUE; index++) {
             File candidate = new File(dir, base + "(" + index + ")" + suffix);
             if (!candidate.exists()) {
@@ -168,12 +149,10 @@ public final class FileUtil {
     }
 
     /**
-     * 清洗文件名，剔除路径分隔符与 Windows 非法字符。
-     *
-     * <p>防止对端构造 {@code ../../etc/passwd} 这类文件名造成目录穿越写入。</p>
+     * 清理文件名中的路径和非法字符。
      *
      * @param fileName 原始文件名
-     * @return 安全的纯文件名
+     * @return 可安全落盘的文件名
      */
     public static String sanitizeFileName(String fileName) {
         if (fileName == null || fileName.trim().isEmpty()) {
@@ -184,6 +163,7 @@ public final class FileUtil {
         if (slash >= 0) {
             name = name.substring(slash + 1);
         }
+        // 去掉路径部分并替换常见非法字符
         name = name.replaceAll("[\\\\/:*?\"<>|]", "_");
         if (name.isEmpty() || ".".equals(name) || "..".equals(name)) {
             return "unnamed";
@@ -192,12 +172,12 @@ public final class FileUtil {
     }
 
     /**
-     * 复制输入流到输出流，用于文件落盘。
+     * 把输入流完整复制到输出流。
      *
-     * @param in  输入流
+     * @param in 输入流
      * @param out 输出流
-     * @return 实际复制的字节数
-     * @throws IOException 读写失败时抛出
+     * @return 复制的字节数
+     * @throws IOException 读取或写入失败时抛出
      */
     public static long copy(InputStream in, OutputStream out) throws IOException {
         byte[] buffer = new byte[Constants.FILE_CHUNK_SIZE];
@@ -212,12 +192,10 @@ public final class FileUtil {
     }
 
     /**
-     * 删除文件，失败时仅记录日志不抛异常。
-     *
-     * <p>用于清理传输失败产生的残缺文件，此时“删除失败”不应再中断主流程。</p>
+     * 删除文件，失败时只记录日志。
      *
      * @param file 待删除文件
-     * @return 删除成功或文件本就不存在时返回 true
+     * @return 文件不存在或删除成功返回 true
      */
     public static boolean deleteQuietly(File file) {
         if (file == null || !file.exists()) {
@@ -232,10 +210,10 @@ public final class FileUtil {
     }
 
     /**
-     * 获取文件扩展名（小写，不含点）。
+     * 取文件名的扩展名。
      *
      * @param fileName 文件名
-     * @return 扩展名；无扩展名时返回空字符串
+     * @return 小写扩展名，没有扩展名时返回空串
      */
     public static String extensionOf(String fileName) {
         if (fileName == null) {

@@ -8,45 +8,23 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 配置加载类。
- *
- * <p>职责：从 {@code config/chat.properties} 读取运行期配置（端口、路径、线程池参数等），
- * 并覆盖 {@link Constants} 中定义的默认值。普通配置缺失或读取失败时静默回退到默认值，
- * 保证程序在任何环境下都能启动；而加密口令这类安全关键项刻意不设默认值，
- * 缺失时由调用方（{@link com.chat.util.MessageCipher}、服务器启动自检）明确拒绝，
- * 不让“忘记配置”悄悄退化成使用公开的弱密钥。</p>
- *
- * <p>设计说明：使用静态初始化 + 不可变 {@link Properties} 快照，读多写少，
- * 无需加锁；刻意不引入任何配置框架，符合“不用现成框架”的题目约束。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 读取 config/chat.properties 中的配置项，部分配置项支持系统属性覆盖。
  */
 public final class Config {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".Config");
 
-    /** 配置项内存快照 */
     private static final Properties PROPERTIES = new Properties();
 
-    /** 配置文件是否成功加载 */
+    /** 配置文件是否读取成功 */
     private static boolean loaded;
 
     static {
         load();
     }
 
-    /** 私有构造，禁止实例化工具类 */
     private Config() {
     }
 
-    /**
-     * 加载配置文件。
-     *
-     * <p>使用 try-with-resources 保证输入流关闭；文件不存在时记录警告并继续使用默认值，
-     * 而不是抛出异常中断启动流程。</p>
-     */
     private static void load() {
         try (InputStream in = new FileInputStream(Constants.CONFIG_FILE)) {
             PROPERTIES.load(in);
@@ -59,20 +37,20 @@ public final class Config {
     }
 
     /**
-     * 判断配置文件是否成功加载。
+     * 返回配置文件是否读取成功。
      *
-     * @return 加载成功返回 true
+     * @return 读取成功时返回 true
      */
     public static boolean isLoaded() {
         return loaded;
     }
 
     /**
-     * 读取字符串配置。
+     * 读取字符串配置项。
      *
-     * @param key          配置键
-     * @param defaultValue 缺省值
-     * @return 配置值；不存在时返回 defaultValue
+     * @param key 配置键
+     * @param defaultValue 默认值
+     * @return 配置值，缺失或为空时返回默认值
      */
     public static String get(String key, String defaultValue) {
         String value = PROPERTIES.getProperty(key);
@@ -83,13 +61,11 @@ public final class Config {
     }
 
     /**
-     * 读取整型配置。
+     * 读取整数配置项。
      *
-     * <p>数值非法时回退默认值并记录警告，避免因配置笔误导致程序无法启动。</p>
-     *
-     * @param key          配置键
-     * @param defaultValue 缺省值
-     * @return 配置数值；解析失败时返回 defaultValue
+     * @param key 配置键
+     * @param defaultValue 默认值
+     * @return 配置值，缺失或格式非法时返回默认值
      */
     public static int getInt(String key, int defaultValue) {
         String value = PROPERTIES.getProperty(key);
@@ -105,11 +81,11 @@ public final class Config {
     }
 
     /**
-     * 读取长整型配置。
+     * 读取长整数配置项。
      *
-     * @param key          配置键
-     * @param defaultValue 缺省值
-     * @return 配置数值；解析失败时返回 defaultValue
+     * @param key 配置键
+     * @param defaultValue 默认值
+     * @return 配置值，缺失或格式非法时返回默认值
      */
     public static long getLong(String key, long defaultValue) {
         String value = PROPERTIES.getProperty(key);
@@ -125,11 +101,11 @@ public final class Config {
     }
 
     /**
-     * 读取布尔配置。
+     * 读取布尔配置项。
      *
-     * @param key          配置键
-     * @param defaultValue 缺省值
-     * @return 仅当值为 "true"（忽略大小写）时返回 true，否则返回 defaultValue
+     * @param key 配置键
+     * @param defaultValue 默认值
+     * @return 配置值，缺失时返回默认值
      */
     public static boolean getBoolean(String key, boolean defaultValue) {
         String value = PROPERTIES.getProperty(key);
@@ -140,13 +116,9 @@ public final class Config {
     }
 
     /**
-     * 获取数据根目录。
+     * 返回数据目录，系统属性 lanchat.data.dir 优先。
      *
-     * <p>取值优先级：系统属性 {@code lanchat.data.dir} > 配置文件 {@code data.dir} > 内置默认值。
-     * 系统属性优先级最高，是为了让自动化测试能够把数据隔离到临时目录，
-     * 从而避免测试污染开发者的真实数据。</p>
-     *
-     * @return 数据根目录路径
+     * @return 数据目录路径
      */
     public static String dataDir() {
         String fromProperty = System.getProperty("lanchat.data.dir");
@@ -157,18 +129,16 @@ public final class Config {
     }
 
     /**
-     * 获取聊天记录导出目录。
+     * 返回导出目录。
      *
-     * @return 导出目录路径
+     * @return 数据目录下的 export 子目录路径
      */
     public static String exportDir() {
         return dataDir() + java.io.File.separator + "export";
     }
 
     /**
-     * 获取数据库驱动类名。
-     *
-     * <p>取值优先级：系统属性 {@code lanchat.db.driver} > 配置文件 {@code db.driver}。</p>
+     * 返回数据库驱动类名。
      *
      * @return 驱动类名
      */
@@ -177,106 +147,69 @@ public final class Config {
     }
 
     /**
-     * 获取数据库连接地址。
+     * 返回数据库连接地址。
      *
-     * <p>取值优先级：系统属性 {@code lanchat.db.url} > 配置文件 {@code db.url}。
-     * 提供系统属性覆盖是为了让自动化测试与演示使用独立的库，
-     * 避免测试数据写进开发者的真实数据库。</p>
-     *
-     * @return JDBC 连接地址
+     * @return 连接地址
      */
     public static String dbUrl() {
         return override("lanchat.db.url", get("db.url", Constants.DB_URL));
     }
 
     /**
-     * 获取数据库用户名。
+     * 返回数据库用户名。
      *
-     * @return 数据库用户名
+     * @return 用户名
      */
     public static String dbUser() {
         return override("lanchat.db.user", get("db.username", Constants.DB_USER));
     }
 
     /**
-     * 获取数据库密码。
+     * 返回数据库密码。
      *
-     * @return 数据库密码；未配置时为空字符串
+     * @return 密码，未配置时为空串
      */
     public static String dbPassword() {
         return override("lanchat.db.password", get("db.password", ""));
     }
 
     /**
-     * 获取聊天记录加密口令。
+     * 返回消息加密密钥。
      *
-     * <p>取值优先级：系统属性 {@code lanchat.crypto.secret} > 配置文件 {@code security.message.secret}。
-     * 该口令用于派生 AES 密钥，所有读写同一数据库的进程（服务器与客户端导出的场景）
-     * 必须使用同一口令，否则查出来的记录会显示为无法解密。</p>
-     *
-     * <p>刻意不提供内置默认口令：默认口令意味着“忘记配置”会静默退化为使用一个公开的弱密钥，
-     * 密文形同明文。未配置时返回空串，由 {@link com.chat.util.MessageCipher} 与服务器启动
-     * 自检明确拒绝，让问题在启动阶段暴露而不是在数据落库之后。</p>
-     *
-     * @return 加密口令；未配置时返回空字符串
+     * @return 密钥，未配置时为空串
      */
     public static String messageSecret() {
         return override("lanchat.crypto.secret", get("security.message.secret", ""));
     }
 
     /**
-     * 获取智能体小助手要执行的工作流编号（workflow_id）。
+     * 返回 AI 工作流编号。
      *
-     * <p>取值位置是工作流编排页地址栏 {@code workflow_id=} 之后的那串数字。</p>
-     *
-     * <p>为兼容接入工作流之前的旧配置，{@code ai.workflow.id} 未配置时会回退到
-     * {@code ai.bot.id}；系统属性同理，优先 {@code lanchat.ai.workflow.id}，
-     * 其次 {@code lanchat.ai.bot.id}。</p>
-     *
-     * @return 工作流编号；未配置时返回空字符串
+     * @return 工作流编号，未配置时为空串
      */
     public static String aiWorkflowId() {
-        String fromFile = get("ai.workflow.id", get("ai.bot.id", ""));
-        String value = override("lanchat.ai.workflow.id", fromFile);
-        if (value.isEmpty()) {
-            value = override("lanchat.ai.bot.id", "");
-        }
-        return value;
+        return override("lanchat.ai.workflow.id", get("ai.workflow.id", ""));
     }
 
     /**
-     * 获取智能体接口地址。
+     * 返回 AI 接口地址。
      *
-     * <p>取值优先级：系统属性 {@code lanchat.ai.url} > 配置文件 {@code ai.api.url}。
-     * 提供覆盖是为了让自动化测试能把请求打到本地桩上，从而不必真的出网。</p>
-     *
-     * @return 接口地址，默认 {@link Constants#AI_API_URL}
+     * @return 接口地址
      */
     public static String aiApiUrl() {
         return override("lanchat.ai.url", get("ai.api.url", Constants.AI_API_URL));
     }
 
     /**
-     * 获取智能体平台的个人访问令牌。
+     * 返回 AI 接口访问令牌。
      *
-     * <p>取值优先级：系统属性 {@code lanchat.ai.token} > 配置文件 {@code ai.api.token}。
-     * 提供系统属性覆盖与数据库口令同理——演示或排查时可以完全不把令牌落到磁盘上。</p>
-     *
-     * <p>该令牌等同于密码：只用于请求头，不得写进日志、异常信息或任何回执正文。</p>
-     *
-     * @return 访问令牌；未配置时返回空字符串（此时小助手不启用）
+     * @return 访问令牌，未配置时为空串
      */
     public static String aiApiToken() {
         return override("lanchat.ai.token", get("ai.api.token", ""));
     }
 
-    /**
-     * 读取系统属性覆盖值。
-     *
-     * @param property      系统属性名
-     * @param fromFileValue 配置文件中的取值
-     * @return 系统属性存在且非空时优先返回，否则返回配置文件取值
-     */
+    /** 系统属性非空时优先于配置文件值。 */
     private static String override(String property, String fromFileValue) {
         String value = System.getProperty(property);
         if (value != null && !value.trim().isEmpty()) {
@@ -286,66 +219,65 @@ public final class Config {
     }
 
     /**
-     * 获取客户端心跳发送间隔。
+     * 返回心跳发送间隔。
      *
-     * @return 毫秒数，默认 {@link Constants#HEARTBEAT_INTERVAL_MS}
+     * @return 间隔毫秒数
      */
     public static long heartbeatIntervalMs() {
         return getLong("heartbeat.interval.ms", Constants.HEARTBEAT_INTERVAL_MS);
     }
 
     /**
-     * 获取服务器判定连接掉线的心跳超时阈值。
+     * 返回心跳超时时间。
      *
-     * @return 毫秒数，默认 {@link Constants#HEARTBEAT_TIMEOUT_MS}
+     * @return 超时毫秒数
      */
     public static long heartbeatTimeoutMs() {
         return getLong("heartbeat.timeout.ms", Constants.HEARTBEAT_TIMEOUT_MS);
     }
 
     /**
-     * 获取单文件大小上限。
+     * 返回单个文件大小上限。
      *
-     * @return 字节数，默认 {@link Constants#MAX_FILE_SIZE}
+     * @return 上限字节数
      */
     public static long maxFileSize() {
         return getLong("file.max.size", Constants.MAX_FILE_SIZE);
     }
 
     /**
-     * 获取允许的最大并发连接数。
+     * 返回服务端最大连接数。
      *
-     * @return 连接数，默认 {@link Constants#MAX_CONNECTIONS}
+     * @return 最大连接数
      */
     public static int maxConnections() {
         return getInt("server.max.connections", Constants.MAX_CONNECTIONS);
     }
 
     /**
-     * 获取服务器端口。
+     * 返回服务端监听端口。
      *
-     * @return 实际生效的 TCP 端口
+     * @return 端口号
      */
     public static int serverPort() {
         return getInt("server.port", Constants.DEFAULT_SERVER_PORT);
     }
 
     /**
-     * 获取发现服务端口。
+     * 返回局域网发现端口。
      *
-     * @return 实际生效的 UDP 端口
+     * @return 端口号
      */
     public static int discoveryPort() {
         return getInt("discovery.port", Constants.DISCOVERY_PORT);
     }
 
     /**
-     * 获取接收文件保存目录。
+     * 返回接收文件目录。
      *
-     * @return 保存目录绝对或相对路径
+     * @return 目录路径
      */
     public static String receivedDir() {
         return get("file.received.dir", Constants.RECEIVED_DIR);
     }
-
 }

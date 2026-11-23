@@ -35,103 +35,61 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 登录窗口。
- *
- * <p>职责：程序入口界面。提供服务器地址填写（或自动发现）、登录、注册等能力，
- * 登录成功后打开 {@link ClientUI} 主窗口。</p>
- *
- * <p>本窗口<b>不</b>提供修改密码：改密要求登录态，若在此实现就必须"短暂登录—改密—立刻断开"，
- * 期间账号会以在线的幽灵会话挂在服务端。第 4 轮改动把改密并入主窗口的
- * {@link SettingsUI}（登录后改密不掉线），此处不再保留入口。</p>
- *
- * <p>关键设计：</p>
- * <ul>
- *   <li>所有网络操作都在 {@link SwingWorker} 中执行，避免阻塞事件分发线程导致界面假死；</li>
- *   <li>登录结果通过 {@link ChatListener} 异步回调，用 {@link CountDownLatch} 与
- *       等待线程同步，兼顾“不卡界面”与“结果可判定”；</li>
- *   <li>自动发现使用 UDP 广播，失败时静默降级为手动填写。</li>
- * </ul>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 登录窗口，负责服务器地址与账号输入、连接登录、注册以及自动发现局域网服务器。
  */
 public class LoginUI extends BaseUI implements ChatListener {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250121L;
 
-    /** 服务器地址输入框 */
     private final JTextField hostField = new JTextField("127.0.0.1", 14);
 
-    /** 服务器端口输入框 */
     private final JTextField portField = new JTextField(String.valueOf(Config.serverPort()), 6);
 
-    /** 用户名输入框 */
     private final JTextField usernameField = new JTextField(14);
 
-    /** 密码输入框 */
     private final JPasswordField passwordField = new JPasswordField(14);
 
-    /** 昵称输入框（注册时可填） */
     private final JTextField nicknameField = new JTextField(14);
 
-    /** 状态标签 */
     private final JLabel statusLabel = new JLabel("请输入账号信息或点击“自动发现服务器”");
 
-    /** 登录按钮 */
     private final SkinButton loginButton = new SkinButton("登录", SkinButton.Kind.PRIMARY);
 
-    /** 注册按钮 */
     private final SkinButton registerButton = new SkinButton("注册新账号", SkinButton.Kind.NORMAL);
 
-    /** 发现按钮 */
     private final SkinButton discoverButton =
             new SkinButton("自动发现服务器", SkinButton.Kind.NORMAL);
 
-    /** 登录结果等待锁 */
+    /** 登录请求等待服务端回执的同步锁。 */
     private transient volatile CountDownLatch loginLatch;
 
-    /** 登录是否成功 */
     private transient volatile boolean loginSucceeded;
 
-    /** 登录失败原因 */
     private transient volatile String loginFailure = "";
 
-    /** 注册结果等待锁 */
+    /** 注册请求等待服务端回执的同步锁。 */
     private transient volatile CountDownLatch registerLatch;
 
-    /** 注册是否成功 */
     private transient volatile boolean registerSucceeded;
 
-    /** 注册结果说明 */
     private transient volatile String registerMessage = "";
 
-    /** 当前客户端实例 */
     private transient ChatClient client;
 
-    /**
-     * 会话所有权是否已交接给主窗口。
-     *
-     * <p>登录成功后连接由 {@link ClientUI} 接管，此时登录窗口的关闭动作只应释放窗口自身，
-     * 若仍然关闭连接会把刚建立的会话一并断开，导致主窗口一出现就提示连接已断开。</p>
-     */
+    /** 客户端已交给主窗口，关闭本窗口时不再断开连接。 */
     private transient boolean sessionHandedOver;
 
     /**
-     * 构造登录窗口。
+     * 创建使用默认服务器地址与端口的登录窗口。
      */
     public LoginUI() {
         this(null, 0);
     }
 
     /**
-     * 构造登录窗口并预填服务器地址。
+     * 创建登录窗口并预填服务器信息。
      *
-     * <p>退出登录后重新回到本窗口时会复用上次连接的服务器地址：在多机使用场景下，
-     * 服务器 IP 不固定为 127.0.0.1，每次都让使用者重新输入既繁琐又容易输错。</p>
-     *
-     * @param host 服务器地址，为 null 或空时使用默认值 127.0.0.1
-     * @param port 服务器端口，小于等于 0 时使用配置中的端口
+     * @param host 预填的服务器地址，为空时保持默认值
+     * @param port 预填的端口，小于等于 0 时使用配置默认值
      */
     public LoginUI(String host, int port) {
         super(Constants.APP_NAME + " " + Constants.APP_VERSION + " - 登录");
@@ -147,9 +105,6 @@ public class LoginUI extends BaseUI implements ChatListener {
         getRootPane().setDefaultButton(loginButton);
     }
 
-    /**
-     * 组装界面组件。
-     */
     private void initComponents() {
         JPanel form = new JPanel(new GridBagLayout());
         form.setBackground(Theme.CARD);
@@ -192,11 +147,6 @@ public class LoginUI extends BaseUI implements ChatListener {
         body().add(south, BorderLayout.SOUTH);
     }
 
-    /**
-     * 构建品牌头部：徽标、程序名与副标题。
-     *
-     * @return 面板
-     */
     private JPanel buildBrand() {
         JPanel brand = new JPanel(new BorderLayout(14, 0));
         brand.setBackground(Theme.PRIMARY);
@@ -218,15 +168,6 @@ public class LoginUI extends BaseUI implements ChatListener {
         return brand;
     }
 
-    /**
-     * 向表单追加一行“标签 + 输入框”。
-     *
-     * @param panel       表单面板
-     * @param constraints 布局约束
-     * @param row         行号
-     * @param label       标签文本
-     * @param field       输入组件
-     */
     private void addRow(JPanel panel, GridBagConstraints constraints, int row, String label,
                         java.awt.Component field) {
         constraints.gridx = 0;
@@ -242,7 +183,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 执行登录：后台建立连接并等待登录结果。
+     * 校验输入并在后台线程完成连接与登录。
      */
     private void doLogin() {
         String host = hostField.getText().trim();
@@ -255,6 +196,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             showError("端口必须是数字");
             return;
         }
+        // 校验必填项
         if (host.isEmpty() || name.isEmpty()) {
             showError("服务器地址与用户名不能为空");
             return;
@@ -267,22 +209,13 @@ public class LoginUI extends BaseUI implements ChatListener {
         resetLoginState();
         createClient();
 
+        // 后台连接服务器并登录
         new SwingWorker<Boolean, Void>() {
-            /**
-             * 后台线程执行连接并发送登录请求。
-             *
-             * @return 请求是否已提交
-             */
             @Override
             protected Boolean doInBackground() {
                 return client.openConnection(host, port) && client.login(name, password);
             }
 
-            /**
-             * 连接失败直接提示；提交成功则进入统一的登录结果等待流程。
-             *
-             * @param requested 请求是否已提交
-             */
             @Override
             protected void done() {
                 boolean requested = false;
@@ -292,6 +225,7 @@ public class LoginUI extends BaseUI implements ChatListener {
                     loginFailure = "连接异常: " + e.getMessage();
                 }
                 if (!requested) {
+                    // 连接失败时恢复按钮并关闭客户端
                     String reason = loginFailure.isEmpty() ? "无法连接服务器" : loginFailure;
                     setBusy(false, reason);
                     showError(loginFailure.isEmpty() ? "无法连接服务器，请检查地址与端口" : loginFailure);
@@ -304,22 +238,14 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 等待服务器返回登录结果。
-     *
-     * <p>本方法是打开主窗口的唯一入口：登录与"注册后自动登录"都必须经过它。
-     * 早期版本的注册分支只发出了登录请求却没有等待结果，于是界面永远停在登录页，
-     * 而服务器端账号已经在线，再次点击登录就会被拒绝为"已在其它位置登录"。</p>
+     * 等待登录回执并处理成功或失败的结果。
      */
     private void awaitLoginResult() {
         new SwingWorker<Boolean, Void>() {
-            /**
-             * 后台等待登录结果。
-             *
-             * @return 是否登录成功
-             */
             @Override
             protected Boolean doInBackground() {
                 try {
+                    // 最多等待 6 秒登录回执
                     CountDownLatch latch = loginLatch;
                     return latch != null && latch.await(6, TimeUnit.SECONDS) && loginSucceeded;
                 } catch (InterruptedException e) {
@@ -328,11 +254,6 @@ public class LoginUI extends BaseUI implements ChatListener {
                 }
             }
 
-            /**
-             * 登录成功则打开主窗口，否则复位界面并释放连接。
-             *
-             * @param success 是否成功
-             */
             @Override
             protected void done() {
                 boolean success = false;
@@ -353,20 +274,17 @@ public class LoginUI extends BaseUI implements ChatListener {
         }.execute();
     }
 
-    /**
-     * 打开主窗口并关闭登录窗口。
-     */
     private void openMainWindow() {
         setBusy(false, "登录成功");
         ClientUI main = new ClientUI(client);
         main.setVisible(true);
-        // 先标记所有权已交接，再关闭登录窗口，避免 dispose() 把正在使用的连接关掉
+
         sessionHandedOver = true;
         dispose();
     }
 
     /**
-     * 执行注册：连接服务器提交注册，成功后在同一连接上自动登录。
+     * 校验注册信息并在后台提交注册，成功后自动登录。
      */
     private void doRegister() {
         String host = hostField.getText().trim();
@@ -380,6 +298,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             showError("端口必须是数字");
             return;
         }
+        // 校验必填项
         if (host.isEmpty() || name.isEmpty() || password.isEmpty()) {
             showError("服务器地址、用户名与密码不能为空");
             return;
@@ -390,12 +309,8 @@ public class LoginUI extends BaseUI implements ChatListener {
         registerLatch = new CountDownLatch(1);
         createClient();
 
+        // 后台连接服务器并发送注册请求
         new SwingWorker<Boolean, Void>() {
-            /**
-             * 后台建立连接并发送注册请求。
-             *
-             * @return 是否连接成功
-             */
             @Override
             protected Boolean doInBackground() {
                 if (!client.openConnection(host, port)) {
@@ -413,9 +328,6 @@ public class LoginUI extends BaseUI implements ChatListener {
                 return true;
             }
 
-            /**
-             * 根据注册结果决定是否继续自动登录。
-             */
             @Override
             protected void done() {
                 boolean connected = false;
@@ -437,10 +349,10 @@ public class LoginUI extends BaseUI implements ChatListener {
                     cleanupClient();
                     return;
                 }
-                // 注册成功：复用同一条连接登录，并交给统一的等待流程打开主窗口
-                // 此处保持忙碌状态，避免使用者在自动登录期间重复点击而新建连接
+
                 setBusy(true, "注册成功，正在自动登录……");
                 showInfo("注册成功，正在自动登录……");
+                // 注册成功后用同一账号登录
                 resetLoginState();
                 client.login(name, password);
                 awaitLoginResult();
@@ -449,24 +361,17 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 自动发现局域网服务器。
+     * 在后台广播搜索局域网服务器并让用户选择。
      */
     private void doDiscover() {
         setBusy(true, "正在广播搜索局域网服务器……");
         new SwingWorker<List<DiscoveryClient.ServerInfo>, Void>() {
-            /**
-             * 后台执行 UDP 发现。
-             *
-             * @return 服务器列表
-             */
             @Override
             protected List<DiscoveryClient.ServerInfo> doInBackground() {
+                // 等待 2 秒收集服务器应答
                 return DiscoveryClient.discoverOnce(2000);
             }
 
-            /**
-             * 展示发现结果供用户选择。
-             */
             @Override
             protected void done() {
                 List<DiscoveryClient.ServerInfo> servers;
@@ -504,22 +409,11 @@ public class LoginUI extends BaseUI implements ChatListener {
         }.execute();
     }
 
-    /**
-     * 把发现的服务器信息填入表单。
-     *
-     * @param info 服务器信息
-     */
     private void applyServer(DiscoveryClient.ServerInfo info) {
         hostField.setText(info.getHost());
         portField.setText(String.valueOf(info.getPort()));
     }
 
-    /**
-     * 关闭上一个客户端连接（若有）。
-     *
-     * <p>登录与注册都会新建连接：若不先清理旧连接，旧连接会一直保持登录态，
-     * 新连接再登录同一账号时会被服务器判定为"已在其它位置登录"。</p>
-     */
     private void closePreviousClient() {
         if (client != null) {
             client.removeListener(this);
@@ -528,30 +422,18 @@ public class LoginUI extends BaseUI implements ChatListener {
         }
     }
 
-    /**
-     * 重置登录等待状态，必须在发送登录请求之前调用。
-     */
     private void resetLoginState() {
         loginSucceeded = false;
         loginFailure = "";
         loginLatch = new CountDownLatch(1);
     }
 
-    /**
-     * 创建客户端并注册本窗口为监听器。
-     */
     private void createClient() {
         closePreviousClient();
         client = new ChatClient();
         client.addListener(this);
     }
 
-    /**
-     * 设置界面忙碌状态。
-     *
-     * @param busy   是否忙碌
-     * @param status 状态文本
-     */
     private void setBusy(boolean busy, String status) {
         onEdt(() -> {
             loginButton.setEnabled(!busy);
@@ -561,9 +443,6 @@ public class LoginUI extends BaseUI implements ChatListener {
         });
     }
 
-    /**
-     * 释放客户端资源。
-     */
     private void cleanupClient() {
         if (client != null) {
             client.removeListener(this);
@@ -574,13 +453,14 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 处理服务器消息：分别唤醒登录与注册等待线程。
+     * 处理登录结果、注册结果以及系统与错误消息。
      *
-     * @param message 消息
+     * @param message 收到的消息
      */
     @Override
     public void onMessage(Message message) {
         if (message.getType() == MessageType.LOGIN_RESULT && message instanceof TextMessage) {
+            // 登录结果写入等待状态并唤醒登录线程
             String[] result = ChatClient.parseLoginResult(((TextMessage) message).getContent());
             loginSucceeded = "1".equals(result[0]);
             loginFailure = loginSucceeded ? "" : result[1];
@@ -590,6 +470,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         if (message.getType() == MessageType.REGISTER_RESULT && message instanceof TextMessage) {
+            // 注册结果写入等待状态并唤醒注册线程
             String[] result = ChatClient.parseRegisterResult(((TextMessage) message).getContent());
             registerSucceeded = "1".equals(result[0]);
             registerMessage = result[1];
@@ -599,6 +480,7 @@ public class LoginUI extends BaseUI implements ChatListener {
             return;
         }
         if (message.getType() == MessageType.SYSTEM || message.getType() == MessageType.ERROR) {
+            // 系统消息与错误显示在状态栏
             onEdt(() -> {
                 statusLabel.setText(message.getSummary());
                 if (message.getType() == MessageType.ERROR) {
@@ -609,10 +491,10 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 连接状态变化：登录前断开时给出明确提示。
+     * 在状态栏显示连接状态变化。
      *
-     * @param connected 是否连接
-     * @param reason    原因
+     * @param connected 当前是否已连接
+     * @param reason 状态说明
      */
     @Override
     public void onConnectionChanged(boolean connected, String reason) {
@@ -620,7 +502,7 @@ public class LoginUI extends BaseUI implements ChatListener {
     }
 
     /**
-     * 窗口关闭时释放资源。
+     * 关闭窗口，未交接给主窗口时断开客户端连接。
      */
     @Override
     public void dispose() {

@@ -18,55 +18,28 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * 用户数据访问的 JDBC 实现。
- *
- * <p>职责：把用户持久化到 {@code chat_user} 表。本类是 {@link UserDao} 的唯一实现——
- * 文件型实现已随"存储只保留数据库"的调整删除，因此不存在任何降级路径。</p>
- *
- * <p>为什么不在编译期依赖驱动：项目要求不使用任何第三方框架。
- * 本类只使用 {@code java.sql} 标准接口，驱动类名由配置提供，通过反射加载，
- * 因此驱动不在 classpath 上时也能照常编译，只是运行期 {@link #isAvailable()} 返回 false，
- * 并由启动自检把原因报出来。</p>
- *
- * <p>SQL 注入防护：所有涉及用户输入的语句一律使用 {@link PreparedStatement} 参数占位符，
- * 禁止字符串拼接 SQL。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 基于 JDBC 的用户表实现，负责建表与用户记录的增删改查。
  */
 public class JdbcUserDao implements UserDao {
-
-    /** 日志记录器 */
     private static final Logger LOGGER = Logger.getLogger(Constants.LOGGER_NAME + ".JdbcUserDao");
 
-    /** MySQL "列已存在" 的驱动错误码（Duplicate column name） */
-    private static final int DUPLICATE_COLUMN_ERROR_CODE = 1060;
-
-    /** MySQL "列已存在" 的标准 SQLState；与错误码一起判断，任一命中即视为正常 */
-    private static final String DUPLICATE_COLUMN_SQL_STATE = "42S21";
-
-    /** JDBC 连接地址 */
     private final String url;
 
-    /** 数据库用户名 */
     private final String dbUser;
 
-    /** 数据库密码 */
     private final String dbPassword;
 
-    /** 是否可用：驱动类加载成功且建表语句执行成功 */
     private volatile boolean available;
 
-    /** 不可用原因，供启动自检与界面提示展示 */
     private volatile String failureReason = "";
 
     /**
-     * 使用配置构造 DAO，并尝试建表。
+     * 使用指定连接参数创建实例并尝试初始化。
      *
-     * @param driverClass JDBC 驱动类名，例如 {@code com.mysql.cj.jdbc.Driver}
-     * @param url         连接地址
-     * @param dbUser      数据库用户名
-     * @param dbPassword  数据库密码
+     * @param driverClass JDBC 驱动类名
+     * @param url 数据库连接地址
+     * @param dbUser 数据库用户名
+     * @param dbPassword 数据库密码
      */
     public JdbcUserDao(String driverClass, String url, String dbUser, String dbPassword) {
         this.url = url;
@@ -75,20 +48,10 @@ public class JdbcUserDao implements UserDao {
         this.available = tryInitialize(driverClass);
     }
 
-    /**
-     * 尝试加载驱动并建表。
-     *
-     * <p>任何失败都只降级为 available=false，不中断程序启动——
-     * 数据库是加分项而非主链路，不能因为数据库不可用导致整个聊天室无法使用。</p>
-     *
-     * @param driverClass 驱动类名
-     * @return 初始化成功返回 true
-     */
     private boolean tryInitialize(String driverClass) {
         try {
             Class.forName(driverClass);
             createTableIfAbsent();
-            ensureAvatarColumn();
             LOGGER.info(() -> "用户数据存储已就绪: " + url);
             return true;
         } catch (ClassNotFoundException e) {
@@ -102,28 +65,19 @@ public class JdbcUserDao implements UserDao {
         }
     }
 
-    /**
-     * 建表（幂等）。
-     *
-     * @throws SQLException 执行失败时抛出
-     */
     private void createTableIfAbsent() throws SQLException {
         String sql = "CREATE TABLE IF NOT EXISTS chat_user ("
                 + "username VARCHAR(32) PRIMARY KEY,"
                 + "nickname VARCHAR(64) NOT NULL,"
                 + "salt CHAR(32) NOT NULL,"
-                // 必须与 sql/schema.sql 一致：PBKDF2 散列形如 pbkdf2$120000$<64 位十六进制>，
-                // 约 78 字符，沿用历史 CHAR(64) 会在写入时被数据库拒绝（Data too long）
+
                 + "password_hash VARCHAR(128) NOT NULL,"
                 + "role VARCHAR(16) NOT NULL DEFAULT 'USER',"
                 + "create_time DATETIME NULL,"
                 + "last_login_time DATETIME NULL,"
-                // 头像存 PNG 的 Base64 文本，单张约 6-16KB，用 MEDIUMTEXT 留足余量。
-                // 允许 NULL：NULL 与空串都表示"未设置头像"，界面回落到默认剪影
+
                 + "avatar MEDIUMTEXT NULL,"
-                // 与 sql/schema.sql 保持逐项一致：运行期建表若漏建索引，
-                // 会出现"脚本建库查询快、程序自动建库查询慢"的隐蔽差异，
-                // 而 CREATE TABLE IF NOT EXISTS 不会为已存在的表补建索引
+
                 + "KEY idx_chat_user_nickname (nickname),"
                 + "KEY idx_chat_user_role (role))";
         try (Connection connection = openConnection();
@@ -133,73 +87,24 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 为已存在的 {@code chat_user} 表补建 {@code avatar} 列（幂等）。
+     * 确认 chat_user 表存在 avatar 列，列已存在时忽略重复列错误。
      *
-     * <p><b>为什么建表之后还要单独做这一步</b>：{@code CREATE TABLE IF NOT EXISTS}
-     * 对已经存在的表<b>什么都不做</b>——它既不会补列，也不会报错。因此从上一版升级上来的
-     * 数据库不会有 avatar 列，而此后所有 {@code INSERT}/{@code UPDATE} 都会因为
-     * "Unknown column 'avatar'" 而失败，表现为"注册/登录都报数据库错误"。</p>
-     *
-     * <p>重复执行是正常路径而非异常：列已存在时 MySQL 返回错误码 1060
-     * （SQLState {@code 42S21}，Duplicate column name），这里直接放过。
-     * 采用"先执行再容错"而不是"先查元数据再决定"，是为了顺带覆盖两个服务端实例
-     * 同时启动的场景——查完再改的写法在那时会一起执行 ALTER，仍要靠 1060 兜底。</p>
-     *
-     * @throws SQLException 补列失败且原因不是"列已存在"时抛出
-     */
-    private void ensureAvatarColumn() throws SQLException {
-        // COMMENT 必须与 sql/schema.sql 中的列定义逐字一致：ALTER 补出来的列若没有注释，
-        // 就会出现"脚本建的库有注释、程序自动升级的库没有"这种同一列两种形态的差异，
-        // 后来的人无法从库结构判断该列存的是什么
-        String sql = "ALTER TABLE chat_user ADD COLUMN avatar MEDIUMTEXT NULL"
-                + " COMMENT '自定义头像：PNG 图片的 Base64 文本（约 6-16KB）；NULL 或空串表示未设置，界面显示默认头像'";
-        try (Connection connection = openConnection();
-             Statement statement = connection.createStatement()) {
-            statement.execute(sql);
-            LOGGER.info("已为 chat_user 补充 avatar 列");
-        } catch (SQLException e) {
-            if (e.getErrorCode() != DUPLICATE_COLUMN_ERROR_CODE
-                    && !DUPLICATE_COLUMN_SQL_STATE.equals(e.getSQLState())) {
-                throw e;
-            }
-            LOGGER.fine("avatar 列已存在，无需补充");
-        }
-    }
-
-    /**
-     * 打开数据库连接。
-     *
-     * @return 连接对象
-     * @throws SQLException 连接失败时抛出
+     * @throws SQLException 添加列失败时抛出
      */
     private Connection openConnection() throws SQLException {
         return DriverManager.getConnection(url, dbUser, dbPassword);
     }
 
-    /**
-     * 判断存储是否可用。
-     *
-     * @return 可用返回 true
-     */
     public boolean isAvailable() {
         return available;
     }
 
-    /**
-     * 获取不可用原因。
-     *
-     * @return 原因描述；可用时为空字符串
-     */
     public String failureReason() {
         return failureReason;
     }
 
     /**
      * 把结果集当前行映射为用户对象。
-     *
-     * @param rs 结果集，游标已定位到目标行
-     * @return 用户对象
-     * @throws SQLException 读取失败时抛出
      */
     private User map(ResultSet rs) throws SQLException {
         User user = new User();
@@ -221,11 +126,11 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 新增用户。
+     * 插入一条用户记录。
      *
      * @param entity 用户对象
-     * @return 新增成功返回 true
-     * @throws ChatException 执行失败时抛出
+     * @return 写入成功返回 true；数据库不可用或实体为空返回 false
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public boolean save(User entity) throws ChatException {
@@ -236,6 +141,7 @@ public class JdbcUserDao implements UserDao {
                 + "last_login_time, avatar) VALUES(?,?,?,?,?,?,?,?)";
         try (Connection connection = openConnection();
              PreparedStatement ps = connection.prepareStatement(sql)) {
+            // 复用按 INSERT 列顺序填充参数的方法
             fill(ps, entity);
             return ps.executeUpdate() > 0;
         } catch (SQLException e) {
@@ -244,11 +150,11 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 更新用户。
+     * 更新一条用户记录。
      *
      * @param entity 用户对象
-     * @return 更新成功返回 true
-     * @throws ChatException 执行失败时抛出
+     * @return 更新成功返回 true；数据库不可用或实体为空返回 false
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public boolean update(User entity) throws ChatException {
@@ -259,6 +165,7 @@ public class JdbcUserDao implements UserDao {
                 + "last_login_time=?, avatar=? WHERE username=?";
         try (Connection connection = openConnection();
              PreparedStatement ps = connection.prepareStatement(sql)) {
+            // 按 UPDATE 语句的列顺序绑定参数
             ps.setString(1, entity.getNickname());
             ps.setString(2, entity.getSalt());
             ps.setString(3, entity.getPasswordHash());
@@ -274,11 +181,7 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 填充新增语句的参数。
-     *
-     * @param ps   预编译语句
-     * @param user 用户对象
-     * @throws SQLException 参数设置失败时抛出
+     * 按 INSERT 语句的列顺序填充参数。
      */
     private void fill(PreparedStatement ps, User user) throws SQLException {
         ps.setString(1, user.getUsername());
@@ -291,32 +194,25 @@ public class JdbcUserDao implements UserDao {
         ps.setString(8, user.getAvatar());
     }
 
-    /**
-     * 按用户名删除用户。
-     *
-     * @param id 用户名
-     * @return 删除成功返回 true
-     * @throws UserNotFoundException 用户不存在时抛出
-     * @throws ChatException         执行失败时抛出
-     */
     @Override
     public boolean deleteById(String id) throws UserNotFoundException, ChatException {
         return deleteByUsername(id);
     }
 
     /**
-     * 按用户名删除用户。
+     * 按用户名删除用户记录。
      *
      * @param username 用户名
      * @return 删除成功返回 true
-     * @throws UserNotFoundException 用户不存在时抛出
-     * @throws ChatException         执行失败时抛出
+     * @throws UserNotFoundException 数据库不可用或用户不存在时抛出
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public boolean deleteByUsername(String username) throws UserNotFoundException, ChatException {
         if (!available) {
             throw new UserNotFoundException("数据库模式不可用");
         }
+        // 用户不存在时不执行删除
         if (findByUsername(username) == null) {
             throw new UserNotFoundException("用户不存在: " + username);
         }
@@ -330,13 +226,6 @@ public class JdbcUserDao implements UserDao {
         }
     }
 
-    /**
-     * 按用户名查询用户。
-     *
-     * @param id 用户名
-     * @return 用户对象；不存在时返回 null
-     * @throws ChatException 查询失败时抛出
-     */
     @Override
     public User findById(String id) throws ChatException {
         return findByUsername(id);
@@ -346,8 +235,8 @@ public class JdbcUserDao implements UserDao {
      * 按用户名查询用户。
      *
      * @param username 用户名
-     * @return 用户对象；不存在或数据库不可用时返回 null
-     * @throws ChatException 查询失败时抛出
+     * @return 对应用户，不存在返回 null
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public User findByUsername(String username) throws ChatException {
@@ -367,11 +256,11 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 判断用户名是否存在。
+     * 判断用户名是否已存在。
      *
      * @param username 用户名
-     * @return 存在返回 true
-     * @throws ChatException 查询失败时抛出
+     * @return 已存在返回 true
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public boolean exists(String username) throws ChatException {
@@ -379,11 +268,11 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 保存或更新用户。
+     * 保存用户，用户名已存在时改为更新。
      *
      * @param user 用户对象
      * @return 写入成功返回 true
-     * @throws ChatException 执行失败时抛出
+     * @throws ChatException 数据库操作失败时抛出
      */
     @Override
     public boolean saveOrUpdate(User user) throws ChatException {
@@ -393,12 +282,6 @@ public class JdbcUserDao implements UserDao {
         return save(user);
     }
 
-    /**
-     * 查询全部用户。
-     *
-     * @return 用户列表，永不返回 null
-     * @throws ChatException 查询失败时抛出
-     */
     @Override
     public List<User> findAll() throws ChatException {
         List<User> users = new ArrayList<>();
@@ -418,12 +301,6 @@ public class JdbcUserDao implements UserDao {
         }
     }
 
-    /**
-     * 统计用户总数。
-     *
-     * @return 用户数量
-     * @throws ChatException 查询失败时抛出
-     */
     @Override
     public long count() throws ChatException {
         if (!available) {
@@ -440,13 +317,9 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 从配置文件构造 JDBC DAO 的工厂方法。
+     * 使用配置文件中的数据库参数创建实例。
      *
-     * <p>数据库是本项目唯一的存储，因此不再有"是否启用"的开关：
-     * 连接参数来自 {@code config/chat.properties}，并允许用系统属性
-     * {@code lanchat.db.url} 等覆盖，便于测试使用独立库。</p>
-     *
-     * @return JDBC DAO 实例，可通过 {@link #isAvailable()} 判断是否真的可用
+     * @return 用户数据访问实例
      */
     public static JdbcUserDao fromConfig() {
         return new JdbcUserDao(com.chat.common.Config.dbDriver(),
@@ -456,23 +329,18 @@ public class JdbcUserDao implements UserDao {
     }
 
     /**
-     * 显式构造可用的数据库用户 DAO，供集成测试或演示直接调用。
+     * 使用指定连接参数创建实例。
      *
-     * @param driverClass 驱动类名
-     * @param url         连接地址
-     * @param user        数据库用户名
-     * @param password    数据库密码
-     * @return JDBC DAO 实例，可通过 {@link #isAvailable()} 判断是否真的可用
+     * @param driverClass JDBC 驱动类名
+     * @param url 数据库连接地址
+     * @param user 数据库用户名
+     * @param password 数据库密码
+     * @return 用户数据访问实例
      */
     public static JdbcUserDao open(String driverClass, String url, String user, String password) {
         return new JdbcUserDao(driverClass, url, user, password);
     }
 
-    /**
-     * 输出数据源信息，便于日志排查（不包含密码）。
-     *
-     * @return 形如 {@code JdbcUserDao{url=..., available=true}} 的字符串
-     */
     @Override
     public String toString() {
         return "JdbcUserDao{url=" + url + ", available=" + available + "}";

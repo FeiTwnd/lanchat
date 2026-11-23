@@ -25,53 +25,36 @@ import java.awt.event.MouseMotionAdapter;
 import java.awt.event.WindowEvent;
 
 /**
- * 自定义标题栏。
- *
- * <p>职责：为无边框窗口提供标题展示、拖动移动、双击最大化、最小化与关闭。
- * 关闭动作分发的是标准 {@code WINDOW_CLOSING} 事件，因此各窗口既有的关闭逻辑
- * （服务器的停服确认、客户端断开连接、登录窗口的会话交接）都会被正常触发，
- * 不会被自定义按钮绕过。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 自绘的窗口标题栏，包含图标、标题、未读气泡以及最小化和关闭按钮，并支持拖动窗口与双击最大化。
  */
 public class SkinTitleBar extends JPanel {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20260919L;
 
-    /** 标题栏高度 */
+    /** 标题栏高度，单位像素。 */
     public static final int HEIGHT = 38;
 
-    /** 未读角标距右边缘的内缩（像素），留出最小化与关闭按钮的位置 */
+    /** 未读气泡右边缘与标题栏右侧的距离，单位像素。 */
     private static final int BADGE_RIGHT_INSET = 76;
 
-    /** 所属窗口 */
     private final transient JFrame frame;
 
-    /** 标题标签 */
     private final JLabel titleLabel;
 
-    /** 是否处于最大化状态 */
     private transient boolean maximized;
 
-    /** 最大化前的窗口位置与尺寸 */
     private transient Rectangle restoreBounds;
 
-    /** 拖动起点（屏幕坐标） */
     private transient Point dragStart;
 
-    /** 拖动开始时的窗口位置 */
     private transient Point windowStart;
 
-    /** 未读合计角标：0 表示不显示 */
     private transient int badgeCount;
 
     /**
-     * 构造标题栏。
+     * 创建标题栏并绑定所属窗口。
      *
-     * @param frame 所属窗口
-     * @param title 标题文本
+     * @param frame 所在的窗口
+     * @param title 初始标题文字
      */
     public SkinTitleBar(JFrame frame, String title) {
         this.frame = frame;
@@ -107,21 +90,18 @@ public class SkinTitleBar extends JPanel {
     }
 
     /**
-     * 更新标题文本。
+     * 修改标题文字。
      *
-     * @param title 标题
+     * @param title 新的标题，null 按空文字处理
      */
     public void setTitleText(String title) {
         titleLabel.setText(title == null ? "" : title);
     }
 
     /**
-     * 设置未读合计角标。
+     * 设置未读气泡显示的数量。
      *
-     * <p>默认 0 即不显示，因此登录窗口、服务器控制台等同样使用本标题栏的窗口
-     * 不设置它就不会有任何变化。</p>
-     *
-     * @param count 未读条数，小于等于 0 表示不显示
+     * @param count 未读数量，小于 0 时按 0 处理
      */
     public void setBadgeCount(int count) {
         if (badgeCount == count) {
@@ -131,38 +111,28 @@ public class SkinTitleBar extends JPanel {
         repaint();
     }
 
-    /**
-     * 绘制渐变底与底部细分隔线。
-     *
-     * @param g 画笔
-     */
     @Override
     protected void paintComponent(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        // 横向渐变底色与底部分隔线
         g2.setPaint(new GradientPaint(0, 0, Theme.PRIMARY, getWidth(), HEIGHT, Theme.PRIMARY_DARK));
         g2.fillRect(0, 0, getWidth(), getHeight());
         g2.setColor(new Color(0x00000022, true));
         g2.setStroke(new BasicStroke(1f));
         g2.drawLine(0, getHeight() - 1, getWidth(), getHeight() - 1);
         if (badgeCount > 0) {
-            // 角标画在绘制流程里而不是做成一个 JLabel：标题栏宽度随窗口变化，
-            // 放组件就要参与布局并在窗口缩放时反复重排，直接画反而稳定
+            // 未读气泡画在右侧按钮区域左边
             Badge.paint(g2, getWidth() - BADGE_RIGHT_INSET, HEIGHT / 2, badgeCount);
         }
         g2.dispose();
         super.paintComponent(g);
     }
 
-    /**
-     * 为若干组件安装拖动与双击最大化行为。
-     *
-     * @param targets 可拖动的区域
-     */
+    /** 为给定组件安装拖动窗口与双击最大化的鼠标监听。 */
     private void installDrag(Component... targets) {
         for (Component target : targets) {
             target.addMouseListener(new MouseAdapter() {
-
                 @Override
                 public void mousePressed(MouseEvent e) {
                     dragStart = e.getLocationOnScreen();
@@ -177,7 +147,6 @@ public class SkinTitleBar extends JPanel {
                 }
             });
             target.addMouseMotionListener(new MouseMotionAdapter() {
-
                 @Override
                 public void mouseDragged(MouseEvent e) {
                     if (dragStart == null || windowStart == null) {
@@ -192,9 +161,7 @@ public class SkinTitleBar extends JPanel {
         }
     }
 
-    /**
-     * 在最大化与还原之间切换。
-     */
+    /** 在最大化与还原状态之间切换窗口尺寸。 */
     private void toggleMaximize() {
         if (maximized) {
             if (restoreBounds != null) {
@@ -210,23 +177,12 @@ public class SkinTitleBar extends JPanel {
         maximized = true;
     }
 
-    /**
-     * 标题栏按钮：悬停时显示背景，关闭按钮使用危险色。
-     */
+    /** 标题栏上的窗口控制按钮。 */
     private final class TitleButton extends JButton {
-
-        /** 序列化版本号 */
         private static final long serialVersionUID = 20260920L;
 
-        /** 是否为关闭按钮 */
         private final boolean danger;
 
-        /**
-         * 构造按钮。
-         *
-         * @param icon   图标
-         * @param danger 是否为关闭按钮
-         */
         TitleButton(javax.swing.Icon icon, boolean danger) {
             super(icon);
             this.danger = danger;
@@ -240,11 +196,6 @@ public class SkinTitleBar extends JPanel {
             setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         }
 
-        /**
-         * 绘制悬停背景。
-         *
-         * @param g 画笔
-         */
         @Override
         protected void paintComponent(Graphics g) {
             if (getModel().isRollover() || getModel().isPressed()) {

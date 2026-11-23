@@ -7,68 +7,58 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
 /**
- * 日期时间工具类。
- *
- * <p>职责：统一系统的日期格式化与解析规则，避免各处自行拼装格式串导致历史记录无法回读。</p>
- *
- * <p>线程安全：{@link DateTimeFormatter} 本身不可变且线程安全，
- * 因此这里使用静态常量而非旧的 {@code SimpleDateFormat}（后者非线程安全，是经典陷阱）。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 日期时间格式化与解析工具。
  */
 public final class DateUtil {
-
-    /** 日期时间格式器：yyyy-MM-dd HH:mm:ss */
+    /** 完整日期时间格式，精确到秒。 */
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    /** 仅时间格式器：HH:mm:ss，用于界面展示 */
+    /** 时分秒格式。 */
     private static final DateTimeFormatter TIME_FORMATTER =
             DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    /** 仅日期格式器：yyyy-MM-dd，用于按日期检索与展示 */
+    /** 日期格式。 */
     private static final DateTimeFormatter DATE_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
-    /** 私有构造，禁止实例化工具类 */
     private DateUtil() {
     }
 
     /**
-     * 格式化日期时间为标准字符串。
+     * 格式化为 yyyy-MM-dd HH:mm:ss。
      *
-     * @param dateTime 日期时间，可为 null
-     * @return 形如 {@code 2025-01-01 10:20:30} 的字符串；入参为 null 时返回空字符串
+     * @param dateTime 待格式化的时间
+     * @return 格式化结果，入参为 null 时返回空串
      */
     public static String format(LocalDateTime dateTime) {
         return dateTime == null ? "" : DATE_TIME_FORMATTER.format(dateTime);
     }
 
     /**
-     * 仅格式化时间部分，用于聊天窗口展示。
+     * 格式化为 HH:mm:ss。
      *
-     * @param dateTime 日期时间，可为 null
-     * @return 形如 {@code 10:20:30} 的字符串；入参为 null 时返回空字符串
+     * @param dateTime 待格式化的时间
+     * @return 格式化结果，入参为 null 时返回空串
      */
     public static String formatTime(LocalDateTime dateTime) {
         return dateTime == null ? "" : TIME_FORMATTER.format(dateTime);
     }
 
     /**
-     * 格式化当前时间。
+     * 返回当前时间的完整格式化文本。
      *
-     * @return 当前时间的标准格式字符串
+     * @return 当前时间，格式为 yyyy-MM-dd HH:mm:ss
      */
     public static String now() {
         return DATE_TIME_FORMATTER.format(LocalDateTime.now());
     }
 
     /**
-     * 解析标准格式的日期时间字符串。
+     * 解析 yyyy-MM-dd HH:mm:ss 格式的文本。
      *
-     * @param text 形如 {@code 2025-01-01 10:20:30} 的文本
-     * @return 解析结果；文本为空或格式非法时返回 null
+     * @param text 待解析文本
+     * @return 解析结果，空文本或格式不符时返回 null
      */
     public static LocalDateTime parse(String text) {
         if (text == null || text.trim().isEmpty()) {
@@ -82,10 +72,10 @@ public final class DateUtil {
     }
 
     /**
-     * 获取指定日期的“日键”，用于历史记录文件命名。
+     * 返回指定时间所属日期的文本。
      *
-     * @param dateTime 日期时间
-     * @return 形如 {@code 2025-01-01} 的字符串
+     * @param dateTime 时间，为 null 时取当前时间
+     * @return 日期文本，格式为 yyyy-MM-dd
      */
     public static String dayKey(LocalDateTime dateTime) {
         LocalDateTime target = dateTime == null ? LocalDateTime.now() : dateTime;
@@ -93,19 +83,19 @@ public final class DateUtil {
     }
 
     /**
-     * 获取今天的日键。
+     * 返回今天的日期文本。
      *
-     * @return 形如 {@code 2025-01-01} 的字符串
+     * @return 日期文本，格式为 yyyy-MM-dd
      */
     public static String todayKey() {
         return DATE_FORMATTER.format(LocalDate.now());
     }
 
     /**
-     * 把毫秒数转换为可读的时长文本，用于日志与传输耗时展示。
+     * 把毫秒数转换为中文可读时长。
      *
      * @param millis 毫秒数
-     * @return 形如 {@code 1.5 秒} 或 {@code 320 毫秒} 的字符串
+     * @return 形如 500 毫秒、1.5 秒或 2 分 3 秒的文本
      */
     public static String formatDuration(long millis) {
         if (millis < 1000) {

@@ -27,61 +27,33 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 服务器图形界面。
- *
- * <p>职责：为管理员提供服务器可视化控制台——查看运行状态、启停服务、
- * 观察在线用户、浏览实时日志。界面本身不包含任何业务逻辑，
- * 所有事件通过 {@link ServerObserver} 从服务器核心推送而来。</p>
- *
- * <p>线程安全：观察者回调发生在网络线程，界面更新统一通过
- * {@link BaseUI#onEdt(Runnable)} 切换到事件分发线程。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 服务器控制台界面，提供启动与停止控制、运行日志和在线用户列表。
  */
 public class ServerUI extends BaseUI implements ServerObserver {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20250111L;
 
-    /** 服务器实例 */
     private final transient ChatServer server;
 
-    /** 在线用户表模型 */
     private final DefaultTableModel userTableModel = new DefaultTableModel(
             new String[]{"用户名", "昵称", "角色", "远端地址"}, 0) {
-        /** 序列化版本号 */
         private static final long serialVersionUID = 20250112L;
 
-        /**
-         * 禁止直接编辑表格单元格。
-         *
-         * @param row    行号
-         * @param column 列号
-         * @return 恒定返回 false
-         */
         @Override
         public boolean isCellEditable(int row, int column) {
             return false;
         }
     };
 
-    /** 日志文本区 */
     private final JTextArea logArea = new JTextArea();
 
-    /** 状态标签 */
     private final JLabel statusLabel = new JLabel("服务器未启动");
 
-    /** 启动按钮 */
     private final SkinButton startButton = new SkinButton("启动服务器", SkinButton.Kind.PRIMARY);
 
-    /** 停止按钮 */
     private final SkinButton stopButton = new SkinButton("停止服务器", SkinButton.Kind.NORMAL);
 
-    /** 在线人数标签 */
     private final JLabel onlineLabel = new JLabel("在线人数: 0");
 
-    /** 定时刷新器，周期性同步在线人数等运行指标 */
     private final transient ScheduledExecutorService refresher =
             Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "server-ui-refresh");
@@ -90,7 +62,7 @@ public class ServerUI extends BaseUI implements ServerObserver {
             });
 
     /**
-     * 构造服务器界面。
+     * 创建服务器控制台。
      *
      * @param server 服务器实例
      */
@@ -104,9 +76,7 @@ public class ServerUI extends BaseUI implements ServerObserver {
         startRefresher();
     }
 
-    /**
-     * 组装界面组件。
-     */
+    /** 构建界面组件并写入初始日志。 */
     private void initComponents() {
         logArea.setEditable(false);
         logArea.setLineWrap(true);
@@ -133,11 +103,6 @@ public class ServerUI extends BaseUI implements ServerObserver {
                 + (Config.isLoaded() ? "成功" : "失败（使用默认值）"));
     }
 
-    /**
-     * 构建信息面板。
-     *
-     * @return 面板对象
-     */
     private JPanel buildInfoPanel() {
         JPanel panel = new JPanel(new GridLayout(3, 1, 4, 4));
         panel.setBackground(Theme.BG);
@@ -150,11 +115,6 @@ public class ServerUI extends BaseUI implements ServerObserver {
         return panel;
     }
 
-    /**
-     * 构建控制按钮面板。
-     *
-     * @return 面板对象
-     */
     private JPanel buildControlPanel() {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
         panel.setBackground(Theme.BG);
@@ -167,9 +127,6 @@ public class ServerUI extends BaseUI implements ServerObserver {
         return panel;
     }
 
-    /**
-     * 启动服务器。
-     */
     private void startServer() {
         boolean started = server.start();
         if (started) {
@@ -184,9 +141,6 @@ public class ServerUI extends BaseUI implements ServerObserver {
         }
     }
 
-    /**
-     * 停止服务器。
-     */
     private void stopServer() {
         if (!confirm("确定要停止服务器吗？所有在线客户端将断开连接。")) {
             return;
@@ -199,9 +153,7 @@ public class ServerUI extends BaseUI implements ServerObserver {
         onlineLabel.setText("在线人数: 0");
     }
 
-    /**
-     * 启动定时刷新任务，周期性同步在线人数与用户列表。
-     */
+    /** 启动定时刷新任务。 */
     private void startRefresher() {
         refresher.scheduleWithFixedDelay(() -> {
             if (server.isRunning()) {
@@ -210,10 +162,9 @@ public class ServerUI extends BaseUI implements ServerObserver {
         }, 1, 2, TimeUnit.SECONDS);
     }
 
-    /**
-     * 刷新在线用户表格。
-     */
+    /** 刷新在线用户表与在线人数。 */
     private void refreshUserTable() {
+        // 先取用户快照，再回到界面线程更新表格
         List<User> users = server.getUserManager().onlineUsers();
         onEdt(() -> {
             userTableModel.setRowCount(0);
@@ -225,18 +176,11 @@ public class ServerUI extends BaseUI implements ServerObserver {
                         user.isAdmin() ? "管理员" : "普通用户",
                         handler == null ? "-" : handler.getRemoteAddress()});
             }
-            // 表格与人数刻意不同口径：表格里要能看到虚拟成员（小助手），
-            // 而"在线人数"指的是真实连接数——否则只有小助手在线时控制台显示"在线 1 人"，
-            // 与局域网发现应答、客户端好友树给出的说法对不上
+
             onlineLabel.setText("在线人数: " + server.getUserManager().size());
         });
     }
 
-    /**
-     * 追加一行日志。
-     *
-     * @param message 日志内容
-     */
     private void appendLog(String message) {
         onEdt(() -> {
             logArea.append(logLine(message) + System.lineSeparator());
@@ -245,9 +189,9 @@ public class ServerUI extends BaseUI implements ServerObserver {
     }
 
     /**
-     * 接收服务器事件并写入日志。
+     * 把服务器事件写入日志，用户上下线时刷新用户表。
      *
-     * @param type    事件类型
+     * @param type 事件类型
      * @param content 事件描述
      */
     @Override
@@ -259,7 +203,7 @@ public class ServerUI extends BaseUI implements ServerObserver {
     }
 
     /**
-     * 窗口关闭时释放资源并停止服务器。
+     * 关闭界面，必要时停止服务器。
      */
     @Override
     public void dispose() {
@@ -272,9 +216,9 @@ public class ServerUI extends BaseUI implements ServerObserver {
     }
 
     /**
-     * 独立启动服务器界面的入口。
+     * 打开服务器控制台。
      *
-     * @param args 命令行参数
+     * @param args 命令行参数，未使用
      */
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new ServerUI(ChatServer.getInstance()).setVisible(true));

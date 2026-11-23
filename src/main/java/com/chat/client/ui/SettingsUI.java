@@ -30,109 +30,67 @@ import java.util.Iterator;
 import java.util.function.BiConsumer;
 
 /**
- * 设置窗口：昵称、头像与密码的统一入口。
- *
- * <p>为什么要有这个窗口：此前"改昵称"在主窗口右栏、"改密码"在登录界面、
- * "换头像"根本没有入口——三件同属"修改我自己的资料"的事散在三处，
- * 使用者必须先猜"这件事该去哪个窗口做"，猜错就只能得到一句"请到别处办理"。
- * 合并之后三者共用一条回执通道（{@link com.chat.common.MessageType#PROFILE_RESULT}）
- * 与一套结果展示。</p>
- *
- * <p>三条链路都不需要管理员审核：服务端校验的是"原密码对不对""昵称长度是否合法"
- * 这类客观规则，改的是自己的资料，没有需要人为裁量的部分。</p>
- *
- * <p>与主窗口的分工：本窗口只负责"收集输入、做本地校验、把请求交给
- * {@link ChatClient}"，服务端回执由 {@link ClientUI} 转交给
- * {@link #onProfileResult(String)} 展示——窗口不做自己的网络监听，
- * 否则每开一次设置就要在客户端上挂一份监听器，关掉时还得记得摘。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 设置窗口，提供昵称、头像、密码修改以及管理员删除用户的操作。
  */
 public class SettingsUI extends BaseUI {
-
-    /** 序列化版本号 */
     private static final long serialVersionUID = 20260922L;
 
-    /** 头像预览的显示边长（像素） */
+    /** 头像预览边长，单位像素。 */
     private static final int AVATAR_PREVIEW = Constants.AVATAR_SIDE;
 
-    /** 头像超出长度上限时的降级边长：先降到 64 再重编一次 */
+    /** 编码超过长度上限时使用的备用头像边长，单位像素。 */
     private static final int AVATAR_FALLBACK_SIDE = 64;
 
-    /** 客户端实例 */
     private final transient ChatClient client;
 
-    /** 资料变更成功后的回调：参数为（新昵称, 新头像 Base64），未变更的传 null */
+    /** 昵称或头像修改成功后的回调，参数依次为新昵称与新头像。 */
     private final transient BiConsumer<String, String> onChanged;
 
-    /** 是否为管理员：决定本窗口是否出现"删除用户"分区 */
     private final transient boolean admin;
 
-    /** 删除用户请求的回调，参数为待删除的用户名；为 null 表示本窗口不提供该功能 */
+    /** 管理员删除用户时的回调。 */
     private final transient java.util.function.Consumer<String> onDeleteUser;
 
-    /** 昵称输入框 */
     private final transient JTextField nicknameField = new JTextField();
 
-    /** 头像预览标签 */
     private final transient JLabel avatarPreview = new JLabel();
 
-    /** 昵称分区的结果提示 */
     private final transient JLabel nicknameStatus = statusLabel(" ");
 
-    /** 头像分区的结果提示 */
     private final transient JLabel avatarStatus = statusLabel(" ");
 
-    /** 密码分区的结果提示 */
     private final transient JLabel passwordStatus = statusLabel(" ");
 
-    /** 原密码 */
     private final transient JPasswordField oldPasswordField = new JPasswordField();
 
-    /** 新密码 */
     private final transient JPasswordField newPasswordField = new JPasswordField();
 
-    /** 确认新密码 */
     private final transient JPasswordField confirmPasswordField = new JPasswordField();
 
-    /** 待删除的用户名（仅管理员可见的分区使用） */
     private final transient JTextField deleteUserField = new JTextField();
 
-    /** 删除用户分区的结果提示 */
     private final transient JLabel deleteStatus = statusLabel(" ");
 
-    /**
-     * 待提交的头像 Base64。
-     *
-     * <p>选择图片后并不立即上传，而是先在这里放一份预览：换头像是个"看一眼再决定"的操作，
-     * 选错一张立刻上传、失败再传一次，对使用者与服务器都是多余的往返。
-     * 恢复默认头像时置为 {@code ""}——空串表示"清除"，与 {@code null}（什么都不改）区分开。</p>
-     */
+    /** 待提交的头像编码，空串表示恢复默认头像，null 表示未修改。 */
     private transient String pendingAvatar;
 
     /**
-     * 构造设置窗口。
+     * 创建普通用户的设置窗口。
      *
-     * @param client    客户端实例
-     * @param onChanged 资料变更成功后的回调，参数为（新昵称, 新头像 Base64），未变更的为 null
+     * @param client 已登录的客户端
+     * @param onChanged 昵称或头像修改成功后的回调
      */
     public SettingsUI(ChatClient client, BiConsumer<String, String> onChanged) {
         this(client, onChanged, false, null);
     }
 
     /**
-     * 构造设置窗口，并决定是否提供"删除用户"分区。
+     * 创建设置窗口。
      *
-     * <p>为什么删除用户挪到这里：它原本是主窗口右栏的一枚按钮，和"改我自己的资料"并列。
-     * 但这两件事的性质完全不同——一个是人人可用的自助操作，一个是管理员对别人账号的
-     * 处置，放在同一列里既容易误点，也让普通用户看到一个自己用不了的功能。
-     * 收进设置窗口后，普通用户根本看不到这个分区。</p>
-     *
-     * @param client       客户端实例
-     * @param onChanged    资料变更成功后的回调，参数为（新昵称, 新头像 Base64），未变更的为 null
-     * @param admin        当前用户是否为管理员
-     * @param onDeleteUser 删除用户请求的回调，参数为待删除用户名；非管理员传 null
+     * @param client 已登录的客户端
+     * @param onChanged 昵称或头像修改成功后的回调
+     * @param admin 是否为管理员
+     * @param onDeleteUser 删除用户的回调，为空时不显示删除分区
      */
     public SettingsUI(ChatClient client, BiConsumer<String, String> onChanged, boolean admin,
                       java.util.function.Consumer<String> onDeleteUser) {
@@ -146,10 +104,7 @@ public class SettingsUI extends BaseUI {
         body().add(buildContent(), BorderLayout.CENTER);
         body().add(buildFooter(), BorderLayout.SOUTH);
         refreshPreview();
-        // 高度按内容实算而不是写死：写死的高度在"某个分区长得比预期高"时会把下面
-        // 那块直接切掉（此前头像预览与密码框被截断正是这个原因），而截断的部分
-        // 使用者既看不到也没有滚动条可拉。包一层滚动面板作为第二道保险，
-        // 屏幕放不下时至少还能滚，而不是永远看不到
+
         pack();
         Dimension packed = getSize();
         setSize(Math.max(560, packed.width + 8), Math.min(Math.max(520, packed.height + 8), 760));
@@ -157,12 +112,7 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 组装各分区。
-     *
-     * <p>用纵向 {@link BoxLayout} 而不是等分网格：三个分区的自然高度本来就不一样，
-     * 等分会让"内容高的那个被裁掉、内容矮的那个留一片空白"。</p>
-     *
-     * @return 内容面板
+     * 组装各设置分区并放入滚动容器。
      */
     private javax.swing.JComponent buildContent() {
         JPanel content = new JPanel();
@@ -175,6 +125,7 @@ public class SettingsUI extends BaseUI {
         content.add(javax.swing.Box.createVerticalStrut(8));
         content.add(buildPasswordSection());
         if (admin && onDeleteUser != null) {
+            // 管理员且提供回调时显示删除分区
             content.add(javax.swing.Box.createVerticalStrut(8));
             content.add(buildDeleteUserSection());
         }
@@ -186,11 +137,6 @@ public class SettingsUI extends BaseUI {
         return scroll;
     }
 
-    /**
-     * 删除用户分区（仅管理员）。
-     *
-     * @return 面板
-     */
     private JPanel buildDeleteUserSection() {
         JPanel inner = new JPanel(new BorderLayout(6, 6));
         inner.setOpaque(false);
@@ -214,11 +160,6 @@ public class SettingsUI extends BaseUI {
         return panel;
     }
 
-    /**
-     * 昵称分区。
-     *
-     * @return 面板
-     */
     private JPanel buildNicknameSection() {
         JPanel inner = new JPanel(new BorderLayout(6, 6));
         inner.setOpaque(false);
@@ -239,11 +180,6 @@ public class SettingsUI extends BaseUI {
         return panel;
     }
 
-    /**
-     * 头像分区。
-     *
-     * @return 面板
-     */
     private JPanel buildAvatarSection() {
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         buttons.setOpaque(false);
@@ -270,11 +206,6 @@ public class SettingsUI extends BaseUI {
         return panel;
     }
 
-    /**
-     * 密码分区。
-     *
-     * @return 面板
-     */
     private JPanel buildPasswordSection() {
         JPanel fields = new JPanel(new GridLayout(3, 2, 6, 6));
         fields.setOpaque(false);
@@ -308,11 +239,6 @@ public class SettingsUI extends BaseUI {
         return panel;
     }
 
-    /**
-     * 底部说明栏。
-     *
-     * @return 面板
-     */
     private JPanel buildFooter() {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
         panel.setBackground(Theme.BG);
@@ -324,23 +250,15 @@ public class SettingsUI extends BaseUI {
         return panel;
     }
 
-    /**
-     * 构造一个左对齐的字段标签。
-     *
-     * @param text 文本
-     * @return 标签
-     */
     private static JLabel label(String text) {
         JLabel label = new JLabel(text);
         label.setForeground(Theme.TEXT);
         return label;
     }
 
-    /**
-     * 提交昵称修改。
-     */
     private void submitNickname() {
         String nickname = nicknameField.getText() == null ? "" : nicknameField.getText().trim();
+        // 校验非空与长度上限
         if (nickname.isEmpty()) {
             showSectionResult(nicknameStatus, false, "昵称不能为空");
             return;
@@ -361,9 +279,6 @@ public class SettingsUI extends BaseUI {
         showSectionResult(nicknameStatus, true, "已提交，等待服务端确认……");
     }
 
-    /**
-     * 提交头像修改。
-     */
     private void submitAvatar() {
         if (pendingAvatar == null) {
             showSectionResult(avatarStatus, false, "请先选择一张图片，或点“恢复默认头像”");
@@ -376,9 +291,6 @@ public class SettingsUI extends BaseUI {
         showSectionResult(avatarStatus, true, "已提交，等待服务端确认……");
     }
 
-    /**
-     * 提交密码修改。
-     */
     private void submitPassword() {
         String oldPassword = new String(oldPasswordField.getPassword());
         String newPassword = new String(newPasswordField.getPassword());
@@ -387,6 +299,7 @@ public class SettingsUI extends BaseUI {
             showSectionResult(passwordStatus, false, "请输入原密码");
             return;
         }
+        // 校验新密码长度与两次输入是否一致
         if (newPassword.length() < Constants.PASSWORD_MIN_LENGTH
                 || newPassword.length() > Constants.PASSWORD_MAX_LENGTH) {
             showSectionResult(passwordStatus, false, "新密码长度需在 "
@@ -408,13 +321,6 @@ public class SettingsUI extends BaseUI {
         showSectionResult(passwordStatus, true, "已提交，等待服务端确认……");
     }
 
-    /**
-     * 提交删除用户请求。
-     *
-     * <p>本地只做"填了没有、是不是自己"这类一眼可辨的检查，其余交给服务端：
-     * 是不是管理员、目标存不存在，都只有服务端说了算，客户端抢着判会给出与真实结果
-     * 不一致的结论。</p>
-     */
     private void submitDeleteUser() {
         if (!admin || onDeleteUser == null) {
             return;
@@ -425,6 +331,7 @@ public class SettingsUI extends BaseUI {
             return;
         }
         if (target.equals(client.getUsername())) {
+            // 不能删除当前登录的账号
             showSectionResult(deleteStatus, false, "不能删除当前登录的账号");
             return;
         }
@@ -436,12 +343,9 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 展示服务端对删除用户的处理结果。
+     * 显示管理员删除用户的处理结果。
      *
-     * <p>删除的结果由服务端以系统消息下发、经主窗口转到这里：请求是从本窗口发出的，
-     * 结果却弹在主窗口的状态栏上，使用者很可能没看见。</p>
-     *
-     * @param text 结果文本
+     * @param text 服务端返回的结果文本
      */
     public void onDeleteResult(String text) {
         if (text == null || text.isEmpty() || onDeleteUser == null) {
@@ -450,13 +354,6 @@ public class SettingsUI extends BaseUI {
         onEdt(() -> showSectionResult(deleteStatus, text.contains("成功"), text));
     }
 
-    /**
-     * 选择一张本地图片作为头像。
-     *
-     * <p>用系统原生对话框（见 {@link NativeFileDialog}）：换头像是"随手挑一张图"的动作，
-     * 使用者对系统自己的选图窗口最熟悉；扩展名限制交给它顺带校验，
-     * 图片能不能解码仍由 {@link #encodeAvatar(File)} 说了算。</p>
-     */
     private void chooseAvatar() {
         File file = NativeFileDialog.open(this, "选择头像图片", null, Constants.IMAGE_EXTENSIONS);
         if (file == null) {
@@ -472,29 +369,16 @@ public class SettingsUI extends BaseUI {
                 "已选择 " + file.getName() + "，点“保存头像”后生效");
     }
 
-    /**
-     * 把待提交的头像设置为"恢复默认"。
-     */
     private void resetAvatar() {
         pendingAvatar = "";
         refreshPreview();
         showSectionResult(avatarStatus, true, "将恢复为默认头像，点“保存头像”后生效");
     }
 
-    /**
-     * 重画头像预览。
-     *
-     * <p>预览与聊天窗口里的头像走同一套绘制逻辑，但<b>不共用同一份状态</b>：
-     * 待提交的图片通过 {@link AvatarFactory#previewAvatar} 画成一张只挂在本标签上的图标。
-     * 早先的做法是先把待提交图片 {@code putAvatar} 进工厂再取图标，看起来省事，
-     * 代价是"选了图片"这一步就已经把全局头像换掉了——主窗口、用户列表、聊天气泡
-     * 立刻全变成新头像，此时不点保存也退不回去，等于保存按钮形同虚设。
-     * 预览只画在本地，未点“保存头像”前，换头像这件事对外界零影响。</p>
-     */
     private void refreshPreview() {
         String username = client.getUsername();
         if (pendingAvatar == null) {
-            // 还没选过任何东西：显示服务端下发的当前头像
+            // 尚未选择新头像时显示当前头像
             avatarPreview.setIcon(AvatarFactory.avatar(username, true, false, AVATAR_PREVIEW));
         } else {
             avatarPreview.setIcon(AvatarFactory.previewAvatar(
@@ -505,17 +389,14 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 读取并编码头像图片。
+     * 读取图片并编码为限定长度的 Base64 头像。
      *
-     * <p>三步都有各自的拒绝理由：先只读图片头拿到尺寸（不整图解码，否则一张
-     * "解压炸弹"就足以把客户端撑爆），超限直接拒绝；再按<b>短边</b>等比缩放并居中裁切，
-     * 不能直接拉成正方形——那会把人物压扁；最后编码后若仍超出长度上限，降一级边长重编一次。</p>
-     *
-     * @param file 用户选择的图片文件
-     * @return 头像的 Base64 文本；失败时返回 null（原因已提示给使用者）
+     * @param file 图片文件
+     * @return 编码结果，读取或校验失败时返回 null
      */
     private String encodeAvatar(File file) {
         try {
+            // 先读取图片头中的尺寸
             Dimension source = readImageSize(file);
             if (source == null) {
                 showSectionResult(avatarStatus, false, "无法识别该文件，请换一张图片");
@@ -535,8 +416,7 @@ public class SettingsUI extends BaseUI {
             }
             String encoded = encodeSquare(image, Constants.AVATAR_SIDE);
             if (encoded.length() > Constants.AVATAR_MAX_LENGTH) {
-                // 细节特别多的照片在 96×96 下也可能编出大文件，降一级再试；
-                // 仍然超限就说明这张图不适合做头像，明确报错好过让它被服务端静默拒绝
+                // 超过长度上限时改用更小的边长重新编码
                 encoded = encodeSquare(image, AVATAR_FALLBACK_SIDE);
             }
             if (encoded.length() > Constants.AVATAR_MAX_LENGTH) {
@@ -552,11 +432,11 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 只读取图片的尺寸信息，不做整图解码。
+     * 只读取图片尺寸而不解码整张图。
      *
      * @param file 图片文件
-     * @return 尺寸；格式不被支持时返回 null
-     * @throws IOException 读取失败
+     * @return 图片宽高，无法识别时返回 null
+     * @throws IOException 读取文件失败
      */
     private static Dimension readImageSize(File file) throws IOException {
         try (ImageInputStream stream = ImageIO.createImageInputStream(file)) {
@@ -578,17 +458,18 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 把图片按短边居中裁成正方形并缩放，再编码为 Base64 PNG。
+     * 居中裁剪为正方形，缩放后编码为 PNG 的 Base64 文本。
      *
-     * @param source 源图
-     * @param side   目标边长
-     * @return Base64 文本
-     * @throws IOException 编码失败
+     * @param source 原图
+     * @param side 输出边长
+     * @return Base64 编码的 PNG
+     * @throws IOException 编码写入失败
      */
     private static String encodeSquare(BufferedImage source, int side) throws IOException {
         int width = source.getWidth();
         int height = source.getHeight();
         int crop = Math.min(width, height);
+        // 居中裁剪出最大正方形
         BufferedImage square = source.getSubimage((width - crop) / 2, (height - crop) / 2,
                 crop, crop);
         BufferedImage scaled = new BufferedImage(side, side, BufferedImage.TYPE_INT_ARGB);
@@ -607,19 +488,15 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 处理方法端回执。
+     * 处理服务端返回的资料修改结果。
      *
-     * <p>由 {@link ClientUI} 转交：本窗口不做客户端监听，因此回执的入口只有这一处。
-     * 正文格式为 {@code 成败|分区|中文原因}，按分区把结果写到对应的提示行，
-     * 让使用者一眼看出"是哪一项成功了"。</p>
-     *
-     * @param content 回执正文
+     * @param content 以竖线分隔的结果文本，依次为成功标记、分区和原因
      */
     public void onProfileResult(String content) {
         String[] fields = content == null ? new String[0]
                 : content.split("\\|", Constants.PROFILE_RESULT_FIELD_COUNT);
         if (fields.length < Constants.PROFILE_RESULT_FIELD_COUNT) {
-            // 解析不了就原样显示：宁可让人看到一段看不懂的文本，也不要假装"没收到"
+            // 字段数不足视为回执格式异常
             showSectionResult(passwordStatus, false, "服务端回执格式异常：" + content);
             return;
         }
@@ -637,12 +514,11 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 回执成功后就地同步界面状态。
-     *
-     * @param section 分区标识
+     * 修改成功后更新界面并触发回调。
      */
     private void applySuccess(String section) {
         if (Constants.PROFILE_SECTION_NICK.equals(section)) {
+            // 昵称修改成功后通知主窗口刷新
             String nickname = nicknameField.getText() == null ? "" : nicknameField.getText().trim();
             if (onChanged != null) {
                 onChanged.accept(nickname, null);
@@ -658,18 +534,13 @@ public class SettingsUI extends BaseUI {
             return;
         }
         if (Constants.PROFILE_SECTION_PASSWORD.equals(section)) {
+            // 密码修改成功后清空输入框
             oldPasswordField.setText("");
             newPasswordField.setText("");
             confirmPasswordField.setText("");
         }
     }
 
-    /**
-     * 取分区标识对应的提示行。
-     *
-     * @param section 分区标识
-     * @return 提示标签；未知分区用密码分区那一行兜底
-     */
     private JLabel statusLabelFor(String section) {
         if (Constants.PROFILE_SECTION_NICK.equals(section)) {
             return nicknameStatus;
@@ -681,13 +552,10 @@ public class SettingsUI extends BaseUI {
     }
 
     /**
-     * 把分区标识翻译成中文名。
+     * 把分区标识转换为中文名称。
      *
-     * <p>之所以放在这里而不是各调用点各写一份：主窗口的状态栏与设置窗口的分区提示
-     * 都要翻译同一个标识，两处各写一份就会出现"同一个回执在两处说法不同"。</p>
-     *
-     * @param section 分区标识，例如 {@code NICK}
-     * @return 中文名；未知标识原样返回
+     * @param section 分区标识
+     * @return 分区的中文名称
      */
     static String sectionName(String section) {
         if (Constants.PROFILE_SECTION_NICK.equals(section)) {
@@ -702,13 +570,6 @@ public class SettingsUI extends BaseUI {
         return section == null || section.isEmpty() ? "资料" : section;
     }
 
-    /**
-     * 在指定提示行上显示结果。
-     *
-     * @param target  提示标签
-     * @param success 是否成功
-     * @param text    文本
-     */
     private void showSectionResult(JLabel target, boolean success, String text) {
         if (target == null) {
             return;

@@ -10,52 +10,36 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 
 /**
- * 矢量图标工厂。
- *
- * <p>职责：用 Java2D 运行时绘制界面所需的小图标，替代图片资源文件，
- * 好处是不依赖工作目录、不引入第三方素材、缩放不糊。</p>
- *
- * <p>所有图标都在 {@code [0, size)} 的正方形坐标系内绘制，绘制前已配置抗锯齿与描边样式，
- * 因此每个图标的绘制代码只需关注几何形状。</p>
- *
- * <p>关于"暂时没有调用点的图标"：{@link #user(int, Color)} 与 {@link #lock(int, Color)}
- * 原本服务于主窗口功能面板上的"修改昵称…"与"修改密码…"两个入口，这两条入口在第 4 轮改动中
- * 并入了统一的"设置…"窗口，图标改用 {@link #settings(int, Color)}。
- * 两者作为本工厂的公开能力予以保留（同 {@code SkinButton#withIcon}）：删掉它们既不会让
- * 界面变好，反而让下一个需要"用户""密码锁"图形的地方重新画一遍。</p>
- *
- * @author Java 课程设计
- * @version 1.0
+ * 用 Java2D 绘制界面所需的矢量图标。各工厂方法返回固定边长的 Icon，size 为像素边长，
+ * color 为线条或填充颜色。
  */
 public final class Glyphs {
-
-    /** 图标绘制回调 */
+    /**
+     * 图标绘制回调，坐标原点位于图标左上角。
+     */
     public interface Painter {
-
         /**
-         * 绘制图形。
+         * 在给定画布上绘制图标内容。
          *
-         * @param g    已配置抗锯齿与描边的画笔
-         * @param size 图标边长（像素）
+         * @param g 画布上下文
+         * @param size 图标边长
          */
         void paint(Graphics2D g, int size);
     }
 
-    /** 私有构造，禁止实例化工具类 */
     private Glyphs() {
     }
 
     /**
-     * 构造一个矢量图标。
+     * 按给定尺寸、颜色与绘制回调创建图标。
      *
-     * @param size    边长
-     * @param color   颜色
-     * @param painter 绘制回调
-     * @return 图标对象
+     * @param size 图标边长，单位像素
+     * @param color 线条颜色
+     * @param painter 图标绘制回调
+     * @return 新的图标对象
      */
     public static Icon of(final int size, final Color color, final Painter painter) {
         return new Icon() {
-
             @Override
             public int getIconWidth() {
                 return size;
@@ -82,10 +66,10 @@ public final class Glyphs {
     }
 
     /**
-     * 应用徽标：圆角渐变方块内嵌一个对话气泡。
+     * 生成应用图标，渐变圆角方块内绘制一个对话气泡。
      *
-     * @param size 边长
-     * @return 图标
+     * @param size 图标边长，单位像素
+     * @return 应用图标
      */
     public static Icon logo(final int size) {
         return of(size, Color.WHITE, (g, s) -> {
@@ -103,25 +87,11 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 最小化图标。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon minimize(final int size, final Color color) {
         return of(size, color, (g, s) -> g.drawLine((int) (s * 0.24), (int) (s * 0.56),
                 (int) (s * 0.76), (int) (s * 0.56)));
     }
 
-    /**
-     * 关闭图标。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon close(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawLine((int) (s * 0.28), (int) (s * 0.28), (int) (s * 0.72), (int) (s * 0.72));
@@ -129,13 +99,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 对勾图标：用于"已恢复""校验通过"这类正向结果提示。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon check(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawLine((int) (s * 0.24), (int) (s * 0.54), (int) (s * 0.43), (int) (s * 0.72));
@@ -143,13 +106,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 刷新图标：缺口圆环加箭头。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon refresh(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             int pad = Math.max(2, s / 6);
@@ -159,13 +115,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 搜索图标：放大镜。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon search(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             int d = (int) (s * 0.52);
@@ -175,15 +124,12 @@ public final class Glyphs {
     }
 
     /**
-     * 树节点的展开/收起三角。
+     * 生成树节点展开或折叠箭头。
      *
-     * <p>之所以自绘而不用外观自带的图标：好友树改用基础外观实现后（见 {@link Theme#installDefaults()}），
-     * 系统外观提供的树形图标不一定能正常绘制，自绘可以保证任何平台都显示同一套三角。</p>
-     *
-     * @param expanded 展开时为向下三角，收起时为向右三角
-     * @param size     边长
-     * @param color    颜色
-     * @return 图标
+     * @param expanded true 绘制向下的展开箭头，false 绘制向右的折叠箭头
+     * @param size 图标边长，单位像素
+     * @param color 填充颜色
+     * @return 箭头图标
      */
     public static Icon treeArrow(final boolean expanded, final int size, final Color color) {
         return of(size, color, (g, s) -> {
@@ -202,13 +148,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 群聊图标：两个重叠气泡。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon group(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawRoundRect((int) (s * 0.10), (int) (s * 0.16),
@@ -218,13 +157,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 文件图标：文档加折角。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon file(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             int left = (int) (s * 0.22);
@@ -241,13 +173,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 历史记录图标：表盘。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon history(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             int pad = Math.max(2, s / 7);
@@ -257,13 +182,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 导出图标：托盘加下箭头。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon export(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawLine(s / 2, (int) (s * 0.16), s / 2, (int) (s * 0.58));
@@ -275,13 +193,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 用户图标。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon user(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             int d = (int) (s * 0.34);
@@ -291,13 +202,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 密码锁图标。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon lock(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawArc((int) (s * 0.32), (int) (s * 0.16), (int) (s * 0.36), (int) (s * 0.40),
@@ -307,37 +211,20 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 退出登录图标：门框加向外箭头。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon logout(final int size, final Color color) {
         return of(size, color, (g, s) -> {
-            // 门框只画左、上、下三边，右侧留出缺口表示"离开这扇门"
+            // 左侧门框
             g.drawLine((int) (s * 0.20), (int) (s * 0.14), (int) (s * 0.20), (int) (s * 0.86));
             g.drawLine((int) (s * 0.20), (int) (s * 0.14), (int) (s * 0.48), (int) (s * 0.14));
             g.drawLine((int) (s * 0.20), (int) (s * 0.86), (int) (s * 0.48), (int) (s * 0.86));
-            // 向外箭头
+
+            // 指向门外的箭头
             g.drawLine((int) (s * 0.46), (int) (s * 0.50), (int) (s * 0.86), (int) (s * 0.50));
             g.drawLine((int) (s * 0.68), (int) (s * 0.34), (int) (s * 0.86), (int) (s * 0.50));
             g.drawLine((int) (s * 0.68), (int) (s * 0.66), (int) (s * 0.86), (int) (s * 0.50));
         });
     }
 
-    /**
-     * 设置图标：齿轮。
-     *
-     * <p>画法：一个圆环当轮盘，环外再画 8 根等角分布的短径向线当齿，中心一个小圆当轴孔。
-     * 用"环 + 放射线"而不是逐个画梯形齿，是因为图标边长常小到 16~18 像素，
-     * 每个齿只有两三个像素宽，画梯形齿只会糊成一团，放射线在小尺寸下反而更清晰。</p>
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon settings(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             double center = s / 2.0;
@@ -348,6 +235,7 @@ public final class Glyphs {
                     ring * 2, ring * 2);
             g.drawOval(Math.round((float) center - hole), Math.round((float) center - hole),
                     hole * 2, hole * 2);
+            // 沿八个方向绘制齿轮的齿
             for (int i = 0; i < 8; i++) {
                 double angle = Math.PI * i / 4.0;
                 double cos = Math.cos(angle);
@@ -360,13 +248,6 @@ public final class Glyphs {
         });
     }
 
-    /**
-     * 删除图标：垃圾桶。
-     *
-     * @param size  边长
-     * @param color 颜色
-     * @return 图标
-     */
     public static Icon trash(final int size, final Color color) {
         return of(size, color, (g, s) -> {
             g.drawLine((int) (s * 0.18), (int) (s * 0.30), (int) (s * 0.82), (int) (s * 0.30));
