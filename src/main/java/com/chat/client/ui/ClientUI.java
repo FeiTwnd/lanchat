@@ -1452,13 +1452,16 @@ public class ClientUI extends BaseUI implements ChatListener, ChatClient.Message
                     panelsNotifiedDisconnect = true;
                 }
             }
-            // 非主动退出且不再重连时结束程序
+            // 非主动退出且不再重连时回到登录界面，不要直接结束程序
             if (!connected && !loggingOut && !reconnecting) {
+                String host = client.getServerHost();
+                int port = client.getServerPort();
+                String lastUser = client.getUsername();
                 client.removeListener(this);
-                client.close();
-                showError(reason + "\n程序将退出，请重新登录。");
                 dispose();
-                System.exit(0);
+                LoginUI login = new LoginUI(host, port, lastUser);
+                login.showNotice(reason);
+                login.setVisible(true);
             }
         });
     }

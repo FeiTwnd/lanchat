@@ -105,6 +105,31 @@ public class LoginUI extends BaseUI implements ChatListener {
         getRootPane().setDefaultButton(loginButton);
     }
 
+    /**
+     * 创建登录窗口并在服务器信息之外预填上次登录的用户名。
+     *
+     * @param host 预填的服务器地址，为空时保持默认值
+     * @param port 预填的端口，小于等于 0 时使用配置默认值
+     * @param username 预填的用户名，为空时保持为空
+     */
+    public LoginUI(String host, int port, String username) {
+        this(host, port);
+        if (username != null && !username.trim().isEmpty()) {
+            usernameField.setText(username.trim());
+        }
+    }
+
+    /**
+     * 在状态栏显示一条提示，会话过期回到登录界面时说明原因。
+     *
+     * @param text 提示文本，为空时忽略
+     */
+    public void showNotice(String text) {
+        if (text != null && !text.trim().isEmpty()) {
+            statusLabel.setText(text.trim());
+        }
+    }
+
     private void initComponents() {
         JPanel form = new JPanel(new GridBagLayout());
         form.setBackground(Theme.CARD);

@@ -191,7 +191,8 @@ public final class ChatServer {
         handlers.clear();
         userManager.clear();
 
-        sessionTokens.clear();
+        // 会话令牌与监听套接字无关，停止时不能清空：控制台的停止与启动只中断连接，
+        // 客户端在令牌有效期内重连后仍可恢复会话，令牌失效统一由 TTL 与清理逻辑控制
         // 关闭线程池与智能体服务
         shutdownPool(connectionPool);
         connectionPool = null;
